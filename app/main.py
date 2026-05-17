@@ -2350,6 +2350,7 @@ import urllib.error as v012_urlerror
 from pathlib import Path as V012Path
 
 V012_PROTECTION_STATE_PATH = V012Path("state/testnet_protection_orders.json")
+PROTECTION_STORE = "TESTNET_ALGO_PROTECTION"
 
 
 def v012_env_bool(name: str, default: bool = False) -> bool:
@@ -2536,17 +2537,15 @@ def v012_mark_cancel_result(symbol: str, cancel_results: list) -> None:
     canceled_ids = set()
     for r in cancel_results:
         body = r.get("response", {}).get("body") or {}
-        oid = str(body.get("orderId") or r.get("orderId") or "")
+        oid = str(body.get("algoId") or r.get("algoId") or "")
         if oid:
             canceled_ids.add(oid)
 
-    for row in rows:
-        for order in row.get("orders", []):
-            oid = str(order.get("orderId") or "")
-            if oid in canceled_ids:
-                order["local_status"] = "CANCEL_REQUESTED"
-                order["canceled_at_utc"] = utc_now_iso()
-                order["canceled_at_wib"] = wib_now_iso()
+    for order in rows:
+        oid = str(order.get("algoId") or "")
+        if oid in canceled_ids:
+            order["status"] = "CANCEL_REQUESTED"
+            order["canceled_at"] = utc_now_iso()
 
     state.setdefault("symbols", {})[symbol] = rows
     v012_save_protection_state(state)
@@ -2667,8 +2666,54 @@ def v012_place_protective_order(symbol: str, label: str, plan_item: dict, client
 
 
 
+
+def v012_build_protection_store_record(symbol: str, signal_key: str, order: dict) -> dict:
+    response_body = (order.get("response") or {}).get("body") or {}
+    return {
+        "symbol": symbol,
+        "signal_key": signal_key,
+        "algoId": response_body.get("algoId") or order.get("algoId") or order.get("orderId"),
+        "clientAlgoId": response_body.get("clientAlgoId") or order.get("clientAlgoId") or order.get("clientOrderId"),
+        "type": (order.get("request") or {}).get("type"),
+        "side": (order.get("request") or {}).get("side"),
+        "stopPrice": (order.get("request") or {}).get("stopPrice"),
+        "quantity": (order.get("request") or {}).get("quantity"),
+        "status": "PLACED" if order.get("ok") else "FAILED",
+        "created_at": utc_now_iso(),
+        "canceled_at": None,
+        "source": PROTECTION_STORE,
+    }
+
+
+def v012_store_protection_records(symbol: str, signal_key: str, orders: list) -> None:
+    for order in orders:
+        v012_store_protection_orders(symbol, v012_build_protection_store_record(symbol, signal_key, order))
+
+
+def binance_get_open_algo_orders(symbol: str) -> dict:
+    params = {"symbol": symbol}
+    return v012_signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+
+
+def v012_clean_algo_order_row(symbol: str, row: dict) -> dict:
+    return {
+        "symbol": symbol,
+        "algoId": row.get("algoId"),
+        "clientAlgoId": row.get("clientAlgoId"),
+        "type": row.get("type"),
+        "side": row.get("side"),
+        "stopPrice": row.get("stopPrice") or row.get("triggerPrice"),
+        "quantity": row.get("quantity") or row.get("origQty"),
+        "status": row.get("status"),
+    }
+
+
 def v012_block_legacy_protection_cancel(path: str, params: dict) -> None:
-    if path == "/fapi/v1/order" and str((params or {}).get("_protection_cancel", "")).lower() == "true":
+    if path != "/fapi/v1/order":
+        return
+    p = params or {}
+    protection_marker = str(p.get("_protection_cancel", "")).lower() == "true" or str(p.get("algoType", "")).upper() == "CONDITIONAL" or bool(p.get("algoId") or p.get("clientAlgoId"))
+    if protection_marker:
         raise RuntimeError("legacy_order_cancel_for_protection_blocked")
 
 def v012_cancel_order(symbol: str, order_id=None, orig_client_order_id=None) -> dict:
@@ -2792,7 +2837,7 @@ async def v012_place_protection_endpoint(request: Request):
             "orders": placed,
             "plan": plan,
         }
-        v012_store_protection_orders(symbol, record)
+        v012_store_protection_records(symbol, signal_key, placed)
         append_jsonl(EXECUTION_EVENTS_LOG, {
             "event_at_utc": utc_now_iso(),
             "event_at_wib": wib_now_iso(),
@@ -2828,7 +2873,7 @@ async def v012_place_protection_endpoint(request: Request):
         "orders": placed,
         "plan": plan,
     }
-    v012_store_protection_orders(symbol, record)
+    v012_store_protection_records(symbol, signal_key, placed)
 
     event = {
         "event_at_utc": utc_now_iso(),
@@ -2849,6 +2894,40 @@ async def v012_place_protection_endpoint(request: Request):
         "symbol": symbol,
         "orders": placed,
         "cleanup_required": decision == "PARTIAL_PROTECTION",
+    }
+
+
+@app.api_route("/testnet/algo-open-orders", methods=["GET", "POST"])
+async def v012_algo_open_orders_endpoint(request: Request):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    payload = {}
+    if request.method.upper() == "POST":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+    symbol = v010_normalize_symbol(
+        request.query_params.get("symbol")
+        or payload.get("symbol")
+        or payload.get("pair")
+        or ""
+    )
+    if not symbol:
+        return {"ok": False, "reason": "missing_symbol"}
+
+    res = binance_get_open_algo_orders(symbol)
+    body = res.get("body")
+    raw_rows = body if isinstance(body, list) else (body.get("orders") if isinstance(body, dict) else [])
+    rows = [v012_clean_algo_order_row(symbol, r) for r in (raw_rows or []) if isinstance(r, dict)]
+    return {
+        "ok": bool(res.get("ok")),
+        "symbol": symbol,
+        "orders": rows,
+        "http_status": res.get("http_status"),
+        "reason": res.get("reason"),
     }
 
 
@@ -2901,12 +2980,11 @@ async def v012_cancel_protection_endpoint(request: Request):
         cancel_targets.append({"orderId": None, "origClientOrderId": cid})
 
     if not cancel_targets:
-        for record in v012_known_orders(symbol):
-            for order in record.get("orders", []):
-                if order.get("ok"):
-                    oid = order.get("algoId") or order.get("orderId")
-                    cid = order.get("clientAlgoId") or order.get("clientOrderId")
-                    cancel_targets.append({"orderId": oid, "origClientOrderId": cid})
+        for order in v012_known_orders(symbol):
+            oid = order.get("algoId")
+            cid = order.get("clientAlgoId")
+            if oid or cid:
+                cancel_targets.append({"orderId": oid, "origClientOrderId": cid})
 
     # de-dupe
     seen = set()
