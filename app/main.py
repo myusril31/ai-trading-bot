@@ -3022,3 +3022,159 @@ async def v012_cancel_protection_endpoint(request: Request):
         "results": results,
     }
 
+
+def v013_env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, str(default))).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def v013_lifecycle_guard(symbol: str) -> Dict[str, Any]:
+    env = str(binance_env() or "").upper()
+    if env != "TESTNET":
+        return {"ok": False, "decision": "REJECT", "reason": "binance_env_not_testnet"}
+    if v013_env_bool("TESTNET_KILL_SWITCH", False):
+        return {"ok": False, "decision": "REJECT", "reason": "testnet_kill_switch_enabled"}
+    if v013_env_bool("KILL_SWITCH", False):
+        return {"ok": False, "decision": "REJECT", "reason": "kill_switch_enabled"}
+    if live_binance_key_detected():
+        return {"ok": False, "decision": "REJECT", "reason": "live_key_detected"}
+    if not v010_testnet_allowed_symbol(symbol):
+        return {"ok": False, "decision": "REJECT", "reason": "symbol_not_allowed"}
+    return {"ok": True}
+
+
+def v013_extract_position_amt(position_res: Dict[str, Any], symbol: str) -> str:
+    open_pos = v010_find_open_position(position_res, symbol) or {}
+    return str(open_pos.get("positionAmt") or "0")
+
+
+def v013_fetch_open_algo_orders(symbol: str) -> Dict[str, Any]:
+    res = binance_get_open_algo_orders(symbol)
+    body = res.get("body")
+    raw_rows = body if isinstance(body, list) else (body.get("orders") if isinstance(body, dict) else [])
+    rows = [v012_clean_algo_order_row(symbol, row) for row in (raw_rows or []) if isinstance(row, dict)]
+    return {"ok": bool(res.get("ok")), "orders": rows, "raw": res}
+
+
+def v013_detect_lifecycle_state(position_amt: str, open_algo_orders_count: int, fetch_ok: bool) -> str:
+    if not fetch_ok:
+        return "POSITION_UNKNOWN"
+    try:
+        has_position = abs(float(position_amt)) > 0.0
+    except Exception:
+        has_position = str(position_amt).strip() not in ("", "0", "0.0", "0.00")
+    if has_position and open_algo_orders_count > 0:
+        return "POSITION_OPEN_PROTECTED"
+    if has_position and open_algo_orders_count == 0:
+        return "POSITION_OPEN_UNPROTECTED"
+    if (not has_position) and open_algo_orders_count == 0:
+        return "POSITION_CLOSED_CLEAN"
+    return "POSITION_CLOSED_STALE_ALGO"
+
+
+def v013_cancel_stale_algo_orders(symbol: str, open_algo_orders: list) -> list:
+    cleanup_results = []
+    for order in open_algo_orders or []:
+        if not isinstance(order, dict):
+            continue
+        algo_id = order.get("algoId") or order.get("orderId")
+        client_algo_id = order.get("clientAlgoId") or order.get("origClientOrderId")
+        cleanup_results.append(v012_cancel_order(symbol, algo_id, client_algo_id))
+    return cleanup_results
+
+
+def v013_log_lifecycle_event(event: Dict[str, Any]) -> None:
+    append_jsonl(EXECUTION_EVENTS_LOG, event)
+
+
+@app.post("/testnet/lifecycle-check")
+async def v013_testnet_lifecycle_check(request: Request):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    symbol = v010_normalize_symbol(payload.get("symbol") or payload.get("pair") or "")
+    if not symbol:
+        return {"ok": False, "decision": "REJECT", "reason": "missing_symbol"}
+
+    guard = v013_lifecycle_guard(symbol)
+    if not guard.get("ok"):
+        return {"ok": False, "decision": guard.get("decision"), "reason": guard.get("reason"), "symbol": symbol}
+
+    position_res = binance_testnet_position_risk(symbol)
+    open_algo_res = v013_fetch_open_algo_orders(symbol)
+    position_ok = bool(position_res.get("ok"))
+    orders_ok = bool(open_algo_res.get("ok"))
+    fetch_ok = position_ok and orders_ok
+
+    position_amt = v013_extract_position_amt(position_res, symbol) if position_ok else "0"
+    open_algo_orders = open_algo_res.get("orders") or []
+    open_algo_orders_count = len(open_algo_orders)
+    lifecycle_state = v013_detect_lifecycle_state(position_amt, open_algo_orders_count, fetch_ok)
+
+    known_fn = globals().get("v012_known_orders")
+    known_protection_records_count = len(known_fn(symbol)) if callable(known_fn) else 0
+
+    cleanup_results = []
+    open_algo_orders_after_cleanup = open_algo_orders
+    if lifecycle_state == "POSITION_CLOSED_STALE_ALGO" and str(position_amt).strip() in ("0", "0.0", "0.00"):
+        cleanup_results = v013_cancel_stale_algo_orders(symbol, open_algo_orders)
+        if cleanup_results:
+            v012_mark_cancel_result(symbol, cleanup_results)
+        refreshed = v013_fetch_open_algo_orders(symbol)
+        open_algo_orders_after_cleanup = refreshed.get("orders") or []
+
+    emergency_close_enabled = v013_env_bool("EMERGENCY_CLOSE_ENABLED", False)
+    emergency_close_result = None
+    if lifecycle_state == "POSITION_OPEN_UNPROTECTED":
+        if emergency_close_enabled:
+            emergency_close_result = binance_testnet_close_position_reduce_only(symbol)
+        else:
+            emergency_close_result = {
+                "ok": False,
+                "decision": "ALERT_ONLY",
+                "reason": "position_open_without_protection_alert_only",
+            }
+
+    event = {
+        "event_at_utc": utc_now_iso(),
+        "event_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "action": "TESTNET_LIFECYCLE_CHECK",
+        "execution_mode": execution_mode(),
+        "binance_env": binance_env(),
+        "symbol": symbol,
+        "decision": "LIFECYCLE_CHECK_DONE" if fetch_ok else "LIFECYCLE_CHECK_PARTIAL",
+        "lifecycle_state": lifecycle_state,
+        "position_amt": position_amt,
+        "open_algo_orders_count": open_algo_orders_count,
+        "known_protection_records_count": known_protection_records_count,
+        "cleanup_count": len(cleanup_results),
+        "cleanup_results": cleanup_results,
+        "emergency_close_enabled": emergency_close_enabled,
+        "emergency_close_result": emergency_close_result,
+        "position_risk_result": position_res,
+        "open_algo_orders": open_algo_orders,
+        "open_algo_orders_after_cleanup": open_algo_orders_after_cleanup,
+    }
+    v013_log_lifecycle_event(event)
+
+    return {
+        "ok": fetch_ok,
+        "decision": event["decision"],
+        "symbol": symbol,
+        "lifecycle_state": lifecycle_state,
+        "position_amt": position_amt,
+        "open_algo_orders_count": open_algo_orders_count,
+        "known_protection_records_count": known_protection_records_count,
+        "cleanup_count": len(cleanup_results),
+        "cleanup_results": cleanup_results,
+        "emergency_close_enabled": emergency_close_enabled,
+        "emergency_close_result": emergency_close_result,
+        "open_algo_orders": open_algo_orders,
+        "open_algo_orders_after_cleanup": open_algo_orders_after_cleanup,
+    }
