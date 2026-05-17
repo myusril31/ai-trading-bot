@@ -1,0 +1,22 @@
+# secrets / env
+.env
+.env.*
+*.env
+
+# runtime data
+logs/
+state/
+backups/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# local backups
+*.bak
+*.bak_*
+*.save
+app/*.bak
+app/*.save
+app/main.py.bak*
