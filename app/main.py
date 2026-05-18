@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.12-testnet-protective-order-placement-skeleton"
+APP_VERSION = "v0.14-execution-journal-reconciliation-safety"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -28,6 +28,7 @@ PAPER_STATE_FILE = STATE_DIR / "paper_state.json"
 PAPER_EVENTS_LOG = LOG_DIR / "paper_events.jsonl"
 EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
 EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
+EXECUTION_SUMMARY_LOG = LOG_DIR / "execution_summary.jsonl"
 
 WIB = ZoneInfo("Asia/Jakarta")
 LOCK = Lock()
@@ -1032,6 +1033,7 @@ def binance_market_order(plan: Dict[str, Any]) -> Dict[str, Any]:
 
 def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
     plan = build_execution_plan(p)
+    signal_key = signal_key_of(p)
     ok, reason = validate_execution_plan(plan)
 
     event = {
@@ -1040,7 +1042,7 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
         "app_version": APP_VERSION,
         "execution_mode": execution_mode(),
         "binance_env": binance_env(),
-        "signal_key": signal_key_of(p),
+        "signal_key": signal_key,
         "pair": pair_of(p),
         "symbol": plan.get("symbol"),
         "decision": "BUILT_ONLY" if ok else "SKIPPED",
@@ -1049,6 +1051,16 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     append_jsonl(EXECUTION_EVENTS_LOG, event)
+
+    v014_execution_summary_write(signal_key, {
+        "pair": pair_of(p),
+        "symbol": plan.get("symbol"),
+        "direction": direction_of(p),
+        "paper_decision": "ACCEPT",
+        "paper_reason": "all_paper_gates_pass",
+        "lifecycle_state": "PLAN_VALID" if ok else "PLAN_REJECTED",
+        "notes": reason,
+    })
 
     if ok:
         append_jsonl(EXECUTION_PLANS_LOG, plan)
@@ -1075,6 +1087,31 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
             event = order_test_event
 
         elif execution_mode() == "TESTNET_MARKET":
+            force = str((p.get("force_test") or p.get("force") or "")).strip().lower() in ("1", "true", "yes", "y", "on")
+            session_guard = assert_controlled_test_session_clean(plan.get("symbol") or "", force=force, ignore_signal_key=signal_key)
+            if not session_guard.get("ok"):
+                blocked_event = {
+                    "event_at_utc": utc_now_iso(),
+                    "event_at_wib": wib_now_iso(),
+                    "app_version": APP_VERSION,
+                    "execution_mode": execution_mode(),
+                    "binance_env": binance_env(),
+                    "signal_key": signal_key,
+                    "pair": pair_of(p),
+                    "symbol": plan.get("symbol"),
+                    "decision": "CONTROLLED_TEST_BLOCKED",
+                    "reason": session_guard.get("reason"),
+                    "safety_summary": session_guard.get("safety_summary"),
+                    "forced": session_guard.get("forced"),
+                    "plan": plan,
+                }
+                append_jsonl(EXECUTION_EVENTS_LOG, blocked_event)
+                v014_execution_summary_write(signal_key, {
+                    "entry_order_result": "CONTROLLED_TEST_BLOCKED",
+                    "lifecycle_state": "CONTROLLED_TEST_BLOCKED",
+                    "notes": session_guard.get("reason"),
+                })
+                return blocked_event
             market_res = binance_market_order(plan)
 
             market_event = {
@@ -1094,6 +1131,16 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
 
             append_jsonl(EXECUTION_EVENTS_LOG, market_event)
             event = market_event
+            order_body = market_res.get("body") if isinstance(market_res.get("body"), dict) else {}
+            v014_execution_summary_write(signal_key, {
+                "entry_order_result": "FILLED_OR_ACCEPTED" if market_res.get("ok") else "FAILED",
+                "entry_order_id": order_body.get("orderId"),
+                "entry_client_order_id": order_body.get("clientOrderId") or order_body.get("clientOrderID"),
+                "quantity": plan.get("quantity"),
+                "entry_fill_price": order_body.get("avgPrice") or order_body.get("price"),
+                "lifecycle_state": "ENTRY_SENT" if market_res.get("ok") else "ENTRY_FAILED",
+                "notes": market_event.get("reason"),
+            })
 
     return event
 
@@ -2853,7 +2900,7 @@ async def v012_place_protection_endpoint(request: Request):
             "plan": plan,
         }
         v012_store_protection_records(symbol, signal_key, placed)
-        append_jsonl(EXECUTION_EVENTS_LOG, {
+        sl_failed_event = {
             "event_at_utc": utc_now_iso(),
             "event_at_wib": wib_now_iso(),
             "app_version": APP_VERSION,
@@ -2862,6 +2909,13 @@ async def v012_place_protection_endpoint(request: Request):
             "decision": decision,
             "reason": "sl_failed_tp_skipped",
             "orders": placed,
+        }
+        append_jsonl(EXECUTION_EVENTS_LOG, sl_failed_event)
+        v014_execution_summary_write(signal_key, {
+            "symbol": symbol,
+            "sl_algo_id": sl_result.get("algoId"),
+            "lifecycle_state": "PROTECTION_SL_FAILED",
+            "notes": "sl_failed_tp_skipped",
         })
         return {
             "ok": False,
@@ -2901,6 +2955,16 @@ async def v012_place_protection_endpoint(request: Request):
         "orders": placed,
     }
     append_jsonl(EXECUTION_EVENTS_LOG, event)
+    latest_by_label = {str(o.get("label") or "").upper(): o for o in placed}
+    v014_execution_summary_write(signal_key, {
+        "symbol": symbol,
+        "sl_algo_id": (latest_by_label.get("SL") or {}).get("algoId"),
+        "tp1_algo_id": (latest_by_label.get("TP1") or {}).get("algoId"),
+        "tp2_algo_id": (latest_by_label.get("TP2") or {}).get("algoId"),
+        "tp3_algo_id": (latest_by_label.get("TP3") or {}).get("algoId"),
+        "lifecycle_state": decision,
+        "notes": event.get("reason"),
+    })
 
     return {
         "ok": decision == "PROTECTION_PLACED",
@@ -3103,6 +3167,176 @@ def v013_log_lifecycle_event(event: Dict[str, Any]) -> None:
     append_jsonl(EXECUTION_EVENTS_LOG, event)
 
 
+def v014_is_nonzero_position_amt(position_amt: Any) -> bool:
+    try:
+        return abs(float(str(position_amt or "0").strip())) > 0.0
+    except Exception:
+        return str(position_amt).strip() not in ("", "0", "0.0", "0.00")
+
+
+def v014_open_paper_positions_for_symbol(symbol: str, ignore_signal_key: str = "") -> list:
+    state = load_state()
+    symbol = v010_normalize_symbol(symbol)
+    ignore_signal_key = str(ignore_signal_key or "").strip()
+    rows = []
+    for row in (state.get("open_paper_positions") or []):
+        if str(row.get("status", "OPEN")).upper() != "OPEN":
+            continue
+        if ignore_signal_key and str(row.get("signal_key") or "").strip() == ignore_signal_key:
+            continue
+        row_symbol = v010_normalize_symbol(row.get("pair") or row.get("symbol") or "")
+        if row_symbol == symbol:
+            rows.append(row)
+    return rows
+
+
+def v014_reconcile_state(symbol: str = "", signal_key: str = "", ignore_signal_key: str = "") -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol or "")
+    paper_rows = v014_open_paper_positions_for_symbol(symbol, ignore_signal_key=ignore_signal_key) if symbol else (load_state().get("open_paper_positions") or [])
+    paper_open = any(str(r.get("status", "OPEN")).upper() == "OPEN" for r in paper_rows)
+
+    position_res = binance_testnet_position_risk(symbol) if symbol else {"ok": False, "reason": "symbol_required_for_position_risk"}
+    position_amt = "0"
+    if symbol and position_res.get("ok"):
+        position_amt = v013_extract_position_amt(position_res, symbol)
+
+    algo_res = v013_fetch_open_algo_orders(symbol) if symbol else {"ok": False, "orders": [], "raw": {"reason": "symbol_required_for_algo_orders"}}
+    open_orders = algo_res.get("orders") or []
+    open_algo_count = len(open_orders)
+
+    has_position = v014_is_nonzero_position_amt(position_amt)
+    bot_state_detected = paper_open
+    reasons = []
+    mismatch_state = "UNKNOWN"
+
+    if symbol and (not position_res.get("ok") or not algo_res.get("ok")):
+        mismatch_state = "UNKNOWN"
+        reasons.append(position_res.get("reason") or (algo_res.get("raw") or {}).get("reason") or "exchange_fetch_failed")
+    elif has_position and (not bot_state_detected):
+        mismatch_state = "POSITION_OPEN_NO_STATE"
+        reasons.append("binance_position_open_but_bot_and_paper_state_not_open")
+    elif bot_state_detected and (not has_position):
+        mismatch_state = "STATE_OPEN_NO_POSITION"
+        reasons.append("bot_or_paper_state_open_but_binance_position_closed")
+    elif (not has_position) and open_algo_count > 0:
+        mismatch_state = "STALE_ALGO_NO_POSITION"
+        reasons.append("open_algo_orders_exist_without_open_position")
+    elif has_position and open_algo_count == 0:
+        mismatch_state = "UNPROTECTED_POSITION"
+        reasons.append("position_open_without_protection_orders")
+    elif (not has_position) and open_algo_count == 0 and (not paper_open):
+        mismatch_state = "CLEAN"
+    else:
+        mismatch_state = "UNKNOWN"
+        reasons.append("unable_to_classify_state_conservatively")
+
+    ok = mismatch_state != "UNKNOWN"
+    return {
+        "ok": ok,
+        "symbol": symbol or None,
+        "signal_key": signal_key or None,
+        "bot_state_detected": bot_state_detected,
+        "paper_position_detected": paper_open,
+        "binance_position_amt": position_amt,
+        "open_algo_count": open_algo_count,
+        "open_algo_orders": open_orders,
+        "mismatch_state": mismatch_state,
+        "reasons": reasons,
+        "cleanup_required": mismatch_state in ("STALE_ALGO_NO_POSITION", "UNPROTECTED_POSITION"),
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+def v014_execution_summary_write(signal_key: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    latest = v014_execution_summary_latest(signal_key) or {}
+    created = latest.get("created_at_utc") or utc_now_iso()
+    row = dict(latest)
+    row.update({k: v for k, v in (updates or {}).items() if v is not None})
+    row["signal_key"] = signal_key
+    row["created_at_utc"] = created
+    row["updated_at_utc"] = utc_now_iso()
+    append_jsonl(EXECUTION_SUMMARY_LOG, row)
+    return row
+
+
+def v014_execution_summary_latest(signal_key: str) -> Optional[Dict[str, Any]]:
+    if not signal_key or not EXECUTION_SUMMARY_LOG.exists():
+        return None
+    latest = None
+    try:
+        with EXECUTION_SUMMARY_LOG.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if str(row.get("signal_key") or "") == str(signal_key):
+                    latest = row
+    except Exception:
+        return None
+    return latest
+
+
+def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol or "")
+    recon = v014_reconcile_state(symbol=symbol, ignore_signal_key=ignore_signal_key)
+    open_paper_positions = len(v014_open_paper_positions_for_symbol(symbol, ignore_signal_key=ignore_signal_key)) if symbol else open_paper_count(load_state())
+    reasons = list(recon.get("reasons") or [])
+    live_key_detected = live_binance_key_detected()
+    if binance_env() != "TESTNET":
+        reasons.append("binance_env_not_testnet")
+    if live_key_detected:
+        reasons.append("live_key_detected")
+    if execution_mode() in ("LIVE", "PROD", "MAINNET"):
+        reasons.append(f"execution_mode_not_allowed:{execution_mode()}")
+    if env_bool("TESTNET_KILL_SWITCH", False):
+        reasons.append("testnet_kill_switch_active")
+
+    safe_to_continue = (
+        binance_env() == "TESTNET"
+        and not live_key_detected
+        and execution_mode() not in ("LIVE", "PROD", "MAINNET")
+        and not env_bool("TESTNET_KILL_SWITCH", False)
+        and recon.get("mismatch_state") == "CLEAN"
+        and open_paper_positions == 0
+    )
+    return {
+        "ok": bool(recon.get("ok")),
+        "execution_mode": execution_mode(),
+        "binance_env": binance_env(),
+        "enable_testnet_orders": env_bool("ENABLE_TESTNET_ORDERS", False),
+        "order_test_endpoint_only": env_bool("ORDER_TEST_ENDPOINT_ONLY", True),
+        "testnet_kill_switch": env_bool("TESTNET_KILL_SWITCH", False),
+        "emergency_close_enabled": env_bool("EMERGENCY_CLOSE_ENABLED", False),
+        "live_key_detected": live_key_detected,
+        "open_paper_positions": open_paper_positions,
+        "symbol": symbol or None,
+        "positionAmt": recon.get("binance_position_amt"),
+        "open_algo_count": recon.get("open_algo_count"),
+        "mismatch_state": recon.get("mismatch_state"),
+        "safe_to_continue": safe_to_continue,
+        "reasons": reasons,
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+def assert_controlled_test_session_clean(symbol: str, force: bool = False, ignore_signal_key: str = "") -> Dict[str, Any]:
+    safety = v014_safety_summary(symbol, ignore_signal_key=ignore_signal_key)
+    if force:
+        if live_binance_key_detected():
+            return {"ok": False, "decision": "CONTROLLED_TEST_BLOCKED", "reason": "force_not_allowed_with_live_key_detected", "forced": True, "safety_summary": safety}
+        if binance_env() != "TESTNET":
+            return {"ok": False, "decision": "CONTROLLED_TEST_BLOCKED", "reason": "force_not_allowed_outside_testnet", "forced": True, "safety_summary": safety}
+        return {"ok": True, "decision": "CONTROLLED_TEST_FORCED", "reason": "force_override_in_testnet", "forced": True, "safety_summary": safety}
+    if not safety.get("safe_to_continue"):
+        reason = ";".join(safety.get("reasons") or ["unsafe_previous_test_session_state"])
+        return {"ok": False, "decision": "CONTROLLED_TEST_BLOCKED", "reason": reason, "forced": False, "safety_summary": safety}
+    return {"ok": True, "decision": "CONTROLLED_TEST_ALLOWED", "reason": "session_clean", "forced": False, "safety_summary": safety}
+
+
 @app.post("/testnet/lifecycle-check")
 async def v013_testnet_lifecycle_check(request: Request):
     if not v010_auth_ok(request):
@@ -3178,6 +3412,17 @@ async def v013_testnet_lifecycle_check(request: Request):
         "open_algo_orders_after_cleanup": open_algo_orders_after_cleanup,
     }
     v013_log_lifecycle_event(event)
+    signal_key = str(payload.get("signal_key") or payload.get("signal_id") or "").strip()
+    if signal_key:
+        v014_execution_summary_write(signal_key, {
+            "symbol": symbol,
+            "lifecycle_state": lifecycle_state,
+            "cleanup_count": len(cleanup_results),
+            "final_position_amt": position_amt,
+            "final_open_algo_count": len(open_algo_orders_after_cleanup),
+            "safe_restored": lifecycle_state in ("POSITION_CLOSED_CLEAN", "POSITION_CLOSED_STALE_ALGO") and len(open_algo_orders_after_cleanup) == 0 and not v014_is_nonzero_position_amt(position_amt),
+            "notes": event.get("decision"),
+        })
 
     return {
         "ok": fetch_ok,
@@ -3194,3 +3439,20 @@ async def v013_testnet_lifecycle_check(request: Request):
         "open_algo_orders": open_algo_orders,
         "open_algo_orders_after_cleanup": open_algo_orders_after_cleanup,
     }
+
+
+@app.get("/testnet/execution-summary")
+def v014_execution_summary(request: Request, signal_key: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    row = v014_execution_summary_latest(signal_key)
+    if not row:
+        return {"ok": False, "signal_key": signal_key, "reason": "not_found"}
+    return {"ok": True, "signal_key": signal_key, "summary": row}
+
+
+@app.get("/testnet/safety-summary")
+def v014_safety_summary_endpoint(request: Request, symbol: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    return v014_safety_summary(symbol)
