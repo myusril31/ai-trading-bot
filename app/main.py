@@ -488,7 +488,6 @@ def apply_decision_to_state(p: Dict[str, Any], decision: Dict[str, Any], state: 
             "tp3": p.get("tp3"),
         })
         state["open_paper_positions"] = positions
-        handle_execution_after_accept(p)
 
     return state
 
@@ -1373,13 +1372,27 @@ def webhook_signal(
 
         append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
 
-        return {
+        response = {
             "ok": True,
             "decision": decision["decision"],
             "reason": decision["reason"],
             "gate": decision["gate"],
             "signal_id": p.get("signal_id") or p.get("signal_key"),
+            "execution_mode": execution_mode(),
         }
+
+        if decision.get("decision") == "ACCEPT":
+            execution_event = handle_execution_after_accept(p)
+            if execution_mode() == "TESTNET_MARKET":
+                market_res = execution_event.get("market_order_result")
+                response["market_order_result"] = market_res
+                if not (market_res or {}).get("ok"):
+                    response["ok"] = False
+                    response["execution_error_reason"] = execution_event.get("reason")
+            elif execution_mode() == "TESTNET_ORDER_TEST":
+                response["testnet_order_result"] = execution_event.get("order_test_result")
+
+        return response
 
 
 @app.get("/paper/state")
