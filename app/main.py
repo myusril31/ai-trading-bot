@@ -2140,9 +2140,11 @@ def build_v011_protection_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "decision": "PROTECTION_PLAN_REJECTED", "reason": f"symbol_not_allowed_for_testnet:{symbol}", "symbol": symbol}
 
     sl = v011_d(payload.get("sl") or payload.get("stop_loss") or payload.get("invalid"))
-    tp1 = v011_d(payload.get("tp1"))
-    tp2 = v011_d(payload.get("tp2"))
-    tp3 = v011_d(payload.get("tp3"))
+    tp1 = v011_d(payload.get("tp1") or payload.get("tp_1") or payload.get("take_profit_1"))
+    tp2 = v011_d(payload.get("tp2") or payload.get("tp_2") or payload.get("take_profit_2"))
+    # Hotfix: allow v0.13 lifecycle/protection payload with only tp1+tp2.
+    # If tp3 is not provided, mirror tp2 for a valid 3-leg protective plan.
+    tp3 = v011_d(payload.get("tp3") or payload.get("tp_3") or payload.get("take_profit_3") or payload.get("tp2"))
 
     if sl <= 0 or tp1 <= 0 or tp2 <= 0 or tp3 <= 0:
         return {"ok": False, "decision": "PROTECTION_PLAN_REJECTED", "reason": "missing_or_invalid_sl_tp", "symbol": symbol}
@@ -3058,7 +3060,8 @@ def v013_lifecycle_guard(symbol: str) -> Dict[str, Any]:
 
 def v013_extract_position_amt(position_res: Dict[str, Any], symbol: str) -> str:
     open_pos = v010_find_open_position(position_res, symbol) or {}
-    return str(open_pos.get("positionAmt") or "0")
+    # v010_find_open_position returns key: position_amt (not positionAmt).
+    return str(open_pos.get("position_amt") or open_pos.get("positionAmt") or "0")
 
 
 def v013_fetch_open_algo_orders(symbol: str) -> Dict[str, Any]:
