@@ -9,7 +9,7 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.14-execution-journal-reconciliation-safety"
+APP_VERSION = "v0.15-operator-reporting"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -81,6 +81,15 @@ class PaperCloseAllPayload(BaseModel):
     close_price: Optional[float] = None
     notes: Optional[str] = None
 
+
+class OperatorSymbolPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    symbol: Optional[str] = None
+    date_wib: Optional[str] = None
+    date_utc: Optional[str] = None
+    signal_key: Optional[str] = None
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -121,6 +130,114 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+
+
+def send_telegram_message(text: str) -> Dict[str, Any]:
+    if not env_bool("TELEGRAM_ENABLED", False):
+        return {"ok": True, "sent": False, "skipped": True, "reason": "telegram_disabled"}
+    if not env_bool("TELEGRAM_REPORTING_ENABLED", True):
+        return {"ok": True, "sent": False, "skipped": True, "reason": "telegram_reporting_disabled"}
+
+    token = str(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = str(os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not chat_id:
+        return {"ok": False, "sent": False, "skipped": True, "reason": "telegram_credentials_missing"}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text})
+    req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            ok = 200 <= int(resp.getcode() or 0) < 300
+            return {"ok": ok, "sent": ok, "skipped": False, "reason": "sent" if ok else "telegram_http_non_2xx"}
+    except Exception as e:
+        print(f"[telegram] send failed: {e}")
+        return {"ok": False, "sent": False, "skipped": False, "reason": "telegram_send_failed", "error": str(e)}
+
+
+def fire_and_forget_telegram(text: str) -> None:
+    def _run() -> None:
+        try:
+            send_telegram_message(text)
+        except Exception as e:
+            print(f"[telegram] unexpected failure: {e}")
+
+    Thread(target=_run, daemon=True).start()
+
+
+def notify_signal_decision_async(p: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    try:
+        msg = format_signal_decision_message(p, decision)
+    except Exception as e:
+        print(f"[telegram] decision message format failed: {e}")
+        return
+    try:
+        fire_and_forget_telegram(msg)
+    except Exception as e:
+        print(f"[telegram] decision async notify failed: {e}")
+
+
+def operator_status_payload(symbol: str = "") -> Dict[str, Any]:
+    safety = v014_safety_summary(symbol)
+    return {
+        "ok": safety.get("ok"),
+        "mode": get_mode(),
+        "execution_mode": safety.get("execution_mode"),
+        "binance_env": safety.get("binance_env"),
+        "safe_to_continue": safety.get("safe_to_continue"),
+        "mismatch_state": safety.get("mismatch_state"),
+        "open_paper_positions": safety.get("open_paper_positions"),
+        "symbol": safety.get("symbol"),
+        "positionAmt": safety.get("positionAmt"),
+        "open_algo_count": safety.get("open_algo_count"),
+        "reasons": safety.get("reasons") or [],
+        "timestamp_utc": safety.get("timestamp_utc"),
+    }
+
+
+def format_safety_summary_message(s: Dict[str, Any]) -> str:
+    reasons = s.get("reasons") or []
+    return "\n".join([
+        "🛡️ SAFETY SUMMARY",
+        f"Mode: {get_mode()}",
+        f"Execution: {s.get('execution_mode')}",
+        f"Env: {s.get('binance_env')}",
+        f"Safe: {str(bool(s.get('safe_to_continue'))).lower()}",
+        f"Mismatch: {s.get('mismatch_state')}",
+        f"Paper Open: {s.get('open_paper_positions')}",
+        f"Symbol: {s.get('symbol') or '-'}",
+        f"PositionAmt: {s.get('positionAmt')}",
+        f"Open Algo: {s.get('open_algo_count')}",
+        f"Reasons: {'; '.join(reasons) if reasons else '-'}",
+    ])
+
+
+def decision_do_not_queue(decision: Dict[str, Any]) -> bool:
+    if str(decision.get("decision") or "").upper() != "REJECT":
+        return False
+    text = f"{decision.get('reason','')}|{decision.get('gate','')}".lower()
+    keys = ["max_open", "stale", "duplicate", "unsafe", "cooldown", "daily", "stop"]
+    return any(k in text for k in keys)
+
+
+def format_signal_decision_message(p: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    score = p.get("score")
+    priority = p.get("priority")
+    return "\n".join([
+        "📡 SIGNAL DECISION",
+        f"Pair: {pair_of(p) or '-'}",
+        f"Symbol: {v010_normalize_symbol(p.get('symbol') or p.get('pair') or '') or '-'}",
+        f"Dir: {direction_of(p) or '-'}",
+        f"Status: {status_of(p) or '-'}",
+        f"Score: {score if score is not None else 'pending'}",
+        f"Priority: {priority if priority not in (None, '') else 'pending'}",
+        "",
+        f"Decision: {decision.get('decision')}",
+        f"Reason: {decision.get('reason')}",
+        f"Gate: {decision.get('gate')}",
+        f"Do Not Queue: {str(decision_do_not_queue(decision)).lower()}",
+        f"Execution: {execution_mode()}",
+    ])
 def normalize_pair(x: Any) -> str:
     return str(x or "").strip().upper()
 
@@ -1404,6 +1521,7 @@ def webhook_signal(
                 "gate": "mode_gate",
             }
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
 
             return {
                 "ok": True,
@@ -1418,6 +1536,8 @@ def webhook_signal(
         save_state(state)
 
         append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+
+        notify_signal_decision_async(p, decision)
 
         response = {
             "ok": True,
@@ -3456,3 +3576,286 @@ def v014_safety_summary_endpoint(request: Request, symbol: str = ""):
     if not v010_auth_ok(request):
         return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
     return v014_safety_summary(symbol)
+
+
+def _extract_event_day(row: Dict[str, Any], primary_fields: list[str], fallback_fields: Optional[list[str]] = None) -> str:
+    for field in primary_fields:
+        ts = str(row.get(field) or "").strip()
+        if ts and len(ts) >= 10:
+            return ts[:10]
+    for field in (fallback_fields or []):
+        ts = str(row.get(field) or "").strip()
+        if ts and len(ts) >= 10:
+            dt = parse_iso_utc(ts)
+            if dt:
+                return dt.astimezone(WIB).date().isoformat()
+            return ts[:10]
+    return ""
+
+
+def count_events_today(path: Path, day: str, timestamp_fields: list[str], filter_fn, fallback_timestamp_fields: Optional[list[str]] = None) -> Optional[int]:
+    if not path.exists():
+        return None
+    c = 0
+    seen = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                row_day = _extract_event_day(row, timestamp_fields, fallback_timestamp_fields)
+                if row_day == day:
+                    seen += 1
+                    if filter_fn(row):
+                        c += 1
+    except Exception:
+        return None
+    if seen == 0:
+        return None
+    return c
+
+
+def sum_events_today(path: Path, day: str, timestamp_fields: list[str], field: str, filter_fn, fallback_timestamp_fields: Optional[list[str]] = None) -> Optional[int]:
+    if not path.exists():
+        return None
+    total = 0
+    seen = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                row_day = _extract_event_day(row, timestamp_fields, fallback_timestamp_fields)
+                if row_day == day:
+                    seen += 1
+                    if not filter_fn(row):
+                        continue
+                    try:
+                        val = int(row.get(field) or 0)
+                    except Exception:
+                        continue
+                    if val > 0:
+                        total += val
+    except Exception:
+        return None
+    if seen == 0:
+        return None
+    return total
+
+
+def _safe_metric_text(v: Optional[int]) -> str:
+    if v is None:
+        return "pending"
+    return str(v)
+
+
+def _parse_date_ymd(raw: str) -> str:
+    t = str(raw or "").strip()
+    if not t:
+        return ""
+    if len(t) >= 10:
+        return t[:10]
+    return ""
+
+
+def _resolve_report_date_wib(payload: Optional[OperatorSymbolPayload]) -> str:
+    if payload:
+        d_wib = _parse_date_ymd(payload.date_wib or "")
+        if d_wib:
+            return d_wib
+        d_utc = _parse_date_ymd(payload.date_utc or "")
+        if d_utc:
+            try:
+                dt = datetime.fromisoformat(f"{d_utc}T00:00:00+00:00").astimezone(WIB)
+                return dt.date().isoformat()
+            except Exception:
+                return d_utc
+    return datetime.now(WIB).date().isoformat()
+
+
+@app.api_route("/operator/status", methods=["GET", "POST"])
+def operator_status(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    req_symbol = symbol or ((payload.symbol if payload else "") or "")
+    return operator_status_payload(req_symbol)
+
+
+@app.post("/operator/send-safety-summary")
+def operator_send_safety_summary(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    req_symbol = symbol or ((payload.symbol if payload else "") or "")
+    summary = operator_status_payload(req_symbol)
+    msg = format_safety_summary_message(summary)
+    telegram = send_telegram_message(msg)
+    return {"ok": True, "safety_summary": summary, "telegram": telegram}
+
+
+def format_execution_summary_message(signal_key: str, row: Dict[str, Any]) -> str:
+    return "\n".join([
+        "📄 EXECUTION SUMMARY",
+        f"Signal: {signal_key}",
+        f"Pair: {row.get('pair') or '-'}",
+        f"Symbol: {row.get('symbol') or '-'}",
+        f"Dir: {row.get('direction') or row.get('dir') or '-'}",
+        f"Paper: {row.get('paper_decision') or '-'} / {row.get('paper_reason') or '-'}",
+        f"Lifecycle: {row.get('lifecycle_state') or '-'}",
+        f"Entry: {row.get('entry_status') or row.get('entry_result') or '-'}",
+        f"Protection: {row.get('protection_status') or row.get('protection_summary') or '-'}",
+        f"Notes: {row.get('notes') or '-'}",
+        f"Safe: {row.get('safe_restored') if row.get('safe_restored') is not None else '-'}",
+    ])
+
+
+@app.post("/operator/send-execution-summary")
+def operator_send_execution_summary(request: Request, payload: Optional[OperatorSymbolPayload] = None, signal_key: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    key = str(signal_key or (payload.signal_key if payload else "") or "").strip()
+    if not key:
+        return {"ok": False, "reason": "signal_key_required"}
+    row = v014_execution_summary_latest(key)
+    if not row:
+        return {"ok": False, "reason": "not_found", "signal_key": key}
+    msg = format_execution_summary_message(key, row)
+    telegram = send_telegram_message(msg)
+    return {"ok": True, "signal_key": key, "summary": row, "telegram": telegram}
+
+
+@app.post("/operator/daily-report")
+def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    req_symbol = symbol or ((payload.symbol if payload else "") or "")
+    summary = operator_status_payload(req_symbol)
+    state = load_state()
+    dc = state.get("daily_counters") or {}
+    report_date_wib = _resolve_report_date_wib(payload)
+    accept = int(dc.get("accepted_count") or 0)
+    reject = int(dc.get("rejected_count") or 0)
+    total = accept + reject
+    reject_by_gate = dc.get("rejected_by_gate") or {}
+
+    wib_ts_fields = [
+        "ts_wib", "timestamp_wib", "created_at_wib", "event_at_wib",
+        "decision_at_wib", "accepted_at_wib", "closed_at_wib",
+        "run_ts_wib", "confirmed_ts_wib", "signal_time_wib", "received_at_wib",
+    ]
+    utc_ts_fields = [
+        "ts_utc", "timestamp_utc", "created_at_utc", "event_at_utc",
+        "decision_at_utc", "accepted_at_utc", "closed_at_utc", "received_at_utc",
+        "received_at", "ts", "created_at",
+    ]
+    signals_received = count_events_today(
+        SIGNALS_LOG,
+        report_date_wib,
+        wib_ts_fields,
+        lambda _row: True,
+        fallback_timestamp_fields=utc_ts_fields,
+    )
+    entries_today = count_events_today(
+        EXECUTION_PLANS_LOG,
+        report_date_wib,
+        wib_ts_fields,
+        lambda _row: True,
+        fallback_timestamp_fields=utc_ts_fields,
+    )
+    protection_today = count_events_today(
+        EXECUTION_EVENTS_LOG,
+        report_date_wib,
+        wib_ts_fields,
+        lambda row: (
+            str(row.get("action") or "") == "TESTNET_PLACE_PROTECTION"
+            or str(row.get("decision") or "") == "PROTECTION_PLACED"
+            or str(row.get("reason") or "") == "all_protection_orders_placed"
+        ),
+        fallback_timestamp_fields=utc_ts_fields,
+    )
+    stale_cleanup = sum_events_today(
+        EXECUTION_EVENTS_LOG,
+        report_date_wib,
+        wib_ts_fields,
+        "cleanup_count",
+        lambda row: int(row.get("cleanup_count") or 0) > 0
+        or (
+            str(row.get("lifecycle_state") or "") == "POSITION_CLOSED_STALE_ALGO"
+            and int(row.get("cleanup_count") or 0) > 0
+        ),
+        fallback_timestamp_fields=utc_ts_fields,
+    )
+
+    max_trades = env_int("MAX_TRADES_PER_DAY", 0)
+    max_open = env_int("MAX_OPEN_POSITIONS", 0)
+    loss_cap = env_int("MAX_CONSECUTIVE_LOSSES", 0)
+
+    partial_data = signals_received is None
+    report_status = "BLOCKED" if not summary.get("safe_to_continue") else ("WARN" if partial_data else "OK")
+
+    reject_lines = []
+    for gate, cnt in sorted(reject_by_gate.items()):
+        reject_lines.append(f"- {gate}: {int(cnt or 0)}")
+    known_reject_total = sum(int(v or 0) for v in reject_by_gate.values())
+    reject_lines.append(f"- other: {max(0, reject - known_reject_total)}")
+
+    report_lines = [
+        "📊 DAILY BOT REPORT",
+        "",
+        "SYSTEM",
+        f"Date WIB: {report_date_wib}",
+        f"Mode: {summary.get('mode')}",
+        f"Execution: {summary.get('execution_mode')}",
+        f"Env: {summary.get('binance_env')}",
+        f"Safe: {str(bool(summary.get('safe_to_continue'))).lower()}",
+        f"Mismatch: {summary.get('mismatch_state')}",
+        f"Paper Open: {summary.get('open_paper_positions')}",
+        f"PositionAmt: {summary.get('positionAmt')}",
+        f"Open Algo: {summary.get('open_algo_count')}",
+        "",
+        "SIGNALS",
+        f"Total Received: {_safe_metric_text(signals_received)}",
+        f"ACCEPT: {accept}",
+        f"REJECT: {reject}",
+        "Reject Breakdown:",
+        "",
+        "EXECUTION",
+        f"Entries Today: {_safe_metric_text(entries_today)}",
+        f"Protection Placed: {_safe_metric_text(protection_today)}",
+        "Lifecycle Clean: pending",
+        f"Stale Cleanup: {_safe_metric_text(stale_cleanup)}",
+        f"Open Count: {summary.get('open_paper_positions')}",
+        "",
+        "PERFORMANCE",
+        "Closed Trades: pending",
+        "Win/Loss/BE: pending",
+        "Net PnL: pending",
+        "Avg R: pending",
+        "Best Pair: pending",
+        "Worst Pair: pending",
+        "",
+        "DISCIPLINE",
+        f"Daily Trades Used / MAX_TRADES_PER_DAY: {accept}/{max_trades if max_trades else 'pending'}",
+        f"Loss Streak / MAX_CONSECUTIVE_LOSSES: pending/{loss_cap if loss_cap else 'pending'}",
+        f"Max Open Position Used / MAX_OPEN_POSITIONS: {summary.get('open_paper_positions')}/{max_open if max_open else 'pending'}",
+        "No Queue Rule: ON",
+        f"Status: {report_status}",
+    ]
+    idx = report_lines.index("Reject Breakdown:") + 1
+    report_lines[idx:idx] = reject_lines
+    report = "\n".join(report_lines)
+    telegram = send_telegram_message(report)
+    if report_status == "OK" and not telegram.get("ok") and not telegram.get("skipped"):
+        report_status = "WARN"
+        report = report.replace("Status: OK", "Status: WARN")
+    return {"ok": True, "report": report, "telegram": telegram}
