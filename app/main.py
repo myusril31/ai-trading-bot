@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.16-cost-gate"
+APP_VERSION = "v0.17-progressive-tp-lifecycle"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -29,6 +29,7 @@ PAPER_EVENTS_LOG = LOG_DIR / "paper_events.jsonl"
 EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
 EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
 EXECUTION_SUMMARY_LOG = LOG_DIR / "execution_summary.jsonl"
+TP_LIFECYCLE_STATE_FILE = STATE_DIR / "tp_lifecycle_state.json"
 
 WIB = ZoneInfo("Asia/Jakarta")
 LOCK = Lock()
@@ -3307,6 +3308,40 @@ async def v012_place_protection_endpoint(request: Request):
         "notes": event.get("reason"),
     })
 
+    tp_map = {str(t.get("label") or "").upper(): t for t in (plan.get("tp_plans") or [])}
+    sl_plan = plan.get("sl_plan") or {}
+    initial_qty_fallback = v017_d(plan.get("initial_qty") or "0")
+    if initial_qty_fallback <= Decimal("0"):
+        initial_qty_fallback = v017_d(plan.get("quantity") or "0")
+    if initial_qty_fallback <= Decimal("0"):
+        initial_qty_fallback = sum(abs(v017_d(tp.get("quantity") or "0")) for tp in (plan.get("tp_plans") or []))
+    sl_algo_id = (latest_by_label.get("SL") or {}).get("algoId")
+    lifecycle_stage_seed = "ENTRY_PROTECTED" if (decision == "PROTECTION_PLACED" and sl_algo_id) else "NEEDS_REVIEW"
+    v017_upsert_tp_lifecycle(signal_key, {
+        "symbol": symbol,
+        "direction": plan.get("direction"),
+        "entry_price": plan.get("entry_price"),
+        "initial_qty": str(initial_qty_fallback),
+        "current_position_qty": str(initial_qty_fallback),
+        "tp1_price": (tp_map.get("TP1") or {}).get("stop_price"),
+        "tp2_price": (tp_map.get("TP2") or {}).get("stop_price"),
+        "tp3_price": (tp_map.get("TP3") or {}).get("stop_price"),
+        "tp1_qty": (tp_map.get("TP1") or {}).get("quantity"),
+        "tp2_qty": (tp_map.get("TP2") or {}).get("quantity"),
+        "tp3_qty": (tp_map.get("TP3") or {}).get("quantity"),
+        "initial_sl_price": sl_plan.get("stop_price"),
+        "current_sl_algo_id": sl_algo_id,
+        "current_sl_client_algo_id": (latest_by_label.get("SL") or {}).get("clientOrderId"),
+        "tp1_algo_id": (latest_by_label.get("TP1") or {}).get("algoId"),
+        "tp2_algo_id": (latest_by_label.get("TP2") or {}).get("algoId"),
+        "tp3_algo_id": (latest_by_label.get("TP3") or {}).get("algoId"),
+        "tp1_processed": False,
+        "tp2_processed": False,
+        "be_moved": False,
+        "lock_profit_moved": False,
+        "lifecycle_stage": lifecycle_stage_seed,
+    })
+
     return {
         "ok": decision == "PROTECTION_PLACED",
         "decision": decision,
@@ -3664,6 +3699,61 @@ def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[s
     }
 
 
+
+
+def v017_d(val: Any) -> Decimal:
+    try:
+        return Decimal(str(val))
+    except Exception:
+        return Decimal("0")
+
+
+def v017_load_tp_state() -> dict:
+    try:
+        if not TP_LIFECYCLE_STATE_FILE.exists():
+            return {"signals": {}}
+        obj = json.loads(TP_LIFECYCLE_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return {"signals": {}}
+        obj.setdefault("signals", {})
+        return obj
+    except Exception:
+        return {"signals": {}}
+
+
+def v017_save_tp_state(state: dict) -> None:
+    ensure_dirs()
+    TP_LIFECYCLE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TP_LIFECYCLE_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def v017_get_tp_lifecycle(signal_key: str) -> dict:
+    state = v017_load_tp_state()
+    return (state.get("signals") or {}).get(signal_key) or {}
+
+
+def v017_upsert_tp_lifecycle(signal_key: str, patch: dict) -> dict:
+    state = v017_load_tp_state()
+    state.setdefault("signals", {})
+    cur = dict((state.get("signals") or {}).get(signal_key) or {})
+    cur.update(patch or {})
+    cur["signal_key"] = signal_key
+    cur["updated_at"] = utc_now_iso()
+    state["signals"][signal_key] = cur
+    v017_save_tp_state(state)
+    return cur
+
+
+def v017_cost_buffer_price(entry_price: Decimal) -> Decimal:
+    taker = v017_d(os.getenv("TAKER_FEE_RATE", "0.0004"))
+    fee_mult = v017_d(os.getenv("FEE_BUFFER_MULT", "1.0"))
+    slippage = v017_d(os.getenv("SLIPPAGE_BUFFER_RATE", "0.0005"))
+    return entry_price * (taker * fee_mult * Decimal("2") + slippage)
+
+
+def v017_is_valid_stop(price: Decimal) -> bool:
+    return price > Decimal("0")
+
 def assert_controlled_test_session_clean(symbol: str, force: bool = False, ignore_signal_key: str = "") -> Dict[str, Any]:
     safety = v014_safety_summary(symbol, ignore_signal_key=ignore_signal_key)
     if force:
@@ -3781,6 +3871,161 @@ async def v013_testnet_lifecycle_check(request: Request):
         "open_algo_orders_after_cleanup": open_algo_orders_after_cleanup,
     }
 
+
+
+
+@app.post("/testnet/tp-lifecycle-check")
+async def v017_testnet_tp_lifecycle_check(request: Request):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    symbol = v010_normalize_symbol(payload.get("symbol") or payload.get("pair") or "")
+    signal_key = str(payload.get("signal_key") or payload.get("signal_id") or "").strip()
+    if not symbol or not signal_key:
+        return {"ok": False, "reason": "missing_symbol_or_signal_key"}
+
+    guard = v013_lifecycle_guard(symbol)
+    if not guard.get("ok"):
+        return {"ok": False, "symbol": symbol, "signal_key": signal_key, "reason": guard.get("reason")}
+
+    row = v017_get_tp_lifecycle(signal_key)
+    if not row:
+        return {"ok": False, "symbol": symbol, "signal_key": signal_key, "reason": "lifecycle_state_not_found"}
+    if str(row.get("lifecycle_stage") or "") == "NEEDS_REVIEW":
+        return {"ok": False, "symbol": symbol, "signal_key": signal_key, "reason": "lifecycle_needs_manual_review"}
+
+    pos_res = binance_testnet_position_risk(symbol)
+    if not pos_res.get("ok"):
+        return {"ok": False, "symbol": symbol, "signal_key": signal_key, "reason": pos_res.get("reason")}
+    position_amt = v013_extract_position_amt(pos_res, symbol)
+    abs_pos = abs(v017_d(position_amt))
+
+    open_algo_res = v013_fetch_open_algo_orders(symbol)
+    open_algo_orders = open_algo_res.get("orders") or []
+
+    initial_qty = abs(v017_d(row.get("initial_qty")))
+    tp1_qty = abs(v017_d(row.get("tp1_qty")))
+    tp2_qty = abs(v017_d(row.get("tp2_qty")))
+    entry_price = v017_d(row.get("entry_price"))
+    tp1_price = v017_d(row.get("tp1_price"))
+    direction = str(row.get("direction") or "").upper()
+
+    detected_event = "NONE"
+    action_taken = "NONE"
+    reason = ""
+    old_sl_cancel_ok = None
+    new_sl_algo_id = None
+    new_sl_client_algo_id = None
+    new_sl_price = None
+    stage = str(row.get("lifecycle_stage") or "ENTRY_PROTECTED")
+
+    cleanup_results = []
+    if not open_algo_res.get("ok"):
+        reason = "open_algo_fetch_failed"
+        stage = "NEEDS_REVIEW"
+        row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+    elif abs_pos == Decimal("0"):
+        cleanup_results = v013_cancel_stale_algo_orders(symbol, open_algo_orders)
+        cleanup_failed = any(not bool(r.get("ok")) for r in (cleanup_results or []) if isinstance(r, dict))
+        if cleanup_failed:
+            action_taken = "CLEANUP_LEFTOVER_ALGO_FAILED"
+            reason = "leftover_algo_cleanup_failed"
+            stage = "NEEDS_REVIEW"
+        else:
+            action_taken = "CLEANUP_LEFTOVER_ALGO"
+            stage = "POSITION_CLOSED_CLEAN"
+        row = v017_upsert_tp_lifecycle(signal_key, {"current_position_qty": "0", "lifecycle_stage": stage})
+    else:
+        remaining_qty = abs_pos
+        current_sl_algo_id = row.get("current_sl_algo_id")
+        current_sl_client_algo_id = row.get("current_sl_client_algo_id")
+        if direction not in ("LONG", "SHORT"):
+            reason = "invalid_direction"
+            stage = "NEEDS_REVIEW"
+            row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+        elif initial_qty <= Decimal("0"):
+            reason = "invalid_initial_qty"
+            stage = "NEEDS_REVIEW"
+            row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+        elif remaining_qty <= Decimal("0"):
+            reason = "remaining_qty_unknown"
+            stage = "NEEDS_REVIEW"
+            row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+        elif not (current_sl_algo_id or current_sl_client_algo_id):
+            reason = "missing_current_sl_reference"
+            stage = "NEEDS_REVIEW"
+            row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+        elif abs_pos <= (initial_qty - tp1_qty - tp2_qty) and not bool(row.get("tp2_processed")):
+            detected_event = "TP2_HIT"
+            cost_buf = v017_cost_buffer_price(entry_price)
+            lock_price = tp1_price + cost_buf if direction == "LONG" else tp1_price - cost_buf
+            if not v017_is_valid_stop(lock_price):
+                reason = "invalid_lock_profit_price"
+                stage = "NEEDS_REVIEW"
+                row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+            else:
+                cancel_res = v012_cancel_order(symbol, current_sl_algo_id, current_sl_client_algo_id)
+                old_sl_cancel_ok = bool(cancel_res.get("ok"))
+                if not old_sl_cancel_ok:
+                    reason = "old_sl_cancel_failed"
+                    stage = "NEEDS_REVIEW"
+                    row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+                else:
+                    plan = {"side": "SELL" if direction == "LONG" else "BUY", "type": "STOP_MARKET", "quantity": str(remaining_qty), "stop_price": str(lock_price), "reduceOnly": True}
+                    new_sl = v012_place_protective_order(symbol, "SL_LOCK", plan, "V017")
+                    if (not new_sl.get("ok")) or (not new_sl.get("algoId")):
+                        reason = "new_sl_place_failed"
+                        stage = "NEEDS_REVIEW"
+                        row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+                    else:
+                        new_sl_algo_id = new_sl.get("algoId")
+                        new_sl_client_algo_id = (new_sl.get("response") or {}).get("body", {}).get("clientAlgoId") if isinstance(new_sl.get("response"), dict) else None
+                        new_sl_price = str(lock_price)
+                        action_taken = "MOVE_SL_TO_LOCK_PROFIT_NET"
+                        stage = "TP2_HIT_LOCK_PROFIT_MOVED"
+                        row = v017_upsert_tp_lifecycle(signal_key, {"tp1_processed": True, "be_moved": True, "tp2_processed": True, "lock_profit_moved": True, "current_sl_algo_id": new_sl_algo_id, "current_sl_client_algo_id": new_sl_client_algo_id, "current_position_qty": str(remaining_qty), "lifecycle_stage": stage})
+        elif abs_pos <= (initial_qty - tp1_qty) and not bool(row.get("tp1_processed")):
+            detected_event = "TP1_HIT"
+            cost_buf = v017_cost_buffer_price(entry_price)
+            be_price = entry_price + cost_buf if direction == "LONG" else entry_price - cost_buf
+            if not v017_is_valid_stop(be_price):
+                reason = "invalid_be_net_price"
+                stage = "NEEDS_REVIEW"
+                row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+            else:
+                cancel_res = v012_cancel_order(symbol, current_sl_algo_id, current_sl_client_algo_id)
+                old_sl_cancel_ok = bool(cancel_res.get("ok"))
+                if not old_sl_cancel_ok:
+                    reason = "old_sl_cancel_failed"
+                    stage = "NEEDS_REVIEW"
+                    row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+                else:
+                    plan = {"side": "SELL" if direction == "LONG" else "BUY", "type": "STOP_MARKET", "quantity": str(remaining_qty), "stop_price": str(be_price), "reduceOnly": True}
+                    new_sl = v012_place_protective_order(symbol, "SL_BE", plan, "V017")
+                    if (not new_sl.get("ok")) or (not new_sl.get("algoId")):
+                        reason = "new_sl_place_failed"
+                        stage = "NEEDS_REVIEW"
+                        row = v017_upsert_tp_lifecycle(signal_key, {"lifecycle_stage": stage})
+                    else:
+                        new_sl_algo_id = new_sl.get("algoId")
+                        new_sl_client_algo_id = (new_sl.get("response") or {}).get("body", {}).get("clientAlgoId") if isinstance(new_sl.get("response"), dict) else None
+                        new_sl_price = str(be_price)
+                        action_taken = "MOVE_SL_TO_BE_NET"
+                        stage = "TP1_HIT_BE_MOVED"
+                        row = v017_upsert_tp_lifecycle(signal_key, {"tp1_processed": True, "be_moved": True, "current_sl_algo_id": new_sl_algo_id, "current_sl_client_algo_id": new_sl_client_algo_id, "current_position_qty": str(remaining_qty), "lifecycle_stage": stage})
+        elif abs_pos <= (initial_qty - tp1_qty) and bool(row.get("tp1_processed")):
+            reason = "already_processed"
+
+    event = {"event_at_utc": utc_now_iso(), "event_at_wib": wib_now_iso(), "app_version": APP_VERSION, "action": "TESTNET_TP_LIFECYCLE_CHECK", "symbol": symbol, "signal_key": signal_key, "positionAmt": str(position_amt), "detected_event": detected_event, "action_taken": action_taken, "reason": reason or None, "lifecycle_stage": stage, "cleanup_count": len(cleanup_results), "cleanup_results": cleanup_results, "funding_buffer": "pending"}
+    append_jsonl(EXECUTION_EVENTS_LOG, event)
+    v014_execution_summary_write(signal_key, {"symbol": symbol, "lifecycle_state": str(row.get("lifecycle_stage") or stage), "tp_lifecycle_stage": str(row.get("lifecycle_stage") or stage), "notes": action_taken if action_taken != "NONE" else (reason or "NONE")})
+
+    return {"ok": True, "symbol": symbol, "signal_key": signal_key, "positionAmt": str(position_amt), "initial_qty": str(row.get("initial_qty") or ""), "remaining_qty": str(abs_pos), "detected_event": detected_event, "action_taken": action_taken, "reason": reason or None, "old_sl_cancel_ok": old_sl_cancel_ok, "new_sl_algo_id": new_sl_algo_id, "new_sl_client_algo_id": new_sl_client_algo_id, "new_sl_price": new_sl_price, "cleanup_count": len(cleanup_results), "cleanup_results": cleanup_results, "lifecycle_stage": str(row.get("lifecycle_stage") or stage)}
 
 @app.get("/testnet/execution-summary")
 def v014_execution_summary(request: Request, signal_key: str = ""):
@@ -3932,6 +4177,7 @@ def format_execution_summary_message(signal_key: str, row: Dict[str, Any]) -> st
         f"Dir: {row.get('direction') or row.get('dir') or '-'}",
         f"Paper: {row.get('paper_decision') or '-'} / {row.get('paper_reason') or '-'}",
         f"Lifecycle: {row.get('lifecycle_state') or '-'}",
+        f"TP Lifecycle: {row.get('tp_lifecycle_stage') or '-'}",
         f"Entry: {row.get('entry_status') or row.get('entry_result') or '-'}",
         f"Protection: {row.get('protection_status') or row.get('protection_summary') or '-'}",
         f"Notes: {row.get('notes') or '-'}",
@@ -4054,6 +4300,7 @@ def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayl
         f"Entries Today: {_safe_metric_text(entries_today)}",
         f"Protection Placed: {_safe_metric_text(protection_today)}",
         "Lifecycle Clean: pending",
+        "TP Lifecycle Stage: pending",
         f"Stale Cleanup: {_safe_metric_text(stale_cleanup)}",
         f"Open Count: {summary.get('open_paper_positions')}",
         "",
