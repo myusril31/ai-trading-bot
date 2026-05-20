@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.17-progressive-tp-lifecycle"
+APP_VERSION = "v0.18-paper-performance-realization"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -26,6 +26,7 @@ SIGNALS_LOG = LOG_DIR / "signals.jsonl"
 DECISIONS_LOG = LOG_DIR / "decisions.jsonl"
 PAPER_STATE_FILE = STATE_DIR / "paper_state.json"
 PAPER_EVENTS_LOG = LOG_DIR / "paper_events.jsonl"
+PAPER_PERFORMANCE_LOG = LOG_DIR / "paper_performance.jsonl"
 EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
 EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
 EXECUTION_SUMMARY_LOG = LOG_DIR / "execution_summary.jsonl"
@@ -68,7 +69,7 @@ class PaperClosePayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     signal_key: str
-    outcome: Optional[str] = "CLOSED_MANUAL"
+    outcome: Optional[str] = None
     close_reason: Optional[str] = "MANUAL_CLOSE"
     close_price: Optional[float] = None
     notes: Optional[str] = None
@@ -77,7 +78,7 @@ class PaperClosePayload(BaseModel):
 class PaperCloseAllPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    outcome: Optional[str] = "CLOSED_MANUAL"
+    outcome: Optional[str] = None
     close_reason: Optional[str] = "MANUAL_CLOSE_ALL"
     close_price: Optional[float] = None
     notes: Optional[str] = None
@@ -131,6 +132,14 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
 
 
 def send_telegram_message(text: str) -> Dict[str, Any]:
@@ -1544,6 +1553,172 @@ def append_paper_event(event_type: str, position: Dict[str, Any], extra: Optiona
     event.update(extra)
     append_jsonl(PAPER_EVENTS_LOG, event)
 
+def paper_win_loss_be(outcome: str, include_performance: bool, needs_review: bool) -> str:
+    o = str(outcome or "").upper()
+    if needs_review and not include_performance:
+        return "PENDING"
+    if o in {"TP1", "TP2", "TP3", "MANUAL_PROFIT"}:
+        return "WIN"
+    if o in {"SL", "MANUAL_LOSS"}:
+        return "LOSS"
+    if o == "BE":
+        return "BE"
+    return "REVIEW"
+
+
+def to_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def classify_paper_outcome(position: Dict[str, Any], close_price: Optional[float], r_realized: Optional[float]) -> str:
+    direction = str(position.get("direction") or "").upper()
+    sl = to_float_or_none(position.get("sl"))
+    tp1 = to_float_or_none(position.get("tp1"))
+    tp2 = to_float_or_none(position.get("tp2"))
+    tp3 = to_float_or_none(position.get("tp3"))
+    entry = to_float_or_none(position.get("entry_mid") or position.get("entry_price"))
+    if close_price is None:
+        return "CLOSED_MANUAL"
+
+    if direction == "LONG":
+        if sl is not None and close_price <= sl:
+            return "SL"
+        if tp3 is not None and close_price >= tp3:
+            return "TP3"
+        if tp2 is not None and close_price >= tp2:
+            return "TP2"
+        if tp1 is not None and close_price >= tp1:
+            return "TP1"
+        if r_realized is not None and abs(r_realized) <= env_float("PAPER_BE_TOLERANCE_R", 0.05):
+            return "BE"
+        if entry is not None and close_price > entry:
+            return "MANUAL_PROFIT"
+        if entry is not None and close_price < entry:
+            return "MANUAL_LOSS"
+    elif direction == "SHORT":
+        if sl is not None and close_price >= sl:
+            return "SL"
+        if tp3 is not None and close_price <= tp3:
+            return "TP3"
+        if tp2 is not None and close_price <= tp2:
+            return "TP2"
+        if tp1 is not None and close_price <= tp1:
+            return "TP1"
+        if r_realized is not None and abs(r_realized) <= env_float("PAPER_BE_TOLERANCE_R", 0.05):
+            return "BE"
+        if entry is not None and close_price < entry:
+            return "MANUAL_PROFIT"
+        if entry is not None and close_price > entry:
+            return "MANUAL_LOSS"
+    return "CLOSED_MANUAL"
+
+
+def compute_r_realized(position: Dict[str, Any], close_price: Optional[float]) -> Optional[float]:
+    entry = to_float_or_none(position.get("entry_mid") or position.get("entry_price"))
+    sl = to_float_or_none(position.get("sl"))
+    direction = str(position.get("direction") or "").upper()
+    if entry is None or sl is None or close_price is None:
+        return None
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0:
+        return None
+    if direction == "LONG":
+        return (close_price - entry) / risk_per_unit
+    if direction == "SHORT":
+        return (entry - close_price) / risk_per_unit
+    return None
+
+
+def compute_gross_pnl(position: Dict[str, Any], close_price: Optional[float]) -> Any:
+    entry = to_float_or_none(position.get("entry_mid") or position.get("entry_price"))
+    qty = to_float_or_none(position.get("quantity"))
+    direction = str(position.get("direction") or "").upper()
+    if close_price is None or entry is None:
+        return "pending"
+    if qty is None:
+        return "pending"
+    if direction == "LONG":
+        return (close_price - entry) * qty
+    if direction == "SHORT":
+        return (entry - close_price) * qty
+    return "pending"
+
+
+def append_paper_performance(position: Dict[str, Any], payload_outcome: Optional[str], close_price: Optional[float]) -> Dict[str, Any]:
+    include_performance = True
+    needs_review = False
+    reason = ""
+    try:
+        r_realized = compute_r_realized(position, close_price)
+        if payload_outcome:
+            outcome = str(payload_outcome).strip().upper()
+        elif close_price is not None:
+            outcome = classify_paper_outcome(position, close_price, r_realized)
+        else:
+            outcome = "CLOSED_MANUAL"
+            include_performance = False
+            needs_review = True
+            reason = "missing_close_price"
+
+        gross_pnl_usdt = compute_gross_pnl(position, close_price)
+        rec = {
+            "signal_key": position.get("signal_key"),
+            "pair": position.get("pair"),
+            "symbol": position.get("symbol"),
+            "direction": position.get("direction"),
+            "entry_price": to_float_or_none(position.get("entry_mid") or position.get("entry_price")),
+            "sl": to_float_or_none(position.get("sl")),
+            "tp1": to_float_or_none(position.get("tp1")),
+            "tp2": to_float_or_none(position.get("tp2")),
+            "tp3": to_float_or_none(position.get("tp3")),
+            "close_price": close_price,
+            "quantity": to_float_or_none(position.get("quantity")),
+            "outcome": outcome,
+            "win_loss_be": paper_win_loss_be(outcome, include_performance, needs_review),
+            "r_realized": r_realized,
+            "gross_pnl_usdt": gross_pnl_usdt,
+            "include_performance": include_performance,
+            "needs_review": needs_review,
+            "reason": reason,
+            "opened_at_wib": position.get("opened_at_wib"),
+            "closed_at_wib": position.get("closed_at_wib"),
+            "created_at_utc": utc_now_iso(),
+        }
+        append_jsonl(PAPER_PERFORMANCE_LOG, rec)
+        return rec
+    except Exception as e:
+        rec = {
+            "signal_key": position.get("signal_key"),
+            "pair": position.get("pair"),
+            "symbol": position.get("symbol"),
+            "direction": position.get("direction"),
+            "entry_price": to_float_or_none(position.get("entry_mid") or position.get("entry_price")),
+            "sl": to_float_or_none(position.get("sl")),
+            "tp1": to_float_or_none(position.get("tp1")),
+            "tp2": to_float_or_none(position.get("tp2")),
+            "tp3": to_float_or_none(position.get("tp3")),
+            "close_price": close_price,
+            "quantity": to_float_or_none(position.get("quantity")),
+            "outcome": str(payload_outcome or "CLOSED_MANUAL").upper(),
+            "win_loss_be": "REVIEW",
+            "r_realized": None,
+            "gross_pnl_usdt": "pending",
+            "include_performance": False,
+            "needs_review": True,
+            "reason": f"performance_error:{e}",
+            "opened_at_wib": position.get("opened_at_wib"),
+            "closed_at_wib": position.get("closed_at_wib"),
+            "created_at_utc": utc_now_iso(),
+        }
+        append_jsonl(PAPER_PERFORMANCE_LOG, rec)
+        return rec
+
+
 def close_one_position_in_state(
     state: Dict[str, Any],
     signal_key: str,
@@ -1578,15 +1753,18 @@ def close_one_position_in_state(
         }
 
     closed_at_utc = utc_now_iso()
-    close_status = normalize_close_status(outcome)
-
-    target["status"] = close_status
     target["closed_at_utc"] = closed_at_utc
     target["closed_at_wib"] = datetime.now(WIB).isoformat()
     target["close_reason"] = close_reason or "MANUAL_CLOSE"
-    target["close_outcome"] = outcome or close_status
     target["close_price"] = close_price
     target["notes"] = notes or ""
+
+    perf = append_paper_performance(target, outcome, close_price)
+    close_outcome = str((perf or {}).get("outcome") or outcome or "CLOSED_MANUAL").upper()
+    close_status = normalize_close_status(close_outcome)
+
+    target["status"] = close_status
+    target["close_outcome"] = close_outcome
 
     state["open_paper_positions"] = remaining
 
@@ -1603,6 +1781,7 @@ def close_one_position_in_state(
             "close_reason": target["close_reason"],
             "close_outcome": target["close_outcome"],
             "close_price": close_price,
+            "performance": perf,
         },
     )
 
@@ -1639,15 +1818,18 @@ def close_all_positions_in_state(
             remaining.append(pos)
             continue
 
-        close_status = normalize_close_status(outcome)
-
-        pos["status"] = close_status
         pos["closed_at_utc"] = utc_now_iso()
         pos["closed_at_wib"] = datetime.now(WIB).isoformat()
         pos["close_reason"] = close_reason or "MANUAL_CLOSE_ALL"
-        pos["close_outcome"] = outcome or close_status
         pos["close_price"] = close_price
         pos["notes"] = notes or ""
+
+        perf = append_paper_performance(pos, outcome, close_price)
+        close_outcome = str((perf or {}).get("outcome") or outcome or "CLOSED_MANUAL").upper()
+        close_status = normalize_close_status(close_outcome)
+
+        pos["status"] = close_status
+        pos["close_outcome"] = close_outcome
 
         closed_now.append(pos)
 
@@ -1658,6 +1840,7 @@ def close_all_positions_in_state(
                 "close_reason": pos["close_reason"],
                 "close_outcome": pos["close_outcome"],
                 "close_price": close_price,
+                "performance": perf,
             },
         )
 
@@ -1826,7 +2009,7 @@ def paper_close(
         res = close_one_position_in_state(
             state=state,
             signal_key=req.signal_key,
-            outcome=req.outcome or "CLOSED_MANUAL",
+            outcome=req.outcome,
             close_reason=req.close_reason or "MANUAL_CLOSE",
             close_price=req.close_price,
             notes=req.notes,
@@ -1851,7 +2034,7 @@ def paper_close_all(
         state = load_state()
         res = close_all_positions_in_state(
             state=state,
-            outcome=req.outcome or "CLOSED_MANUAL",
+            outcome=req.outcome,
             close_reason=req.close_reason or "MANUAL_CLOSE_ALL",
             close_price=req.close_price,
             notes=req.notes,
@@ -4149,6 +4332,93 @@ def _resolve_report_date_wib(payload: Optional[OperatorSymbolPayload]) -> str:
     return datetime.now(WIB).date().isoformat()
 
 
+def paper_performance_daily_stats(date_wib: str) -> Dict[str, Any]:
+    closed_trades = win = loss = be = 0
+    tp1_count = tp2_count = tp3_count = sl_count = 0
+    manual_count = needs_review_count = 0
+    r_vals = []
+    pnl_sum = 0.0
+    pnl_count = 0
+
+    if not PAPER_PERFORMANCE_LOG.exists():
+        return {
+            "ok": True,
+            "date_wib": date_wib,
+            "closed_trades": 0,
+            "win": 0,
+            "loss": 0,
+            "be": 0,
+            "win_loss_be": "0/0/0",
+            "avg_r": "pending",
+            "gross_pnl_usdt": "pending",
+            "tp1_count": 0,
+            "tp2_count": 0,
+            "tp3_count": 0,
+            "sl_count": 0,
+            "manual_count": 0,
+            "needs_review_count": 0,
+        }
+
+    for line in PAPER_PERFORMANCE_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        closed = str(row.get("closed_at_wib") or "")[:10]
+        if closed != date_wib:
+            continue
+        closed_trades += 1
+        wl = str(row.get("win_loss_be") or "").upper()
+        if wl == "WIN": win += 1
+        elif wl == "LOSS": loss += 1
+        elif wl == "BE": be += 1
+        if bool(row.get("needs_review")): needs_review_count += 1
+        out = str(row.get("outcome") or "").upper()
+        if out == "TP1": tp1_count += 1
+        if out == "TP2": tp2_count += 1
+        if out == "TP3": tp3_count += 1
+        if out == "SL": sl_count += 1
+        if out in {"MANUAL_PROFIT","MANUAL_LOSS","CLOSED_MANUAL"}: manual_count += 1
+        if bool(row.get("include_performance")):
+            rv = to_float_or_none(row.get("r_realized"))
+            if rv is not None: r_vals.append(rv)
+        pv = to_float_or_none(row.get("gross_pnl_usdt"))
+        if pv is not None:
+            pnl_sum += pv
+            pnl_count += 1
+
+    return {
+        "ok": True,
+        "date_wib": date_wib,
+        "closed_trades": closed_trades,
+        "win": win,
+        "loss": loss,
+        "be": be,
+        "win_loss_be": f"{win}/{loss}/{be}",
+        "avg_r": (sum(r_vals)/len(r_vals)) if r_vals else "pending",
+        "gross_pnl_usdt": pnl_sum if pnl_count > 0 else "pending",
+        "tp1_count": tp1_count,
+        "tp2_count": tp2_count,
+        "tp3_count": tp3_count,
+        "sl_count": sl_count,
+        "manual_count": manual_count,
+        "needs_review_count": needs_review_count,
+    }
+
+
+@app.get("/paper/performance/daily")
+def paper_performance_daily(date_wib: str, x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"), x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret")) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    d = _parse_date_ymd(date_wib)
+    if not d:
+        raise HTTPException(status_code=400, detail="invalid_date_wib")
+    return paper_performance_daily_stats(d)
+
+
+
+
 @app.api_route("/operator/status", methods=["GET", "POST"])
 def operator_status(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
     if not v010_auth_ok(request):
@@ -4276,6 +4546,8 @@ def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayl
     known_reject_total = sum(int(v or 0) for v in reject_by_gate.values())
     reject_lines.append(f"- other: {max(0, reject - known_reject_total)}")
 
+    perf = paper_performance_daily_stats(report_date_wib)
+
     report_lines = [
         "📊 DAILY BOT REPORT",
         "",
@@ -4305,12 +4577,13 @@ def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayl
         f"Open Count: {summary.get('open_paper_positions')}",
         "",
         "PERFORMANCE",
-        "Closed Trades: pending",
-        "Win/Loss/BE: pending",
+        f"Closed Trades: {perf.get('closed_trades')}",
+        f"Win/Loss/BE: {perf.get('win_loss_be')}",
+        f"Gross PnL: {perf.get('gross_pnl_usdt')}",
         "Net PnL: pending",
-        "Avg R: pending",
-        "Best Pair: pending",
-        "Worst Pair: pending",
+        f"Avg R: {perf.get('avg_r')}",
+        f"TP1/TP2/TP3/SL: {perf.get('tp1_count')}/{perf.get('tp2_count')}/{perf.get('tp3_count')}/{perf.get('sl_count')}",
+        f"Needs Review: {perf.get('needs_review_count')}",
         "",
         "DISCIPLINE",
         f"Daily Trades Used / MAX_TRADES_PER_DAY: {accept}/{max_trades if max_trades else 'pending'}",
