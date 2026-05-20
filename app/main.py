@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.15-operator-reporting"
+APP_VERSION = "v0.16-cost-gate"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -956,8 +956,41 @@ def enrich_plan_with_quantity(plan: Dict[str, Any], force_exchange_info: bool = 
         return False, qty_res.get("reason") or "quantity_sizing_failed", qty_res
 
     plan["quantity"] = qty_res.get("rounded_qty")
+    plan["quantity_float"] = float(plan["quantity"] or 0.0)
     plan["notional_usdt"] = qty_res.get("notional")
     return True, "quantity_sizing_valid", qty_res
+
+
+def ensure_tp_split(plan: Dict[str, Any]) -> None:
+    def _sf(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+    total_qty = _sf(plan.get("quantity_float") or plan.get("quantity"), 0.0)
+    if total_qty <= 0:
+        plan["tp1_qty"] = 0.0
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+        return
+    p1 = _sf(plan.get("tp1_qty"), 0.0)
+    p2 = _sf(plan.get("tp2_qty"), 0.0)
+    p3 = _sf(plan.get("tp3_qty"), 0.0)
+    if p1 > 0 and p2 >= 0 and p3 >= 0:
+        plan["tp1_qty"], plan["tp2_qty"], plan["tp3_qty"] = p1, p2, p3
+        return
+    filters = ((plan.get("quantity_sizing") or {}).get("filters") or {})
+    split_res = v011_build_tp_quantities(Decimal(str(total_qty)), filters, {})
+    if split_res.get("ok"):
+        tp_qtys = split_res.get("tp_qtys_str") or []
+        if len(tp_qtys) == 3:
+            plan["tp1_qty"] = _sf(tp_qtys[0], 0.0)
+            plan["tp2_qty"] = _sf(tp_qtys[1], 0.0)
+            plan["tp3_qty"] = _sf(tp_qtys[2], 0.0)
+            return
+    plan["tp1_qty"] = 0.0
+    plan["tp2_qty"] = 0.0
+    plan["tp3_qty"] = 0.0
 
 
 def binance_order_test(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -1006,6 +1039,153 @@ def pair_to_binance_symbol(pair: str) -> str:
 def testnet_allowed_symbols() -> set[str]:
     raw = os.getenv("TESTNET_ALLOWED_SYMBOLS", "")
     return {x.strip().upper() for x in raw.split(",") if x.strip()}
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
+
+def compute_cost_gate(plan: Dict[str, Any]) -> Dict[str, Any]:
+    cost_gate_enabled = env_bool("COST_GATE_ENABLED", True)
+
+    breakdown: Dict[str, Any] = {
+        "cost_gate_enabled": cost_gate_enabled,
+        "cost_gate_pass": True,
+        "cost_gate_reason": "cost_gate_pass",
+    }
+    try:
+        direction = str(plan.get("direction") or "")
+        if direction not in ("Long", "Short"):
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "invalid_direction_for_cost_gate"
+            return breakdown
+        entry_price = float(plan.get("entry_mid") or 0.0)
+        tp1 = float(plan.get("tp1") or 0.0)
+        tp2 = float(plan.get("tp2") or 0.0)
+        tp3 = float(plan.get("tp3") or 0.0)
+        tp1_qty = float(plan.get("tp1_qty") or 0.0)
+        tp2_qty = float(plan.get("tp2_qty") or 0.0)
+        tp3_qty = float(plan.get("tp3_qty") or 0.0)
+        total_qty = float(plan.get("quantity_float") or 0.0)
+        taker_fee_rate = env_float("TAKER_FEE_RATE", 0.0005)
+        fee_buffer_mult = env_float("FEE_BUFFER_MULT", 1.2)
+        funding_rate_buffer = env_float("FUNDING_RATE_BUFFER", 0.0005) if env_bool("FUNDING_GATE_ENABLED", True) else 0.0
+        funding_buffer_cycles = env_int("FUNDING_BUFFER_CYCLES", 1)
+        slippage_buffer_rate = env_float("SLIPPAGE_BUFFER_RATE", 0.0002)
+        min_net_tp1_usdt = env_float("MIN_NET_TP1_USDT", 0.01)
+        min_net_tp1_pct_notional = env_float("MIN_NET_TP1_PCT_NOTIONAL", 0.0002)
+        max_abs_funding_rate = env_float("MAX_ABS_FUNDING_RATE", 0.001)
+        reject_if_net_tp1_negative = env_bool("REJECT_IF_NET_TP1_NEGATIVE", True)
+        breakdown.update({
+            "taker_fee_rate": taker_fee_rate,
+            "fee_buffer_mult": fee_buffer_mult,
+            "funding_rate_buffer": funding_rate_buffer,
+            "funding_buffer_cycles": funding_buffer_cycles,
+            "slippage_buffer_rate": slippage_buffer_rate,
+            "tp1_qty": tp1_qty,
+            "tp2_qty": tp2_qty,
+            "tp3_qty": tp3_qty,
+            "min_net_tp1_usdt": min_net_tp1_usdt,
+            "min_net_tp1_pct_notional": min_net_tp1_pct_notional,
+        })
+        if not cost_gate_enabled:
+            breakdown["cost_gate_reason"] = "cost_gate_disabled"
+        if abs(funding_rate_buffer) > max_abs_funding_rate:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "funding_cost_too_high"
+            return breakdown
+        if tp1_qty <= 0 or total_qty <= 0:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "invalid_qty_for_cost_gate"
+            return breakdown
+        if direction == "Long" and tp1 <= entry_price:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "invalid_tp1_direction_for_cost_gate"
+            return breakdown
+        if direction == "Short" and tp1 >= entry_price:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "invalid_tp1_direction_for_cost_gate"
+            return breakdown
+
+        entry_notional = entry_price * total_qty
+        entry_fee_total = entry_notional * taker_fee_rate * fee_buffer_mult
+        funding_buffer_total = entry_notional * abs(funding_rate_buffer) * funding_buffer_cycles
+
+        def gross(tp_price: float, tp_qty: float) -> float:
+            if direction == "Long":
+                return (tp_price - entry_price) * tp_qty
+            return (entry_price - tp_price) * tp_qty
+
+        gross_profit_tp1 = gross(tp1, tp1_qty)
+        gross_profit_tp2 = gross(tp2, tp2_qty)
+        gross_profit_tp3 = gross(tp3, tp3_qty)
+
+        entry_fee_alloc_tp1 = entry_fee_total * (tp1_qty / total_qty)
+        entry_fee_alloc_tp2 = entry_fee_total * (tp2_qty / total_qty)
+        entry_fee_alloc_tp3 = entry_fee_total * (tp3_qty / total_qty)
+        exit_fee_tp1 = tp1 * tp1_qty * taker_fee_rate * fee_buffer_mult
+        exit_fee_tp2 = tp2 * tp2_qty * taker_fee_rate * fee_buffer_mult
+        exit_fee_tp3 = tp3 * tp3_qty * taker_fee_rate * fee_buffer_mult
+        funding_buffer_alloc_tp1 = funding_buffer_total * (tp1_qty / total_qty)
+        funding_buffer_alloc_tp2 = funding_buffer_total * (tp2_qty / total_qty)
+        funding_buffer_alloc_tp3 = funding_buffer_total * (tp3_qty / total_qty)
+        slippage_buffer_tp1 = entry_price * tp1_qty * slippage_buffer_rate
+        slippage_buffer_tp2 = entry_price * tp2_qty * slippage_buffer_rate
+        slippage_buffer_tp3 = entry_price * tp3_qty * slippage_buffer_rate
+        net_profit_tp1 = gross_profit_tp1 - entry_fee_alloc_tp1 - exit_fee_tp1 - funding_buffer_alloc_tp1 - slippage_buffer_tp1
+        net_profit_tp2 = gross_profit_tp2 - entry_fee_alloc_tp2 - exit_fee_tp2 - funding_buffer_alloc_tp2 - slippage_buffer_tp2
+        net_profit_tp3 = gross_profit_tp3 - entry_fee_alloc_tp3 - exit_fee_tp3 - funding_buffer_alloc_tp3 - slippage_buffer_tp3
+        full_plan_net = net_profit_tp1 + net_profit_tp2 + net_profit_tp3
+        net_tp1_pct = (net_profit_tp1 / entry_notional) if entry_notional > 0 else 0.0
+
+        breakdown.update({
+            "entry_notional": entry_notional,
+            "entry_fee_total": entry_fee_total,
+            "funding_buffer_total": funding_buffer_total,
+            "gross_profit_tp1": gross_profit_tp1,
+            "gross_profit_tp2": gross_profit_tp2,
+            "gross_profit_tp3": gross_profit_tp3,
+            "entry_fee_alloc_tp1": entry_fee_alloc_tp1,
+            "entry_fee_alloc_tp2": entry_fee_alloc_tp2,
+            "entry_fee_alloc_tp3": entry_fee_alloc_tp3,
+            "exit_fee_tp1": exit_fee_tp1,
+            "exit_fee_tp2": exit_fee_tp2,
+            "exit_fee_tp3": exit_fee_tp3,
+            "funding_buffer_alloc_tp1": funding_buffer_alloc_tp1,
+            "funding_buffer_alloc_tp2": funding_buffer_alloc_tp2,
+            "funding_buffer_alloc_tp3": funding_buffer_alloc_tp3,
+            "slippage_buffer_tp1": slippage_buffer_tp1,
+            "slippage_buffer_tp2": slippage_buffer_tp2,
+            "slippage_buffer_tp3": slippage_buffer_tp3,
+            "net_profit_tp1": net_profit_tp1,
+            "net_profit_tp2": net_profit_tp2,
+            "net_profit_tp3": net_profit_tp3,
+            "full_plan_net": full_plan_net,
+        })
+
+        if reject_if_net_tp1_negative and net_profit_tp1 <= 0:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "net_tp1_after_cost_negative"
+        elif net_profit_tp1 < min_net_tp1_usdt:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "net_tp1_after_cost_below_min_usdt"
+        elif net_tp1_pct < min_net_tp1_pct_notional:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "net_tp1_after_cost_below_min_pct"
+        elif full_plan_net <= 0:
+            breakdown["cost_gate_pass"] = False
+            breakdown["cost_gate_reason"] = "full_plan_net_after_cost_negative"
+        return breakdown
+    except Exception:
+        breakdown["cost_gate_pass"] = False
+        breakdown["cost_gate_reason"] = "cost_gate_error"
+        return breakdown
 
 
 def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -1085,6 +1265,12 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
     qty_ok, qty_reason, _qty_res = enrich_plan_with_quantity(plan)
     if not qty_ok:
         return False, qty_reason
+    ensure_tp_split(plan)
+    cost = compute_cost_gate(plan)
+    plan["cost_breakdown"] = cost
+    plan.update(cost)
+    if env_bool("COST_GATE_ENABLED", True) and not bool(cost.get("cost_gate_pass")):
+        return False, f"cost_gate_failed:{cost.get('cost_gate_reason')}"
 
     return True, "execution_plan_valid"
 
@@ -1162,8 +1348,9 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
         "signal_key": signal_key,
         "pair": pair_of(p),
         "symbol": plan.get("symbol"),
-        "decision": "BUILT_ONLY" if ok else "SKIPPED",
-        "reason": reason,
+        "decision": "BUILT_ONLY" if ok else ("EXECUTION_SKIPPED" if str(reason).startswith("cost_gate_failed:") else "SKIPPED"),
+        "reason": "cost_gate_failed" if str(reason).startswith("cost_gate_failed:") else reason,
+        "cost_gate_reason": (str(reason).split(":", 1)[1] if str(reason).startswith("cost_gate_failed:") else (plan.get("cost_gate_reason") or None)),
         "plan": plan,
     }
 
@@ -1179,8 +1366,10 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
         "notes": reason,
     })
 
-    if ok:
+    if ok or str(reason).startswith("cost_gate_failed:"):
         append_jsonl(EXECUTION_PLANS_LOG, plan)
+
+    if ok:
 
         if execution_mode() == "TESTNET_ORDER_TEST":
             order_test_res = binance_order_test(plan)
@@ -1550,6 +1739,10 @@ def webhook_signal(
 
         if decision.get("decision") == "ACCEPT":
             execution_event = handle_execution_after_accept(p)
+            response["cost_gate_pass"] = execution_event.get("plan", {}).get("cost_gate_pass")
+            response["cost_gate_reason"] = execution_event.get("plan", {}).get("cost_gate_reason")
+            if execution_event.get("reason") == "cost_gate_failed":
+                response["execution_skipped_reason"] = "cost_gate_failed"
             if execution_mode() == "TESTNET_MARKET":
                 market_res = execution_event.get("market_order_result")
                 response["market_order_result"] = market_res
@@ -1797,6 +1990,34 @@ def exchange_qty_test(
         "symbol": symbol,
         "qty_result": qty_res,
     }
+
+
+@app.post("/testnet/cost-check")
+async def v016_testnet_cost_check_endpoint(request: Request):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    plan = {
+        "symbol": str(payload.get("symbol") or "").strip().upper(),
+        "direction": str(payload.get("direction") or "Long").strip().title(),
+        "entry_mid": payload.get("entry_price"),
+        "quantity_float": payload.get("quantity"),
+        "tp1": payload.get("tp1"),
+        "tp2": payload.get("tp2"),
+        "tp3": payload.get("tp3"),
+        "tp1_qty": payload.get("tp1_qty"),
+        "tp2_qty": payload.get("tp2_qty"),
+        "tp3_qty": payload.get("tp3_qty"),
+    }
+    if not plan.get("tp1_qty") and not plan.get("tp2_qty") and not plan.get("tp3_qty"):
+        ensure_tp_split(plan)
+    breakdown = compute_cost_gate(plan)
+    return {"ok": True, "cost_gate_pass": breakdown.get("cost_gate_pass"), "cost_gate_reason": breakdown.get("cost_gate_reason"), "cost_breakdown": breakdown}
 
 
 # =========================
