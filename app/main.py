@@ -10,14 +10,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN
 from threading import Lock, Thread
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.19-lite-paper-quantity-pnl"
+APP_VERSION = "v0.20-ml-phase1-shadow-dataset"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -31,6 +31,12 @@ EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
 EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
 EXECUTION_SUMMARY_LOG = LOG_DIR / "execution_summary.jsonl"
 TP_LIFECYCLE_STATE_FILE = STATE_DIR / "tp_lifecycle_state.json"
+ML_SHADOW_SIGNALS_LOG = LOG_DIR / "ml_shadow_signals.jsonl"
+ML_CONTEXT_SNAPSHOTS_LOG = LOG_DIR / "ml_context_snapshots.jsonl"
+ML_PREDICTIONS_LOG = LOG_DIR / "ml_predictions.jsonl"
+ML_DATASET_ROWS_LOG = LOG_DIR / "ml_dataset_rows.jsonl"
+ML_CONTEXT_ERRORS_LOG = LOG_DIR / "ml_context_errors.jsonl"
+ML_CONTEXT_CACHE_FILE = STATE_DIR / "ml_context_cache.json"
 
 WIB = ZoneInfo("Asia/Jakarta")
 LOCK = Lock()
@@ -91,6 +97,15 @@ class OperatorSymbolPayload(BaseModel):
     date_wib: Optional[str] = None
     date_utc: Optional[str] = None
     signal_key: Optional[str] = None
+
+
+class MlContextPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    symbol: Optional[str] = None
+    pair: Optional[str] = None
+    direction: Optional[str] = None
+    signal_key: Optional[str] = None
+    signal_time_wib: Optional[str] = None
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -398,6 +413,135 @@ def parse_wib_time(s: str) -> Optional[datetime]:
     return None
 
 
+def parse_wib_flexible(s: Any) -> Optional[datetime]:
+    raw = str(s or "").replace("WIB", "").strip()
+    dt = parse_wib_time(raw)
+    if dt:
+        return dt
+    try:
+        x = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if x.tzinfo is None:
+            x = x.replace(tzinfo=WIB)
+        return x.astimezone(WIB)
+    except Exception:
+        return None
+
+
+def http_get_json(url: str, timeout: float = 2.0) -> Any:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def load_json_file(path: Path, default: Any) -> Any:
+    try:
+        if not path.exists():
+            return default
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json_file(path: Path, data: Any) -> None:
+    ensure_dirs()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def read_context_cache() -> Dict[str, Any]:
+    data = load_json_file(ML_CONTEXT_CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def write_context_cache(data: Dict[str, Any]) -> None:
+    save_json_file(ML_CONTEXT_CACHE_FILE, data)
+
+
+def cache_get(cache: Dict[str, Any], key: str, ttl_sec: int) -> Optional[Any]:
+    item = cache.get(key)
+    if not isinstance(item, dict):
+        return None
+    ts = parse_iso_utc(item.get("cached_at_utc"))
+    if not ts:
+        return None
+    if (utc_now() - ts).total_seconds() > max(0, ttl_sec):
+        return None
+    return item.get("value")
+
+
+def cache_set(cache: Dict[str, Any], key: str, value: Any) -> None:
+    cache[key] = {"cached_at_utc": utc_now_iso(), "value": value}
+
+
+def ml_enabled() -> bool:
+    return env_bool("ML_DATA_COLLECTION_ENABLED", True)
+
+
+def classify_sample(p: Dict[str, Any]) -> Dict[str, Any]:
+    blob = json.dumps(p, ensure_ascii=False).upper()
+    key = str(signal_key_of(p) or "").upper()
+    tokens = ["SMOKE", "TEST", "VALIDATION", "MANUAL", "V0"]
+    if any(t in key or t in blob for t in tokens):
+        return {"sample_type": "VALIDATION_SAMPLE", "include_ml": False, "include_reason": "validation_or_test_sample"}
+    return {"sample_type": "FORWARD_SHADOW_PAPER", "include_ml": True, "include_reason": "forward_shadow_paper"}
+
+
+def build_binance_context(symbol: str) -> Dict[str, Any]:
+    base = os.getenv("BINANCE_MARKET_CONTEXT_BASE", "https://fapi.binance.com").rstrip("/")
+    out: Dict[str, Any] = {"pair_derivatives_available": False, "btc_derivatives_available": False}
+    try:
+        btc_ticker = http_get_json(f"{base}/fapi/v1/ticker/24hr?symbol=BTCUSDT")
+        btc_change = float(btc_ticker.get("priceChangePercent", 0.0))
+        out["btc_change_24h_pct"] = btc_change
+        out["btc_regime"] = "BULL" if btc_change > 1 else ("BEAR" if btc_change < -1 else "RANGE")
+        out["btc_derivatives_available"] = True
+    except Exception:
+        out["btc_change_24h_pct"] = None
+        out["btc_regime"] = "UNKNOWN"
+    try:
+        fr = http_get_json(f"{base}/fapi/v1/fundingRate?symbol={symbol}&limit=1")
+        fval = float((fr or [{}])[-1].get("fundingRate", 0.0))
+        out["funding_rate"] = fval
+        out["funding_status"] = "EXTREME_POSITIVE" if fval >= 0.0008 else "EXTREME_NEGATIVE" if fval <= -0.0008 else "POSITIVE" if fval > 0 else "NEGATIVE" if fval < 0 else "NEUTRAL"
+        out["pair_derivatives_available"] = True
+    except Exception:
+        out["funding_rate"] = None
+        out["funding_status"] = "UNKNOWN"
+    return out
+
+
+def build_fred_context() -> Dict[str, Any]:
+    api_key = str(os.getenv("FRED_API_KEY") or "").strip()
+    if not api_key:
+        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN"}
+    base = os.getenv("FRED_BASE", "https://api.stlouisfed.org/fred").rstrip("/")
+    def last_two(series: str) -> tuple[Optional[float], Optional[float]]:
+        data = http_get_json(f"{base}/series/observations?series_id={series}&api_key={api_key}&file_type=json&sort_order=desc&limit=6", timeout=3.0)
+        vals = [float(x["value"]) for x in data.get("observations", []) if x.get("value") not in (".", None, "")]
+        return (vals[0], vals[-1]) if vals else (None, None)
+    try:
+        us10, us10_old = last_two("DGS10")
+        vix, _ = last_two("VIXCLS")
+        spx, spx_old = last_two("SP500")
+        dxy, dxy_old = last_two("DTWEXBGS")
+        return {
+            "us10y_latest": us10, "us10y_change_5d": (us10 - us10_old) if us10 is not None and us10_old is not None else None,
+            "vix_latest": vix, "sp500_change_5d": (spx - spx_old) if spx is not None and spx_old is not None else None,
+            "usd_index_latest": dxy, "usd_change_5d": (dxy - dxy_old) if dxy is not None and dxy_old is not None else None,
+            "yield_pressure": "RISING" if (us10 is not None and us10_old is not None and us10 > us10_old) else "FALLING" if (us10 is not None and us10_old is not None and us10 < us10_old) else "NEUTRAL",
+            "vol_status": "STRESS" if (vix or 0) >= 30 else "ELEVATED" if (vix or 0) >= 20 else "NORMAL" if (vix or 0) >= 14 else "CALM",
+            "equity_risk": "RISK_ON" if (spx is not None and spx_old is not None and spx > spx_old) else "RISK_OFF" if (spx is not None and spx_old is not None and spx < spx_old) else "NEUTRAL",
+            "usd_pressure": "USD_UP" if (dxy is not None and dxy_old is not None and dxy > dxy_old) else "USD_DOWN" if (dxy is not None and dxy_old is not None and dxy < dxy_old) else "NEUTRAL",
+            "macro_regime": "MIXED",
+        }
+    except Exception:
+        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN"}
+
+
+
 def is_calendar_blackout_active() -> tuple[bool, str]:
     if not env_bool("CALENDAR_GATE_ENABLED", False):
         return False, "calendar_gate_disabled"
@@ -429,6 +573,55 @@ def is_calendar_blackout_active() -> tuple[bool, str]:
             return True, f"calendar_blackout_active:{start.isoformat()}..{end.isoformat()}"
 
     return False, "calendar_clear"
+
+
+def build_macro_event_context(signal_time_wib: Any, events: Optional[List[Dict[str, Any]]] = None, quality: str = "API_FAILED") -> Dict[str, Any]:
+    fallback = events if isinstance(events, list) else []
+    now = parse_wib_flexible(signal_time_wib) or datetime.now(WIB)
+    active_ids: List[str] = []
+    in_blackout = False
+    risk = "NONE"
+    next_event = None
+    for e in fallback if isinstance(fallback, list) else []:
+        if str(e.get("status", "")).upper() != "ACTIVE":
+            continue
+        et = parse_wib_flexible(e.get("event_time_wib"))
+        if not et:
+            continue
+        pre = int(e.get("blackout_before_min") or 0)
+        post = int(e.get("blackout_after_min") or 0)
+        a = et - timedelta(minutes=pre)
+        b = et + timedelta(minutes=post)
+        if a <= now <= b:
+            in_blackout = True
+            impact = str(e.get("impact", "UNKNOWN")).upper()
+            risk = "HIGH" if impact == "HIGH" else "MEDIUM" if impact == "MEDIUM" else "LOW" if impact == "LOW" else "UNKNOWN"
+            active_ids.append(str(e.get("event_id") or ""))
+        if et >= now and (next_event is None or et < next_event[0]):
+            next_event = (et, e)
+    return {
+        "is_blackout_active": in_blackout,
+        "event_risk_level": risk if in_blackout else "NONE",
+        "active_event_ids": active_ids,
+        "next_event_id": (next_event[1].get("event_id") if next_event else None),
+        "next_event_name": (next_event[1].get("event_name") if next_event else None),
+        "next_event_impact": (next_event[1].get("impact") if next_event else None),
+        "next_event_currency": (next_event[1].get("currency") if next_event else None),
+        "minutes_to_next_high_impact": int((next_event[0] - now).total_seconds() / 60) if next_event and str(next_event[1].get("impact", "")).upper() == "HIGH" else None,
+        "minutes_since_last_high_impact": None,
+        "macro_event_context_quality": quality if fallback else "API_FAILED",
+    }
+
+
+def load_macro_events_from_gsheet_if_configured() -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    source = str(os.getenv("MACRO_EVENT_SOURCE", "GSHEET")).upper().strip()
+    if source != "GSHEET":
+        return None, "gsheet_source_disabled"
+    creds = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GSHEET_CREDENTIALS_FILE") or "").strip()
+    token = str(os.getenv("GSHEET_TOKEN") or "").strip()
+    if not creds and not token:
+        return None, "gsheet_credentials_missing"
+    return None, "gsheet_provider_unavailable"
 
 
 def daily_stop_active(state: Dict[str, Any]) -> tuple[bool, str]:
@@ -1939,6 +2132,164 @@ def close_all_positions_in_state(
     }
 
 
+def build_context_snapshot(p: Dict[str, Any]) -> Dict[str, Any]:
+    if not env_bool("ML_CONTEXT_ENABLED", True):
+        return {"context_quality": "DISABLED", "context_errors": [], "macro_event_context_quality": "DISABLED"}
+    symbol = v010_normalize_symbol(p.get("symbol") or p.get("pair") or "BTCUSDT")
+    cache = read_context_cache()
+    providers_enabled, ok_cnt, fail_cnt = 0, 0, 0
+    err: List[str] = []
+    ctx: Dict[str, Any] = {}
+    if env_bool("BINANCE_MARKET_CONTEXT_ENABLED", True):
+        providers_enabled += 1
+        try:
+            key = f"binance:{symbol}"
+            b = cache_get(cache, key, env_int("BINANCE_MARKET_CONTEXT_CACHE_TTL_SEC", 300))
+            if not isinstance(b, dict):
+                b = build_binance_context(symbol)
+                cache_set(cache, key, b)
+            ctx.update(b)
+            binance_ok = bool(b.get("btc_derivatives_available")) or bool(b.get("pair_derivatives_available"))
+            if (str(b.get("btc_regime")) == "UNKNOWN" and str(b.get("funding_status")) == "UNKNOWN"):
+                binance_ok = False
+            if binance_ok:
+                ok_cnt += 1
+            else:
+                fail_cnt += 1
+                err.append("binance:missing_or_unavailable")
+        except Exception as e:
+            fail_cnt += 1; err.append(f"binance:{e}")
+    if env_bool("FRED_CONTEXT_ENABLED", True):
+        providers_enabled += 1
+        try:
+            key = "fred:macro"
+            f = cache_get(cache, key, env_int("FRED_CACHE_TTL_SEC", 21600))
+            if not isinstance(f, dict):
+                f = build_fred_context()
+                cache_set(cache, key, f)
+            ctx.update(f)
+            fred_ok = not (
+                str(f.get("macro_regime")) == "UNKNOWN"
+                and str(f.get("equity_risk")) == "UNKNOWN"
+                and str(f.get("yield_pressure")) == "UNKNOWN"
+                and str(f.get("usd_pressure")) == "UNKNOWN"
+                and str(f.get("vol_status")) == "UNKNOWN"
+            )
+            if not fred_ok:
+                fail_cnt += 1; err.append("fred:missing_or_unavailable")
+            else:
+                ok_cnt += 1
+        except Exception as e:
+            fail_cnt += 1; err.append(f"fred:{e}")
+    if env_bool("MACRO_EVENT_CALENDAR_ENABLED", True):
+        providers_enabled += 1
+        try:
+            key = "macro:events:list"
+            rows = cache_get(cache, key, env_int("MACRO_EVENT_CACHE_TTL_SEC", 300))
+            quality = "API_FAILED"
+            gerr = None
+            if not isinstance(rows, list):
+                rows, gerr = load_macro_events_from_gsheet_if_configured()
+                if isinstance(rows, list) and rows:
+                    quality = "FULL"
+                    save_json_file(Path(os.getenv("MACRO_EVENT_CALENDAR_FILE", "state/macro_events.json")), rows)
+                    cache_set(cache, key, rows)
+                else:
+                    local_rows = load_json_file(Path(os.getenv("MACRO_EVENT_CALENDAR_FILE", "state/macro_events.json")), [])
+                    if isinstance(local_rows, list) and local_rows:
+                        rows = local_rows
+                        quality = "PARTIAL"
+                    else:
+                        rows = []
+                        quality = "API_FAILED"
+            else:
+                quality = "PARTIAL"
+            m = build_macro_event_context(p.get("signal_time_wib") or wib_now_iso(), events=rows, quality=quality)
+            if quality == "API_FAILED":
+                m["event_risk_level"] = "UNKNOWN"
+                m["active_event_ids"] = []
+            if gerr:
+                err.append(f"macro:{gerr}")
+            ctx.update(m)
+            if str(ctx.get("macro_event_context_quality")) in ("FULL", "PARTIAL"):
+                ok_cnt += 1
+            else:
+                fail_cnt += 1
+        except Exception as e:
+            fail_cnt += 1; err.append(f"macro:{e}")
+    else:
+        ctx["macro_event_context_quality"] = "DISABLED"
+    ctx["context_quality"] = "FULL" if providers_enabled > 0 and ok_cnt == providers_enabled else "PARTIAL" if ok_cnt > 0 else "API_FAILED"
+    ctx["context_errors"] = err
+    ctx["btc_context"] = "TAILWIND" if ctx.get("btc_regime") == "BULL" else "HEADWIND" if ctx.get("btc_regime") == "BEAR" else "MIXED" if ctx.get("btc_regime") == "RANGE" else "UNKNOWN"
+    write_context_cache(cache)
+    if err:
+        append_jsonl(ML_CONTEXT_ERRORS_LOG, {"created_at_utc": utc_now_iso(), "signal_key": signal_key_of(p), "errors": err})
+    return ctx
+
+
+def safe_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Dict[str, Any], state_snapshot: Optional[Dict[str, Any]] = None) -> None:
+    if not ml_enabled():
+        return
+    try:
+        now = utc_now_iso()
+        append_jsonl(ML_SHADOW_SIGNALS_LOG, {
+            "created_at_utc": now, "signal_key": signal_key_of(p), "pair": pair_of(p), "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""),
+            "direction": direction_of(p), "status": status_of(p), "score": p.get("score"), "priority": p.get("priority"), "mode": get_mode(),
+            "execution_decision": decision.get("decision"), "reject_gate": decision.get("gate"), "reject_reason": decision.get("reason"),
+            "payload_summary": {"has_entry": p.get("entry_lo") is not None or p.get("entry_mid") is not None},
+        })
+        context = build_context_snapshot(p) if env_bool("ML_CONTEXT_FETCH_ON_SIGNAL", True) else {"context_quality": "DISABLED", "macro_event_context_quality": "DISABLED", "context_errors": []}
+        if context:
+            append_jsonl(ML_CONTEXT_SNAPSHOTS_LOG, {"created_at_utc": now, "signal_key": signal_key_of(p), **context})
+        sample = classify_sample(p)
+        paper_qty = None
+        paper_notional = None
+        if str(decision.get("decision")) == "ACCEPT":
+            for pos in reversed((state_snapshot or {}).get("open_paper_positions") or []):
+                if str(pos.get("signal_key") or "") == str(signal_key_of(p)):
+                    paper_qty = pos.get("quantity")
+                    paper_notional = pos.get("notional_usdt")
+                    break
+            if paper_qty is None:
+                entry_price = to_float_or_none(p.get("entry_mid") or p.get("entry_price"))
+                if entry_price and entry_price > 0:
+                    paper_notional = paper_notional_usdt_default()
+                    paper_qty = paper_notional / entry_price
+        append_jsonl(ML_DATASET_ROWS_LOG, {
+            "signal_key": signal_key_of(p), "sample_type": sample["sample_type"], "include_ml": sample["include_ml"], "include_reason": sample["include_reason"],
+            "pair": pair_of(p), "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""), "direction": direction_of(p),
+            "signal_time_wib": p.get("signal_time_wib"), "created_at_utc": now, "score": p.get("score"), "priority": p.get("priority"), "mode": get_mode(),
+            "setup_type": p.get("setup_type"), "risk_profile": p.get("risk_profile"), "config_version": p.get("config_version"), "source_mode": p.get("source_mode"),
+            "signal_source": p.get("signal_source"), "execution_decision": decision.get("decision"), "reject_gate": decision.get("gate"), "reject_reason": decision.get("reason"),
+            "do_not_queue": decision_do_not_queue(decision), "entry": p.get("entry_mid") or p.get("entry_lo"), "sl": p.get("sl"), "tp1": p.get("tp1"), "tp2": p.get("tp2"), "tp3": p.get("tp3"),
+            "paper_quantity": paper_qty, "paper_notional": paper_notional, "cost_gate_pass": response.get("cost_gate_pass"),
+            "net_tp1_after_cost": response.get("net_tp1_after_cost"), "label_win": None, "label_target": None, "label_R": None, "outcome_status": "PENDING", **context,
+        })
+        if env_bool("ML_PREDICTION_ENABLED", True) and str(os.getenv("ML_PREDICTION_MODE", "SHADOW_ONLY")).upper() == "SHADOW_ONLY":
+            model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
+            pred = {"signal_key": signal_key_of(p), "created_at_utc": now, "p_win": None, "ml_score": None, "ml_confidence": "NONE", "model_version": os.getenv("ML_MODEL_VERSION", "logistic_v1"), "decision_effect": "SHADOW_ONLY"}
+            if model_path.exists():
+                pred["ml_action"] = "MODEL_ERROR"
+                pred["reason"] = "model_present_but_predictor_unavailable"
+            else:
+                pred["ml_action"] = "NO_MODEL"
+            append_jsonl(ML_PREDICTIONS_LOG, pred)
+    except Exception as e:
+        append_jsonl(ML_CONTEXT_ERRORS_LOG, {"created_at_utc": utc_now_iso(), "signal_key": signal_key_of(p), "error": str(e)})
+
+
+def fire_and_forget_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Dict[str, Any], state_snapshot: Optional[Dict[str, Any]] = None) -> None:
+    p0, d0, r0 = dict(p or {}), dict(decision or {}), dict(response or {})
+    s0 = dict(state_snapshot or {})
+    def _run() -> None:
+        try:
+            safe_ml_shadow_log(p0, d0, r0, s0)
+        except Exception:
+            pass
+    Thread(target=_run, daemon=True).start()
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
@@ -1947,6 +2298,65 @@ def health() -> Dict[str, Any]:
         "mode": get_mode(),
         "time_utc": utc_now_iso(),
     }
+
+
+@app.post("/ml/context-snapshot")
+def ml_context_snapshot(
+    payload: MlContextPayload,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    p = payload.model_dump(mode="json")
+    ctx = build_context_snapshot(p)
+    row = {"created_at_utc": utc_now_iso(), "signal_key": p.get("signal_key"), **ctx}
+    append_jsonl(ML_CONTEXT_SNAPSHOTS_LOG, row)
+    return {"ok": True, "context": row}
+
+
+def _latest_by_signal(path: Path, signal_key: str) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    last = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if str(obj.get("signal_key") or "") == signal_key:
+                last = obj
+    return last
+
+
+@app.get("/ml/context-latest")
+def ml_context_latest(
+    signal_key: str,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return {"ok": True, "row": _latest_by_signal(ML_CONTEXT_SNAPSHOTS_LOG, signal_key)}
+
+
+@app.get("/ml/dataset/latest")
+def ml_dataset_latest(
+    signal_key: str,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return {"ok": True, "row": _latest_by_signal(ML_DATASET_ROWS_LOG, signal_key)}
+
+
+@app.get("/ml/prediction/latest")
+def ml_prediction_latest(
+    signal_key: str,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return {"ok": True, "row": _latest_by_signal(ML_PREDICTIONS_LOG, signal_key)}
 
 
 @app.post("/webhook/signal")
@@ -1973,6 +2383,7 @@ def webhook_signal(
             }
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
             notify_signal_decision_async(p, decision)
+            fire_and_forget_ml_shadow_log(p, decision, {"ok": True, "decision": "RECEIVED_ONLY"}, state)
 
             return {
                 "ok": True,
@@ -2014,6 +2425,7 @@ def webhook_signal(
             elif execution_mode() == "TESTNET_ORDER_TEST":
                 response["testnet_order_result"] = execution_event.get("order_test_result")
 
+        fire_and_forget_ml_shadow_log(p, decision, response, state)
         return response
 
 
