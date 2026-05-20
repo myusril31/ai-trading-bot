@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.18-paper-performance-realization"
+APP_VERSION = "v0.19-lite-paper-quantity-pnl"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -141,6 +141,27 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
+
+
+def paper_notional_usdt_default() -> float:
+    return env_float("PAPER_NOTIONAL_USDT", 50.0)
+
+
+def paper_fee_rate() -> float:
+    return env_float("PAPER_FEE_RATE", 0.0005)
+
+
+def paper_fee_buffer_mult() -> float:
+    return env_float("PAPER_FEE_BUFFER_MULT", 1.2)
+
+
+def paper_slippage_buffer_rate() -> float:
+    return env_float("PAPER_SLIPPAGE_BUFFER_RATE", 0.0002)
+
+
+def paper_net_pnl_enabled() -> bool:
+    return env_bool("PAPER_NET_PNL_ENABLED", True)
 
 def send_telegram_message(text: str) -> Dict[str, Any]:
     if not env_bool("TELEGRAM_ENABLED", False):
@@ -602,14 +623,28 @@ def apply_decision_to_state(p: Dict[str, Any], decision: Dict[str, Any], state: 
         accepted_by_pair[pair] = now_iso
         state["accepted_by_pair"] = accepted_by_pair
 
+        entry_price = to_float_or_none(p.get("entry_mid") or p.get("entry_price"))
+        plan_qty = to_float_or_none(p.get("quantity"))
+        if plan_qty is None:
+            plan = build_execution_plan(p)
+            plan_qty = to_float_or_none(plan.get("quantity"))
+        notional_usdt = paper_notional_usdt_default()
+        qty = plan_qty
+        if qty is None and entry_price is not None and entry_price > 0:
+            qty = notional_usdt / entry_price
+
         positions = state.get("open_paper_positions") or []
         positions.append({
             "signal_key": signal_key,
             "pair": pair,
+            "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""),
             "direction": direction_of(p),
             "status": "OPEN",
             "accepted_at_utc": now_iso,
             "entry_mid": p.get("entry_mid"),
+            "entry_price": entry_price,
+            "quantity": qty,
+            "notional_usdt": notional_usdt,
             "sl": p.get("sl") or p.get("invalid"),
             "tp1": p.get("tp1"),
             "tp2": p.get("tp2"),
@@ -1649,6 +1684,39 @@ def compute_gross_pnl(position: Dict[str, Any], close_price: Optional[float]) ->
     return "pending"
 
 
+def compute_paper_estimated_pnl(position: Dict[str, Any], close_price: Optional[float]) -> Dict[str, Any]:
+    entry = to_float_or_none(position.get("entry_mid") or position.get("entry_price"))
+    qty = to_float_or_none(position.get("quantity"))
+    gross = compute_gross_pnl(position, close_price)
+    if (not paper_net_pnl_enabled()) or entry is None or qty is None or close_price is None or not isinstance(gross, (int, float)):
+        return {
+            "gross_pnl_usdt": gross if isinstance(gross, (int, float)) else "pending",
+            "estimated_entry_fee_usdt": "pending",
+            "estimated_exit_fee_usdt": "pending",
+            "estimated_slippage_usdt": "pending",
+            "estimated_net_pnl_usdt": "pending",
+            "total_fees_estimated": "pending",
+            "pnl_source": "PAPER_ESTIMATE",
+            "include_pnl": False,
+        }
+
+    entry_fee = entry * qty * paper_fee_rate() * paper_fee_buffer_mult()
+    exit_fee = close_price * qty * paper_fee_rate() * paper_fee_buffer_mult()
+    slippage = entry * qty * paper_slippage_buffer_rate()
+    total_fees = entry_fee + exit_fee + slippage
+    est_net = gross - total_fees
+    return {
+        "gross_pnl_usdt": gross,
+        "estimated_entry_fee_usdt": entry_fee,
+        "estimated_exit_fee_usdt": exit_fee,
+        "estimated_slippage_usdt": slippage,
+        "estimated_net_pnl_usdt": est_net,
+        "total_fees_estimated": total_fees,
+        "pnl_source": "PAPER_ESTIMATE",
+        "include_pnl": True,
+    }
+
+
 def append_paper_performance(position: Dict[str, Any], payload_outcome: Optional[str], close_price: Optional[float]) -> Dict[str, Any]:
     include_performance = True
     needs_review = False
@@ -1665,7 +1733,7 @@ def append_paper_performance(position: Dict[str, Any], payload_outcome: Optional
             needs_review = True
             reason = "missing_close_price"
 
-        gross_pnl_usdt = compute_gross_pnl(position, close_price)
+        pnl_metrics = compute_paper_estimated_pnl(position, close_price)
         rec = {
             "signal_key": position.get("signal_key"),
             "pair": position.get("pair"),
@@ -1677,11 +1745,19 @@ def append_paper_performance(position: Dict[str, Any], payload_outcome: Optional
             "tp2": to_float_or_none(position.get("tp2")),
             "tp3": to_float_or_none(position.get("tp3")),
             "close_price": close_price,
-            "quantity": to_float_or_none(position.get("quantity")),
             "outcome": outcome,
             "win_loss_be": paper_win_loss_be(outcome, include_performance, needs_review),
             "r_realized": r_realized,
-            "gross_pnl_usdt": gross_pnl_usdt,
+            "quantity": to_float_or_none(position.get("quantity")),
+            "notional_usdt": to_float_or_none(position.get("notional_usdt")),
+            "gross_pnl_usdt": pnl_metrics.get("gross_pnl_usdt"),
+            "estimated_entry_fee_usdt": pnl_metrics.get("estimated_entry_fee_usdt"),
+            "estimated_exit_fee_usdt": pnl_metrics.get("estimated_exit_fee_usdt"),
+            "estimated_slippage_usdt": pnl_metrics.get("estimated_slippage_usdt"),
+            "estimated_net_pnl_usdt": pnl_metrics.get("estimated_net_pnl_usdt"),
+            "total_fees_estimated": pnl_metrics.get("total_fees_estimated"),
+            "pnl_source": pnl_metrics.get("pnl_source"),
+            "include_pnl": pnl_metrics.get("include_pnl"),
             "include_performance": include_performance,
             "needs_review": needs_review,
             "reason": reason,
@@ -1708,6 +1784,8 @@ def append_paper_performance(position: Dict[str, Any], payload_outcome: Optional
             "win_loss_be": "REVIEW",
             "r_realized": None,
             "gross_pnl_usdt": "pending",
+            "estimated_net_pnl_usdt": "pending",
+            "total_fees_estimated": "pending",
             "include_performance": False,
             "needs_review": True,
             "reason": f"performance_error:{e}",
@@ -4339,6 +4417,10 @@ def paper_performance_daily_stats(date_wib: str) -> Dict[str, Any]:
     r_vals = []
     pnl_sum = 0.0
     pnl_count = 0
+    est_net_sum = 0.0
+    est_net_count = 0
+    fees_sum = 0.0
+    fees_count = 0
 
     if not PAPER_PERFORMANCE_LOG.exists():
         return {
@@ -4351,6 +4433,8 @@ def paper_performance_daily_stats(date_wib: str) -> Dict[str, Any]:
             "win_loss_be": "0/0/0",
             "avg_r": "pending",
             "gross_pnl_usdt": "pending",
+            "estimated_net_pnl_usdt": "pending",
+            "total_fees_estimated": "pending",
             "tp1_count": 0,
             "tp2_count": 0,
             "tp3_count": 0,
@@ -4388,6 +4472,14 @@ def paper_performance_daily_stats(date_wib: str) -> Dict[str, Any]:
         if pv is not None:
             pnl_sum += pv
             pnl_count += 1
+        nv = to_float_or_none(row.get("estimated_net_pnl_usdt"))
+        if nv is not None:
+            est_net_sum += nv
+            est_net_count += 1
+        fv = to_float_or_none(row.get("total_fees_estimated"))
+        if fv is not None:
+            fees_sum += fv
+            fees_count += 1
 
     return {
         "ok": True,
@@ -4399,6 +4491,8 @@ def paper_performance_daily_stats(date_wib: str) -> Dict[str, Any]:
         "win_loss_be": f"{win}/{loss}/{be}",
         "avg_r": (sum(r_vals)/len(r_vals)) if r_vals else "pending",
         "gross_pnl_usdt": pnl_sum if pnl_count > 0 else "pending",
+        "estimated_net_pnl_usdt": est_net_sum if est_net_count > 0 else "pending",
+        "total_fees_estimated": fees_sum if fees_count > 0 else "pending",
         "tp1_count": tp1_count,
         "tp2_count": tp2_count,
         "tp3_count": tp3_count,
@@ -4580,6 +4674,8 @@ def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayl
         f"Closed Trades: {perf.get('closed_trades')}",
         f"Win/Loss/BE: {perf.get('win_loss_be')}",
         f"Gross PnL: {perf.get('gross_pnl_usdt')}",
+        f"Est. Net PnL: {perf.get('estimated_net_pnl_usdt')}",
+        f"Fees Estimate: {perf.get('total_fees_estimated')}",
         "Net PnL: pending",
         f"Avg R: {perf.get('avg_r')}",
         f"TP1/TP2/TP3/SL: {perf.get('tp1_count')}/{perf.get('tp2_count')}/{perf.get('tp3_count')}/{perf.get('sl_count')}",
