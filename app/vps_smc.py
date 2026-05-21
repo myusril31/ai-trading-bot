@@ -280,6 +280,129 @@ def detect_fvg(candles: List[Dict[str, Any]], lookback: int = 35) -> Dict[str, A
             out["bearish_fvg"] = {"lo": float(c2["h"]), "hi": float(c0["l"]), "t": c2["t"], "idx": i}
     return out
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
+
+def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any]) -> Dict[str, Any]:
+    min_candles = _env_int("VPS_SMC_HTF_MIN_CANDLES", 30)
+    eq_band_pct = _env_float("VPS_SMC_HTF_EQ_BAND_PCT", 0.30)
+    if len(htf) < min_candles:
+        return {
+            "htf_gate_status": "HTF_DATA_GAP", "htf_dir": "NEUTRAL", "htf_bias": "MIXED", "htf_structure": "UNKNOWN",
+            "htf_location": "UNKNOWN", "htf_close": None, "htf_last_swing_high": None, "htf_last_swing_low": None,
+            "htf_mid": None, "htf_reason": "not_enough_4h_candles",
+        }
+
+    close = float(htf[-1]["c"])
+    last_high = htf_swing_summary.get("last_swing_high")
+    last_low = htf_swing_summary.get("last_swing_low")
+    htf_mid = None
+    location = "UNKNOWN"
+    structure = "RANGE"
+    direction = "NEUTRAL"
+    bias = "MIXED"
+    if last_high is not None and last_low is not None:
+        last_high = float(last_high)
+        last_low = float(last_low)
+        htf_mid = (last_high + last_low) / 2.0
+        band = abs(htf_mid) * (eq_band_pct / 100.0)
+        if band == 0:
+            band = 1e-12
+        if abs(close - htf_mid) <= band:
+            location = "EQUILIBRIUM"
+        elif close > htf_mid:
+            location = "PREMIUM"
+        else:
+            location = "DISCOUNT"
+        if close > last_high:
+            structure, direction, bias = "BOS_UP", "LONG", "BULLISH"
+        elif close < last_low:
+            structure, direction, bias = "BOS_DOWN", "SHORT", "BEARISH"
+    return {
+        "htf_gate_status": "PASS",
+        "htf_dir": direction,
+        "htf_bias": bias,
+        "htf_structure": structure,
+        "htf_location": location,
+        "htf_close": close,
+        "htf_last_swing_high": last_high,
+        "htf_last_swing_low": last_low,
+        "htf_mid": htf_mid,
+        "htf_reason": None,
+    }
+
+
+def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Dict[str, Any], entry_eq: Dict[str, Any], entry_sweep: Dict[str, Any]) -> Dict[str, Any]:
+    near_liq_pct = _env_float("VPS_SMC_NEAR_LIQ_PCT", 0.35)
+    require_near = _env_bool("VPS_SMC_REQUIRE_AT_OR_NEAR_LIQ", True)
+    close = float(entry[-1]["c"]) if entry else None
+    last_high = entry_swing_summary.get("last_swing_high")
+    last_low = entry_swing_summary.get("last_swing_low")
+    eqh = entry_eq.get("eqh") or []
+    eql = entry_eq.get("eql") or []
+    zones: List[Dict[str, Any]] = []
+    if last_high is not None:
+        zones.append({"type": "SWING_HIGH", "price": float(last_high)})
+    if last_low is not None:
+        zones.append({"type": "SWING_LOW", "price": float(last_low)})
+    for z in eqh:
+        if z.get("price") is not None:
+            zones.append({"type": "EQH", "price": float(z["price"])})
+    for z in eql:
+        if z.get("price") is not None:
+            zones.append({"type": "EQL", "price": float(z["price"])})
+
+    nearest = None
+    if close is not None and close != 0 and zones:
+        nearest = min(zones, key=lambda z: abs(close - float(z["price"])))
+    dist_pct = None
+    at_or_near = False
+    if nearest is not None and close is not None and close != 0:
+        dist_pct = abs(close - float(nearest["price"])) / close * 100.0
+        at_or_near = dist_pct <= near_liq_pct
+    liq_gate_status = "PASS"
+    liq_reason = None
+    if require_near and not at_or_near:
+        liq_gate_status = "BLOCK"
+        liq_reason = "not_near_liquidity"
+    liq_ctx = {
+        "last_buy_side_liq": float(last_high) if last_high is not None else None,
+        "last_sell_side_liq": float(last_low) if last_low is not None else None,
+        "eqh_count": len(eqh),
+        "eql_count": len(eql),
+        "nearest_liq_type": (nearest or {}).get("type"),
+        "nearest_liq_price": (nearest or {}).get("price"),
+        "dist_to_zone_pct": dist_pct,
+        "at_or_near_liq": at_or_near,
+        "sweep_tag": entry_sweep.get("sweep_tag"),
+        "sweep_level": entry_sweep.get("sweep_level"),
+        "sweep_extreme": entry_sweep.get("sweep_extreme"),
+    }
+    return {"liq_ctx": liq_ctx, "liq_gate_status": liq_gate_status, "liq_reason": liq_reason}
+
+
+def build_structure_15m(entry: List[Dict[str, Any]]) -> Dict[str, Any]:
+    pivots = detect_pivots(entry)
+    highs = pivots.get("swing_highs", [])
+    lows = pivots.get("swing_lows", [])
+    if len(highs) < 2 or len(lows) < 2:
+        return {"structure_15m": "UNKNOWN", "structure_reason": "not_enough_swings"}
+    h1, h2 = float(highs[-2]["price"]), float(highs[-1]["price"])
+    l1, l2 = float(lows[-2]["price"]), float(lows[-1]["price"])
+    if h2 > h1 and l2 > l1:
+        return {"structure_15m": "UP", "structure_reason": None}
+    if h2 < h1 and l2 < l1:
+        return {"structure_15m": "DOWN", "structure_reason": None}
+    return {"structure_15m": "RANGE", "structure_reason": None}
+
 def vps_smc_status() -> Dict[str, Any]:
     state = _load_state()
     return {
@@ -354,6 +477,39 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                         "symbol": symbol,
                         "error": f"primitive:{pexc}",
                     })
+            htf_gate = {"htf_gate_status": "HTF_DATA_GAP", "htf_reason": "not_enough_4h_candles"}
+            liq_ctx: Dict[str, Any] = {}
+            liq_gate_status = "BLOCK"
+            liq_reason = "context_not_built"
+            structure_15m = "UNKNOWN"
+            structure_reason = "context_not_built"
+            context_status = "DATA_GAP" if status == "DATA_GAP" else "ERROR"
+            if primitive_status == "READY":
+                try:
+                    htf_gate = build_htf_gate(htf, htf_swing_summary)
+                    liq_out = build_liquidity_context(entry, entry_swing_summary, entry_eq, entry_sweep)
+                    liq_ctx = liq_out["liq_ctx"]
+                    liq_gate_status = liq_out["liq_gate_status"]
+                    liq_reason = liq_out["liq_reason"]
+                    s15 = build_structure_15m(entry)
+                    structure_15m = s15["structure_15m"]
+                    structure_reason = s15["structure_reason"]
+                    htf_gate_status = htf_gate.get("htf_gate_status")
+                    if htf_gate_status == "HTF_DATA_GAP":
+                        context_status = "HTF_DATA_GAP"
+                    elif htf_gate_status == "PASS" and liq_gate_status == "PASS":
+                        context_status = "READY"
+                    elif htf_gate_status == "BLOCK" or liq_gate_status == "BLOCK":
+                        context_status = "BLOCKED"
+                    else:
+                        context_status = "ERROR"
+                except Exception as cexc:
+                    context_status = "ERROR"
+                    _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {
+                        "created_at_utc": _utc_now_iso(),
+                        "symbol": symbol,
+                        "error": f"context:{cexc}",
+                    })
             results.append({
                 "symbol": symbol,
                 "status": status,
@@ -369,6 +525,13 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "entry_sweep": entry_sweep,
                 "stageb_fvg": stageb_fvg,
                 "htf_swing_summary": htf_swing_summary,
+                "htf_gate": htf_gate,
+                "liq_ctx": liq_ctx,
+                "liq_gate_status": liq_gate_status,
+                "liq_reason": liq_reason,
+                "structure_15m": structure_15m,
+                "structure_reason": structure_reason,
+                "context_status": context_status,
                 "reason": reason,
             })
         except Exception as exc:
@@ -380,6 +543,18 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             })
 
     signal_count = 0
+    for result in results:
+        result.setdefault("htf_gate", {"htf_gate_status": "HTF_DATA_GAP"})
+        result.setdefault("liq_ctx", {})
+        result.setdefault("liq_gate_status", "BLOCK")
+        result.setdefault("liq_reason", "context_not_built")
+        result.setdefault("structure_15m", "UNKNOWN")
+        result.setdefault("structure_reason", "context_not_built")
+        if result.get("status") == "DATA_GAP":
+            result.setdefault("context_status", "DATA_GAP")
+        else:
+            result.setdefault("context_status", "ERROR")
+
     log_row = {
         "event_type": "VPS_SMC_RUN_ONCE",
         "created_at_utc": _utc_now_iso(),
@@ -397,6 +572,16 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "bearish_sweep_count": len([r for r in results if (r.get("entry_sweep") or {}).get("bearish_sweep")]),
             "bullish_fvg_count": sum(int(((r.get("stageb_fvg") or {}).get("count_bullish") or 0)) for r in results),
             "bearish_fvg_count": sum(int(((r.get("stageb_fvg") or {}).get("count_bearish") or 0)) for r in results),
+            "htf_pass": len([r for r in results if ((r.get("htf_gate") or {}).get("htf_gate_status") == "PASS")]),
+            "htf_block": len([r for r in results if ((r.get("htf_gate") or {}).get("htf_gate_status") == "BLOCK")]),
+            "htf_data_gap": len([r for r in results if ((r.get("htf_gate") or {}).get("htf_gate_status") == "HTF_DATA_GAP")]),
+            "liq_pass": len([r for r in results if r.get("liq_gate_status") == "PASS"]),
+            "liq_block": len([r for r in results if r.get("liq_gate_status") == "BLOCK"]),
+            "context_ready": len([r for r in results if r.get("context_status") == "READY"]),
+            "context_blocked": len([r for r in results if r.get("context_status") == "BLOCKED"]),
+            "structure_up": len([r for r in results if r.get("structure_15m") == "UP"]),
+            "structure_down": len([r for r in results if r.get("structure_15m") == "DOWN"]),
+            "structure_range": len([r for r in results if r.get("structure_15m") == "RANGE"]),
         },
         "error": last_error,
     }
