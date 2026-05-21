@@ -99,6 +99,7 @@ def _default_state() -> Dict[str, Any]:
         "last_signal_count": 0,
         "last_error": None,
         "last_symbols": [],
+        "logged_signal_keys": {},
         "updated_at_utc": _utc_now_iso(),
     }
 
@@ -597,6 +598,99 @@ def build_structure_15m(entry: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"structure_15m": "DOWN", "structure_reason": None}
     return {"structure_15m": "RANGE", "structure_reason": None}
 
+
+def _bucket_ms(ts_ms: Optional[Any], bucket_min: int) -> Optional[int]:
+    if ts_ms is None:
+        return None
+    try:
+        ts = int(ts_ms)
+    except Exception:
+        return None
+    bucket = max(1, int(bucket_min)) * 60 * 1000
+    return (ts // bucket) * bucket
+
+
+def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any], Optional[str]]:
+    direction = str(((result.get("stageb_confirmation") or {}).get("stageb_direction") or "NONE")).upper()
+    if direction not in ("LONG", "SHORT"):
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["invalid_direction"]}, "invalid_plan"
+    fvg = ((result.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {})
+    fvg_lo = fvg.get("fvg_lo")
+    fvg_hi = fvg.get("fvg_hi")
+    if fvg_lo is None or fvg_hi is None:
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["missing_fvg"]}, "invalid_plan"
+    entry_lo = min(float(fvg_lo), float(fvg_hi))
+    entry_hi = max(float(fvg_lo), float(fvg_hi))
+    entry_mid = (entry_lo + entry_hi) / 2.0
+    liq_ctx = result.get("liq_ctx") or {}
+    htf_gate = result.get("htf_gate") or {}
+    entry_sw = result.get("entry_swing_summary") or {}
+    htf_sw = result.get("htf_swing_summary") or {}
+    sweep_extreme = liq_ctx.get("sweep_extreme")
+    buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08)
+    buffer_mult = buffer_pct / 100.0
+    if sweep_extreme is None:
+        sweep_extreme = entry_sw.get("last_swing_low") if direction == "LONG" else entry_sw.get("last_swing_high")
+    if sweep_extreme is None:
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["missing_sweep_extreme"]}, "invalid_plan"
+    sweep_extreme = float(sweep_extreme)
+    sl = sweep_extreme * (1 - buffer_mult) if direction == "LONG" else sweep_extreme * (1 + buffer_mult)
+    risk = (entry_mid - sl) if direction == "LONG" else (sl - entry_mid)
+    if risk <= 0:
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["invalid_risk"]}, "invalid_plan"
+    if direction == "LONG":
+        tp1 = liq_ctx.get("last_buy_side_liq") or entry_sw.get("last_swing_high") or (entry_mid + (1.0 * risk))
+        tp2 = htf_sw.get("last_swing_high") or (entry_mid + (1.5 * risk))
+        tp3 = (entry_mid + (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
+        rr_tp2 = (float(tp2) - entry_mid) / risk
+        sane = sl < entry_mid and float(tp2) > entry_mid
+    else:
+        tp1 = liq_ctx.get("last_sell_side_liq") or entry_sw.get("last_swing_low") or (entry_mid - (1.0 * risk))
+        tp2 = htf_sw.get("last_swing_low") or (entry_mid - (1.5 * risk))
+        tp3 = (entry_mid - (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
+        rr_tp2 = (entry_mid - float(tp2)) / risk
+        sane = sl > entry_mid and float(tp2) < entry_mid
+    if not sane:
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["sanity_check_failed"]}, "invalid_plan"
+    if rr_tp2 < _env_float("VPS_SMC_RR_MIN_TP2", 0.95):
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["rr_below_min"]}, "invalid_plan"
+    plan = {"entry_lo": entry_lo, "entry_hi": entry_hi, "entry_mid": entry_mid, "sl": sl, "invalid": sl, "tp1": float(tp1), "tp2": float(tp2), "tp3": (float(tp3) if tp3 is not None else None), "rr_tp2": rr_tp2}
+    score = 60
+    reasons: List[str] = ["base_60"]
+    htf_bias = str(htf_gate.get("htf_bias") or "MIXED").upper()
+    htf_structure = str(htf_gate.get("htf_structure") or "UNKNOWN").upper()
+    if str(htf_gate.get("htf_gate_status") or "") == "PASS":
+        score += 10; reasons.append("+10_htf_pass")
+    if (direction == "LONG" and htf_bias == "BULLISH") or (direction == "SHORT" and htf_bias == "BEARISH"):
+        score += 5; reasons.append("+5_htf_bias_align")
+    elif htf_bias == "MIXED" and htf_structure == "RANGE":
+        score += 5; reasons.append("+5_mixed_range")
+    elif (direction == "LONG" and htf_bias == "BEARISH") or (direction == "SHORT" and htf_bias == "BULLISH"):
+        score -= 10; reasons.append("-10_htf_bias_conflict")
+    if str(result.get("liq_gate_status") or "") == "PASS":
+        score += 10; reasons.append("+10_liq_pass")
+    elif str(result.get("liq_gate_status") or "") == "BLOCK":
+        score -= 10; reasons.append("-10_liq_block")
+    if ((result.get("stageb_confirmation") or {}).get("stageb_reclaim") or {}).get("has_reclaim"):
+        score += 10; reasons.append("+10_reclaim")
+    if ((result.get("stageb_confirmation") or {}).get("stageb_displacement") or {}).get("has_displacement"):
+        score += 10; reasons.append("+10_displacement")
+    if ((result.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {}).get("has_fvg"):
+        score += 10; reasons.append("+10_fvg")
+    if rr_tp2 >= 1.5:
+        score += 5; reasons.append("+5_rr_ge_1_5")
+    if rr_tp2 < 1.0:
+        score -= 10; reasons.append("-10_rr_lt_1_0")
+    s15 = str(result.get("structure_15m") or "UNKNOWN").upper()
+    if (direction == "LONG" and s15 == "UP") or (direction == "SHORT" and s15 == "DOWN"):
+        score += 5; reasons.append("+5_structure_align")
+    score = max(0, min(100, score))
+    a_min = _env_float("VPS_SMC_PRIORITY_A_MIN", 80.0)
+    b_min = _env_float("VPS_SMC_PRIORITY_B_MIN", 70.0)
+    priority = "A" if score >= a_min else ("B" if score >= b_min else "C")
+    risk_mult = 1.0 if priority == "A" else (0.75 if priority == "B" else 0.5)
+    return "VALID", plan, {"score": score, "priority": priority, "risk_mult": risk_mult, "reasons": reasons}, None
+
 def vps_smc_status() -> Dict[str, Any]:
     state = _load_state()
     return {
@@ -775,6 +869,8 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             })
 
     signal_count = 0
+    state = _load_state()
+    logged_signal_keys = state.get("logged_signal_keys") if isinstance(state.get("logged_signal_keys"), dict) else {}
     for result in results:
         result.setdefault("htf_gate", {"htf_gate_status": "HTF_DATA_GAP"})
         result.setdefault("liq_ctx", {})
@@ -796,6 +892,60 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "stageb_invalid_reason": "not_built",
         })
         result.setdefault("shadow_state", (result.get("stageb_confirmation") or {}).get("stageb_status") or "INVALID")
+        result["plan_status"] = "INVALID_PLAN"
+        result["plan"] = None
+        result["score_detail"] = {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["not_confirmed"]}
+        result["signal_logged"] = False
+        result["signal_key"] = None
+        result["signal_skip_reason"] = "not_confirmed"
+        if str(result.get("shadow_state") or "") != "CONFIRMED":
+            continue
+        if not _env_bool("VPS_SMC_PLAN_ENABLED", True):
+            result["signal_skip_reason"] = "invalid_plan"
+            continue
+        plan_status, plan, score_detail, skip_reason = _build_plan_and_score(result)
+        result["plan_status"] = plan_status
+        result["plan"] = plan
+        result["score_detail"] = score_detail
+        result["signal_skip_reason"] = skip_reason if plan_status != "VALID" else None
+        if plan_status != "VALID":
+            continue
+        if _env_bool("VPS_SMC_SCORE_ENABLED", True) and float(score_detail.get("score") or 0.0) < _env_float("VPS_SMC_SCORE_MIN", 70.0):
+            result["signal_skip_reason"] = "score_below_min"
+            continue
+        bucket_ms = _bucket_ms(result.get("latest_stageb_close_time_ms"), _env_int("VPS_SMC_DEDUP_BUCKET_MIN", 15))
+        direction = str(((result.get("stageb_confirmation") or {}).get("stageb_direction") or "NONE")).upper()
+        signal_key = f"{result.get('symbol')}|{direction}|{bucket_ms}"
+        result["signal_key"] = signal_key
+        if _env_bool("VPS_SMC_DEDUP_ENABLED", True) and signal_key in logged_signal_keys:
+            result["signal_skip_reason"] = "duplicate"
+            continue
+        if not _env_bool("VPS_SMC_SHADOW_SIGNAL_LOG_ENABLED", True):
+            result["signal_skip_reason"] = "signal_log_disabled"
+            continue
+        htf_gate = result.get("htf_gate") or {}
+        stageb = result.get("stageb_confirmation") or {}
+        poi = stageb.get("stageb_fvg_poi") or {}
+        reclaim = stageb.get("stageb_reclaim") or {}
+        liq_ctx = result.get("liq_ctx") or {}
+        signal_row = {
+            "signal_key": signal_key, "signal_source": "VPS_SMC", "source_mode": "SHADOW_ONLY", "candidate_only": True,
+            "symbol": result.get("symbol"), "pair": result.get("symbol"), "direction": direction, "state": "CONFIRMED", "mode": "SHADOW_ONLY",
+            "score": score_detail.get("score"), "priority": score_detail.get("priority"), "risk_mult": score_detail.get("risk_mult"),
+            "signal_time_wib": None, "confirmed_bucket_ms": bucket_ms, "htf_dir": htf_gate.get("htf_dir"), "htf_bias": htf_gate.get("htf_bias"),
+            "htf_location": htf_gate.get("htf_location"), "htf_structure": htf_gate.get("htf_structure"), "liq_ctx": result.get("liq_ctx"),
+            "dist_to_zone_pct": liq_ctx.get("dist_to_zone_pct"), "structure_15m": result.get("structure_15m"), "sweep_tag": liq_ctx.get("sweep_tag"),
+            "sweep_extreme": liq_ctx.get("sweep_extreme"), "reclaim_level": reclaim.get("reclaim_level"), "fvg_type": poi.get("fvg_type"),
+            "fvg_lo": poi.get("fvg_lo"), "fvg_hi": poi.get("fvg_hi"), "entry_lo": plan.get("entry_lo"), "entry_hi": plan.get("entry_hi"),
+            "entry_mid": plan.get("entry_mid"), "sl": plan.get("sl"), "invalid": plan.get("invalid"), "tp1": plan.get("tp1"),
+            "tp2": plan.get("tp2"), "tp3": plan.get("tp3"), "rr_tp2": plan.get("rr_tp2"), "notes": ",".join(score_detail.get("reasons") or []),
+            "created_at_utc": _utc_now_iso(),
+        }
+        _append_jsonl(_log_dir() / "vps_smc_shadow_signals.jsonl", signal_row)
+        logged_signal_keys[signal_key] = signal_row["created_at_utc"]
+        result["signal_logged"] = True
+        result["signal_skip_reason"] = None
+        signal_count += 1
 
     log_row = {
         "event_type": "VPS_SMC_RUN_ONCE",
@@ -833,16 +983,23 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "structure_up": len([r for r in results if r.get("structure_15m") == "UP"]),
             "structure_down": len([r for r in results if r.get("structure_15m") == "DOWN"]),
             "structure_range": len([r for r in results if r.get("structure_15m") == "RANGE"]),
+            "plan_valid": len([r for r in results if r.get("plan_status") == "VALID"]),
+            "plan_invalid": len([r for r in results if r.get("plan_status") == "INVALID_PLAN"]),
+            "shadow_signals_logged": len([r for r in results if r.get("signal_logged") is True]),
+            "shadow_signals_skipped": len([r for r in results if r.get("signal_logged") is False]),
+            "score_a": len([r for r in results if ((r.get("score_detail") or {}).get("priority") == "A")]),
+            "score_b": len([r for r in results if ((r.get("score_detail") or {}).get("priority") == "B")]),
+            "score_c": len([r for r in results if ((r.get("score_detail") or {}).get("priority") == "C")]),
         },
         "error": last_error,
     }
     _append_jsonl(_log_dir() / "vps_smc_systemlog.jsonl", log_row)
 
-    state = _load_state()
     state["last_run_utc"] = log_row["created_at_utc"]
     state["last_signal_count"] = signal_count
     state["last_error"] = last_error
     state["last_symbols"] = [r.get("symbol") for r in results]
+    state["logged_signal_keys"] = logged_signal_keys
     _save_state(state)
 
     return {
