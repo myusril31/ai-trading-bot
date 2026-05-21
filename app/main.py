@@ -14,11 +14,15 @@ from threading import Lock, Thread
 from typing import Any, Dict, Optional, List
 from zoneinfo import ZoneInfo
 
+try:
+    from websocket import WebSocketApp
+except Exception:
+    WebSocketApp = None
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.20a-ml-phase1-complete-shadow-only"
+APP_VERSION = "v0.21-binance-candle-store"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -38,9 +42,17 @@ ML_PREDICTIONS_LOG = LOG_DIR / "ml_predictions.jsonl"
 ML_DATASET_ROWS_LOG = LOG_DIR / "ml_dataset_rows.jsonl"
 ML_CONTEXT_ERRORS_LOG = LOG_DIR / "ml_context_errors.jsonl"
 ML_CONTEXT_CACHE_FILE = STATE_DIR / "ml_context_cache.json"
+MARKET_DATA_DEFAULT_DIR = STATE_DIR / "market_data"
+MARKET_DATA_DEFAULT_AUDIT_LOG = LOG_DIR / "market_candles.jsonl"
 
 WIB = ZoneInfo("Asia/Jakarta")
 LOCK = Lock()
+MARKET_DATA_LOCK = Lock()
+MARKET_DATA_THREAD: Optional[Thread] = None
+MARKET_WS_CONNECTED = False
+MARKET_BOOTSTRAP_DONE = False
+MARKET_LAST_ERROR = ""
+MARKET_LAST_CLOSED: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(title="AI Trading VPS Bot", version=APP_VERSION)
 
@@ -123,6 +135,8 @@ def wib_now_iso() -> str:
 def ensure_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    market_storage_dir().mkdir(parents=True, exist_ok=True)
+    market_audit_log_path().parent.mkdir(parents=True, exist_ok=True)
 
 
 def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
@@ -156,6 +170,211 @@ def env_float(name: str, default: float) -> float:
         return float(str(raw).strip())
     except Exception:
         return default
+
+
+def market_storage_dir() -> Path:
+    raw = str(os.getenv("BINANCE_CANDLE_STORE_DIR") or "").strip()
+    return Path(raw) if raw else MARKET_DATA_DEFAULT_DIR
+
+
+def market_audit_log_path() -> Path:
+    raw = str(os.getenv("BINANCE_CANDLE_AUDIT_LOG") or "").strip()
+    return Path(raw) if raw else MARKET_DATA_DEFAULT_AUDIT_LOG
+
+
+def market_enabled() -> bool:
+    primary = env_bool("BINANCE_CANDLE_STORE_ENABLED", True)
+    alias = env_bool("BINANCE_CANDLE_COLLECTOR_ENABLED", primary)
+    return primary and alias
+
+
+def market_intervals() -> List[str]:
+    raw = str(os.getenv("BINANCE_CANDLE_INTERVALS") or "1m,5m,15m").strip()
+    allowed = {"1m", "5m", "15m"}
+    intervals = [x.strip() for x in raw.split(",") if x.strip()]
+    clean = [x for x in intervals if x in allowed]
+    return clean or ["1m", "5m", "15m"]
+
+
+def market_allowlist_symbols() -> List[str]:
+    allow = sorted(csv_set("PAIR_ALLOWLIST"))
+    if allow:
+        return [v010_normalize_symbol(s) for s in allow if v010_normalize_symbol(s)]
+    return ["BTCUSDT", "ETHUSDT", "UNIUSDT"]
+
+
+def retention_cutoff_ms(retention_days: int) -> int:
+    return int((utc_now() - timedelta(days=retention_days)).timestamp() * 1000)
+
+
+def market_data_file(symbol: str, interval: str) -> Path:
+    return market_storage_dir() / f"{symbol.upper()}_{interval}.jsonl"
+
+
+def market_load_candles(symbol: str, interval: str) -> List[Dict[str, Any]]:
+    ensure_dirs()
+    path = market_data_file(symbol, interval)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def market_write_candles(symbol: str, interval: str, rows: List[Dict[str, Any]]) -> None:
+    ensure_dirs()
+    path = market_data_file(symbol, interval)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def market_upsert_candles(rows: List[Dict[str, Any]], retention_days: int) -> Dict[str, Any]:
+    global MARKET_LAST_CLOSED
+
+    def canonical_compare(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "close_time_ms": int(row.get("close_time_ms") or 0),
+            "open": str(row.get("open") or ""),
+            "high": str(row.get("high") or ""),
+            "low": str(row.get("low") or ""),
+            "close": str(row.get("close") or ""),
+            "volume": str(row.get("volume") or ""),
+            "quote_volume": str(row.get("quote_volume") or ""),
+            "trade_count": int(row.get("trade_count") or 0),
+            "source": str(row.get("source") or ""),
+            "is_closed": bool(row.get("is_closed")),
+        }
+
+    with MARKET_DATA_LOCK:
+        cutoff_ms = retention_cutoff_ms(retention_days)
+        grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        for item in rows:
+            symbol = str(item.get("symbol") or "").upper()
+            interval = str(item.get("interval") or "1m")
+            if not symbol or interval not in market_intervals():
+                continue
+            grouped.setdefault((symbol, interval), []).append(item)
+        total_written = 0
+        for (symbol, interval), incoming in grouped.items():
+            existing = market_load_candles(symbol, interval)
+            merged: Dict[tuple[str, str, int], Dict[str, Any]] = {}
+            existing_map: Dict[tuple[str, str, int], Dict[str, Any]] = {}
+            audit_append_rows: List[Dict[str, Any]] = []
+            for item in existing:
+                open_time_ms = int(item.get("open_time_ms") or 0)
+                if open_time_ms <= 0 or open_time_ms < cutoff_ms:
+                    continue
+                key = (symbol, interval, open_time_ms)
+                merged[key] = item
+                existing_map[key] = item
+            for row in incoming:
+                open_time_ms = int(row.get("open_time_ms") or 0)
+                if open_time_ms <= 0 or open_time_ms < cutoff_ms:
+                    continue
+                key = (symbol, interval, open_time_ms)
+                prev = merged.get(key)
+                if prev is not None and canonical_compare(prev) == canonical_compare(row):
+                    merged[key] = prev
+                    continue
+                merged[key] = row
+                if existing_map.get(key) is None or canonical_compare(existing_map.get(key) or {}) != canonical_compare(row):
+                    audit_append_rows.append(row)
+            clean_rows = sorted(merged.values(), key=lambda x: int(x.get("open_time_ms") or 0))
+            if clean_rows:
+                MARKET_LAST_CLOSED.setdefault(symbol, {})[interval] = clean_rows[-1]
+            market_write_candles(symbol, interval, clean_rows)
+            total_written += len(clean_rows)
+            if audit_append_rows:
+                with market_audit_log_path().open("a", encoding="utf-8") as af:
+                    for row in audit_append_rows:
+                        af.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return {"written": total_written, "upserted": len(rows), "cutoff_ms": cutoff_ms}
+
+
+def market_build_row_from_kline(symbol: str, interval: str, kline: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        return {
+            "symbol": str(symbol or "").upper(),
+            "interval": str(interval or "1m"),
+            "open_time_ms": int(kline.get("t")),
+            "close_time_ms": int(kline.get("T")),
+            "open": str(kline.get("o")),
+            "high": str(kline.get("h")),
+            "low": str(kline.get("l")),
+            "close": str(kline.get("c")),
+            "volume": str(kline.get("v")),
+            "quote_volume": str(kline.get("q")),
+            "trade_count": int(kline.get("n") or 0),
+            "source": "BINANCE_FUTURES",
+            "is_closed": bool(kline.get("x")),
+            "received_at_utc": utc_now_iso(),
+        }
+    except Exception:
+        return None
+
+
+def market_build_row_from_rest(symbol: str, interval: str, row: List[Any]) -> Optional[Dict[str, Any]]:
+    try:
+        now_ms = int(time.time() * 1000)
+        close_time_ms = int(row[6])
+        if close_time_ms > now_ms:
+            return None
+        return {
+            "symbol": str(symbol or "").upper(),
+            "interval": str(interval or "1m"),
+            "open_time_ms": int(row[0]),
+            "close_time_ms": close_time_ms,
+            "open": str(row[1]),
+            "high": str(row[2]),
+            "low": str(row[3]),
+            "close": str(row[4]),
+            "volume": str(row[5]),
+            "quote_volume": str(row[7]),
+            "trade_count": int(row[8]),
+            "source": "BINANCE_FUTURES",
+            "is_closed": True,
+            "received_at_utc": utc_now_iso(),
+        }
+    except Exception:
+        return None
+
+
+def market_rest_bootstrap(symbols: List[str], intervals: List[str], limit: int = 300) -> Dict[str, Any]:
+    base = "https://fapi.binance.com/fapi/v1/klines"
+    inserted_rows: List[Dict[str, Any]] = []
+    failures: List[str] = []
+    for symbol in symbols:
+        for interval in intervals:
+            try:
+                query = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": int(limit)})
+                rows = http_get_json(f"{base}?{query}")
+                if not isinstance(rows, list):
+                    failures.append(f"{symbol}:{interval}:invalid_response")
+                    continue
+                for r in rows:
+                    if not isinstance(r, list) or len(r) < 9:
+                        continue
+                    obj = market_build_row_from_rest(symbol, interval, r)
+                    if obj:
+                        inserted_rows.append(obj)
+            except Exception as e:
+                failures.append(f"{symbol}:{interval}:{e}")
+    retention_days = env_int("BINANCE_CANDLE_RETENTION_DAYS", 7)
+    write_res = market_upsert_candles(inserted_rows, retention_days)
+    return {"ok": True, "symbols": symbols, "intervals": intervals, "limit": limit, "rows_ingested": len(inserted_rows), "failures": failures, "write": write_res}
 
 
 
@@ -222,6 +441,86 @@ def notify_signal_decision_async(p: Dict[str, Any], decision: Dict[str, Any]) ->
         fire_and_forget_telegram(msg)
     except Exception as e:
         print(f"[telegram] decision async notify failed: {e}")
+
+
+def market_ws_run_forever(symbols: List[str], intervals: List[str]) -> None:
+    global MARKET_WS_CONNECTED, MARKET_LAST_ERROR
+    if WebSocketApp is None:
+        MARKET_WS_CONNECTED = False
+        MARKET_LAST_ERROR = "websocket_client_missing"
+        print("[market_data] websocket-client missing; websocket collector disabled")
+        return
+    streams = "/".join([f"{s.lower()}@kline_{i}" for s in symbols for i in intervals])
+    ws_url = f"wss://fstream.binance.com/stream?streams={streams}"
+    retention_days = env_int("BINANCE_CANDLE_RETENTION_DAYS", 7)
+
+    def on_message(ws: WebSocketApp, message: str) -> None:
+        global MARKET_LAST_ERROR
+        try:
+            payload = json.loads(message)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            kline = data.get("k") if isinstance(data, dict) else None
+            if not isinstance(kline, dict) or not bool(kline.get("x")):
+                return
+            symbol = str(kline.get("s") or "").upper()
+            interval = str(kline.get("i") or "")
+            row = market_build_row_from_kline(symbol, interval, kline)
+            if row:
+                market_upsert_candles([row], retention_days)
+        except Exception as e:
+            MARKET_LAST_ERROR = str(e)
+            print(f"[market_data] ws message error: {e}")
+
+    def on_error(ws: WebSocketApp, error: Any) -> None:
+        global MARKET_WS_CONNECTED, MARKET_LAST_ERROR
+        MARKET_WS_CONNECTED = False
+        MARKET_LAST_ERROR = str(error)
+        print(f"[market_data] ws error: {error}")
+
+    def on_close(ws: WebSocketApp, status_code: Any, msg: Any) -> None:
+        global MARKET_WS_CONNECTED
+        MARKET_WS_CONNECTED = False
+        print(f"[market_data] ws closed: {status_code} {msg}")
+
+    while True:
+        try:
+            ws = WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close)
+            MARKET_WS_CONNECTED = True
+            ws.run_forever(ping_interval=15, ping_timeout=10)
+        except Exception as e:
+            MARKET_WS_CONNECTED = False
+            MARKET_LAST_ERROR = str(e)
+            print(f"[market_data] ws crash: {e}")
+        if not env_bool("BINANCE_CANDLE_RECONNECT_ENABLED", True):
+            break
+        time.sleep(3)
+
+
+def market_data_start_background() -> Dict[str, Any]:
+    global MARKET_DATA_THREAD
+    if not market_enabled():
+        return {"ok": True, "started": False, "reason": "collector_disabled"}
+    if MARKET_DATA_THREAD and MARKET_DATA_THREAD.is_alive():
+        return {"ok": True, "started": False, "reason": "already_running"}
+    symbols = market_allowlist_symbols()
+    intervals = market_intervals()
+    MARKET_DATA_THREAD = Thread(target=market_collector_main, args=(symbols, intervals), daemon=True)
+    MARKET_DATA_THREAD.start()
+    return {"ok": True, "started": True, "symbols": symbols, "intervals": intervals}
+
+
+def market_collector_main(symbols: List[str], intervals: List[str]) -> None:
+    global MARKET_BOOTSTRAP_DONE, MARKET_LAST_ERROR
+    try:
+        if env_bool("BINANCE_CANDLE_REST_BOOTSTRAP_ENABLED", True):
+            limit = env_int("BINANCE_CANDLE_BOOTSTRAP_LIMIT", 300)
+            market_rest_bootstrap(symbols, intervals, limit=limit)
+        MARKET_BOOTSTRAP_DONE = True
+    except Exception as e:
+        MARKET_LAST_ERROR = str(e)
+        print(f"[market_data] bootstrap error (non-fatal): {e}")
+    if str(os.getenv("BINANCE_CANDLE_SOURCE") or "WEBSOCKET").upper() == "WEBSOCKET":
+        market_ws_run_forever(symbols, intervals)
 
 
 def operator_status_payload(symbol: str = "") -> Dict[str, Any]:
@@ -4434,6 +4733,83 @@ def v014_reconcile_state(symbol: str = "", signal_key: str = "", ignore_signal_k
         "cleanup_required": mismatch_state in ("STALE_ALGO_NO_POSITION", "UNPROTECTED_POSITION"),
         "timestamp_utc": utc_now_iso(),
     }
+
+
+@app.on_event("startup")
+def startup_market_data_collector() -> None:
+    try:
+        res = market_data_start_background()
+        print(f"[market_data] startup={res}")
+    except Exception as e:
+        print(f"[market_data] startup failed (non-fatal): {e}")
+
+
+@app.get("/market/candles/status")
+def market_candles_status(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    symbols = market_allowlist_symbols()
+    intervals = market_intervals()
+    last_closed_candle: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        last_closed_candle[symbol] = {}
+        for interval in intervals:
+            cached = (MARKET_LAST_CLOSED.get(symbol) or {}).get(interval)
+            if isinstance(cached, dict) and cached:
+                last_closed_candle[symbol][interval] = cached
+                continue
+            rows = market_load_candles(symbol, interval)
+            if rows:
+                latest = sorted(rows, key=lambda x: int(x.get("open_time_ms") or 0))[-1]
+                last_closed_candle[symbol][interval] = latest
+    return {
+        "ok": True,
+        "enabled": market_enabled(),
+        "symbols": symbols,
+        "intervals": intervals,
+        "last_closed_candle": last_closed_candle,
+        "websocket_connected": MARKET_WS_CONNECTED,
+        "bootstrap_done": MARKET_BOOTSTRAP_DONE,
+        "storage_dir": str(market_storage_dir()),
+        "audit_log": str(market_audit_log_path()),
+        "last_error": MARKET_LAST_ERROR or None,
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+@app.get("/market/candles/latest")
+def market_candles_latest(
+    symbol: str = "UNIUSDT",
+    interval: str = "1m",
+    limit: int = 10,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    symbol = v010_normalize_symbol(symbol)
+    interval = str(interval or "1m").strip()
+    if interval not in market_intervals():
+        return {"ok": False, "reason": f"unsupported_interval:{interval}", "allowed_intervals": market_intervals()}
+    limit = max(1, min(int(limit or 10), 500))
+    rows = market_load_candles(symbol, interval)
+    items_sorted = sorted(rows, key=lambda x: int(x.get("open_time_ms") or 0), reverse=True)
+    return {"ok": True, "symbol": symbol, "interval": interval, "count": len(items_sorted[:limit]), "candles": items_sorted[:limit], "timestamp_utc": utc_now_iso()}
+
+
+@app.post("/market/candles/bootstrap")
+def market_candles_bootstrap(
+    limit: int = 300,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    symbols = market_allowlist_symbols()
+    intervals = market_intervals()
+    res = market_rest_bootstrap(symbols, intervals, limit=max(10, min(int(limit or 300), 1000)))
+    res["storage_dir"] = str(market_storage_dir())
+    return res
 
 
 def v014_execution_summary_write(signal_key: str, updates: Dict[str, Any]) -> Dict[str, Any]:
