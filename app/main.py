@@ -22,7 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.22-forward-outcome-evaluator"
+APP_VERSION = "v0.22a-4h-candle-store"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -199,11 +199,11 @@ def market_enabled() -> bool:
 
 
 def market_intervals() -> List[str]:
-    raw = str(os.getenv("BINANCE_CANDLE_INTERVALS") or "1m,5m,15m").strip()
-    allowed = {"1m", "5m", "15m"}
+    raw = str(os.getenv("BINANCE_CANDLE_INTERVALS") or "1m,5m,15m,4h").strip()
+    allowed = {"1m", "5m", "15m", "4h"}
     intervals = [x.strip() for x in raw.split(",") if x.strip()]
     clean = [x for x in intervals if x in allowed]
-    return clean or ["1m", "5m", "15m"]
+    return clean or ["1m", "5m", "15m", "4h"]
 
 
 def market_allowlist_symbols() -> List[str]:
