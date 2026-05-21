@@ -22,7 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.21-binance-candle-store"
+APP_VERSION = "v0.22-forward-outcome-evaluator"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -40,8 +40,11 @@ ML_SHADOW_SIGNALS_LOG = LOG_DIR / "ml_shadow_signals.jsonl"
 ML_CONTEXT_SNAPSHOTS_LOG = LOG_DIR / "ml_context_snapshots.jsonl"
 ML_PREDICTIONS_LOG = LOG_DIR / "ml_predictions.jsonl"
 ML_DATASET_ROWS_LOG = LOG_DIR / "ml_dataset_rows.jsonl"
+FORWARD_OUTCOMES_LOG = LOG_DIR / "forward_outcomes.jsonl"
+FORWARD_OUTCOME_ERRORS_LOG = LOG_DIR / "forward_outcome_errors.jsonl"
 ML_CONTEXT_ERRORS_LOG = LOG_DIR / "ml_context_errors.jsonl"
 ML_CONTEXT_CACHE_FILE = STATE_DIR / "ml_context_cache.json"
+FORWARD_OUTCOME_STATE_FILE = STATE_DIR / "forward_outcome_state.json"
 MARKET_DATA_DEFAULT_DIR = STATE_DIR / "market_data"
 MARKET_DATA_DEFAULT_AUDIT_LOG = LOG_DIR / "market_candles.jsonl"
 
@@ -119,6 +122,13 @@ class MlContextPayload(BaseModel):
     direction: Optional[str] = None
     signal_key: Optional[str] = None
     signal_time_wib: Optional[str] = None
+
+
+class ForwardOutcomeEvaluatePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    limit: Optional[int] = None
+    max_rows: Optional[int] = None
+    force: Optional[bool] = False
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -2757,6 +2767,221 @@ def _latest_by_signal(path: Path, signal_key: str) -> Dict[str, Any]:
     return last
 
 
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def _forward_window_hours() -> int:
+    hrs = env_int("FORWARD_OUTCOME_WINDOW_HOURS", 24)
+    if hrs <= 0:
+        mins_fallback = env_int("FORWARD_OUTCOME_WINDOW_MINUTES", 180)
+        hrs = max(1, mins_fallback // 60)
+    return max(1, hrs)
+
+
+def _signal_time_and_source(row: Dict[str, Any]) -> (Optional[int], str):
+    dt_wib = parse_wib_flexible(row.get("signal_time_wib"))
+    if dt_wib:
+        return int(dt_wib.astimezone(timezone.utc).timestamp() * 1000), "signal_time_wib"
+    dt_utc = parse_iso_utc(row.get("created_at_utc"))
+    if dt_utc:
+        return int(dt_utc.timestamp() * 1000), "created_at_utc_fallback"
+    return None, "missing"
+
+
+def _eval_forward_outcome_row(row: Dict[str, Any], interval: str, window_ms: int, window_hours: int, skip_validation: bool) -> Dict[str, Any]:
+    now_utc = utc_now()
+    now = now_utc.isoformat()
+    signal_key = str(row.get("signal_key") or "")
+    symbol = v010_normalize_symbol(row.get("symbol") or row.get("pair") or "")
+    direction = str(row.get("direction") or "").upper()
+    sample_type = str(row.get("sample_type") or "")
+    include_ml = bool(row.get("include_ml"))
+    base = {
+        "signal_key": signal_key,
+        "symbol": symbol,
+        "direction": direction,
+        "signal_time_wib": row.get("signal_time_wib"),
+        "evaluated_at_utc": now,
+        "outcome_status": "PENDING",
+        "label_win": None,
+        "label_target": None,
+        "label_R": None,
+        "outcome_ts_wib": None,
+        "bars_to_outcome": None,
+        "candles_checked": 0,
+        "hit_tp1": False,
+        "hit_tp2": False,
+        "hit_tp3": False,
+        "hit_sl": False,
+        "first_hit": None,
+        "same_candle_conflict": False,
+        "same_candle_policy": str(os.getenv("FORWARD_OUTCOME_SAME_CANDLE_POLICY", "CONSERVATIVE_SL")).strip() or "CONSERVATIVE_SL",
+        "evaluation_window_hours": window_hours,
+        "candle_interval": interval,
+        "include_ml_label": False,
+        "exclude_label_reason": None,
+        "time_source": "missing",
+        "execution_decision": row.get("execution_decision"),
+        "sample_type": sample_type,
+    }
+    if sample_type == "VALIDATION_SAMPLE":
+        base["outcome_status"] = "SKIPPED"
+        base["exclude_label_reason"] = "validation_sample"
+        if skip_validation:
+            return base
+    if not include_ml:
+        base["outcome_status"] = "SKIPPED"
+        base["exclude_label_reason"] = "include_ml_false"
+        return base
+    signal_ms, time_source = _signal_time_and_source(row)
+    base["time_source"] = time_source
+    if signal_ms is None:
+        return {**base, "outcome_status": "DATA_GAP", "exclude_label_reason": "missing_signal_time"}
+    entry = to_float_or_none(row.get("entry"))
+    sl = to_float_or_none(row.get("sl"))
+    tp1 = to_float_or_none(row.get("tp1"))
+    tp2 = to_float_or_none(row.get("tp2"))
+    tp3 = to_float_or_none(row.get("tp3"))
+    if entry is None or sl is None or tp1 is None or direction not in ("LONG", "SHORT"):
+        return {**base, "outcome_status": "INVALID_PLAN", "exclude_label_reason": "missing_plan_fields"}
+    candles = market_load_candles(symbol, interval)
+    if not candles:
+        return {**base, "outcome_status": "DATA_GAP", "exclude_label_reason": "missing_candles"}
+    horizon_ms = signal_ms + window_ms
+    selected = []
+    for c in candles:
+        o = int(c.get("open_time_ms") or 0)
+        cl = int(c.get("close_time_ms") or 0)
+        if cl > signal_ms and o <= horizon_ms:
+            selected.append(c)
+    if not selected:
+        if int(now_utc.timestamp() * 1000) < horizon_ms:
+            return {**base, "outcome_status": "PENDING", "exclude_label_reason": "awaiting_candles"}
+        return {**base, "outcome_status": "DATA_GAP", "exclude_label_reason": "no_candles_after_signal"}
+    hit_target = None
+    hit_ts_wib = None
+    same_conflict = False
+    checked = 0
+    latest_close_ms = 0
+    for c in selected:
+        checked += 1
+        latest_close_ms = max(latest_close_ms, int(c.get("close_time_ms") or 0))
+        hi = to_float_or_none(c.get("high"))
+        lo = to_float_or_none(c.get("low"))
+        if hi is None or lo is None:
+            continue
+        if direction == "LONG":
+            sl_hit = lo <= sl
+            tp1_hit = hi >= tp1
+            tp2_hit = tp2 is not None and hi >= tp2
+            tp3_hit = tp3 is not None and hi >= tp3
+        else:
+            sl_hit = hi >= sl
+            tp1_hit = lo <= tp1
+            tp2_hit = tp2 is not None and lo <= tp2
+            tp3_hit = tp3 is not None and lo <= tp3
+        any_tp_hit = bool(tp1_hit or tp2_hit or tp3_hit)
+        if sl_hit and any_tp_hit:
+            hit_target = "SL"
+            same_conflict = True
+            hit_ts_wib = datetime.fromtimestamp((int(c.get("close_time_ms") or 0)) / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+            break
+        if sl_hit:
+            hit_target = "SL"
+            hit_ts_wib = datetime.fromtimestamp((int(c.get("close_time_ms") or 0)) / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+            break
+        if tp3_hit:
+            hit_target = "TP3"
+            hit_ts_wib = datetime.fromtimestamp((int(c.get("close_time_ms") or 0)) / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+            break
+        if tp2_hit:
+            hit_target = "TP2"
+            hit_ts_wib = datetime.fromtimestamp((int(c.get("close_time_ms") or 0)) / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+            break
+        if tp1_hit:
+            hit_target = "TP1"
+            hit_ts_wib = datetime.fromtimestamp((int(c.get("close_time_ms") or 0)) / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+            break
+    out = dict(base)
+    out["candles_checked"] = checked
+    out["bars_to_outcome"] = checked if hit_target else None
+    out["outcome_ts_wib"] = hit_ts_wib
+    out["same_candle_conflict"] = same_conflict
+    if hit_target == "SL":
+        out.update({"outcome_status": "RESOLVED", "include_ml_label": True, "label_target": "SL", "label_win": 0, "label_R": -1.0, "first_hit": "SL", "hit_sl": True})
+        return out
+    if hit_target in ("TP1", "TP2", "TP3"):
+        rr = {"TP1": 1.0, "TP2": 1.5, "TP3": 2.5}
+        out.update({"outcome_status": "RESOLVED", "include_ml_label": True, "label_target": hit_target, "label_win": 1, "label_R": rr[hit_target], "first_hit": hit_target})
+        out["hit_tp1"] = hit_target == "TP1"
+        out["hit_tp2"] = hit_target == "TP2"
+        out["hit_tp3"] = hit_target == "TP3"
+        return out
+    if latest_close_ms >= horizon_ms:
+        out.update({"outcome_status": "OPEN_END", "exclude_label_reason": "window_end_no_hit"})
+        return out
+    out.update({"outcome_status": "PENDING", "exclude_label_reason": "awaiting_window_end"})
+    return out
+
+
+def evaluate_forward_outcomes(limit: int = 200, force: bool = False) -> Dict[str, Any]:
+    if not env_bool("FORWARD_OUTCOME_ENABLED", True):
+        return {"ok": True, "skipped": True, "reason": "forward_outcome_disabled"}
+    interval = str(os.getenv("FORWARD_OUTCOME_INTERVAL", "1m")).strip() or "1m"
+    include_rejected = env_bool("FORWARD_OUTCOME_INCLUDE_REJECTED", True)
+    include_accepted = env_bool("FORWARD_OUTCOME_INCLUDE_ACCEPTED", True)
+    skip_validation = env_bool("FORWARD_OUTCOME_SKIP_VALIDATION", True)
+    max_rows = env_int("FORWARD_OUTCOME_MAX_ROWS_PER_RUN", 200)
+    limit = max(1, min(limit, max_rows))
+    window_hours = _forward_window_hours()
+    window_ms = window_hours * 60 * 60 * 1000
+    rows = _read_jsonl(ML_DATASET_ROWS_LOG)
+    st = load_json_file(FORWARD_OUTCOME_STATE_FILE, {})
+    final_keys = st.get("final_signal_keys") if isinstance(st, dict) else {}
+    if not isinstance(final_keys, dict):
+        final_keys = {}
+    processed = 0
+    written = 0
+    for row in reversed(rows):
+        if processed >= limit:
+            break
+        signal_key = str(row.get("signal_key") or "")
+        decision = str(row.get("execution_decision") or "").upper()
+        if decision == "REJECT" and not include_rejected:
+            continue
+        if decision == "ACCEPT" and not include_accepted:
+            continue
+        if not signal_key or (signal_key in final_keys and not force):
+            continue
+        try:
+            result = _eval_forward_outcome_row(row, interval, window_ms, window_hours, skip_validation)
+        except Exception as e:
+            append_jsonl(FORWARD_OUTCOME_ERRORS_LOG, {"evaluated_at_utc": utc_now_iso(), "signal_key": signal_key, "error": str(e)})
+            continue
+        processed += 1
+        append_jsonl(FORWARD_OUTCOMES_LOG, result)
+        written += 1
+        if result.get("outcome_status") in ("RESOLVED", "OPEN_END", "DATA_GAP", "INVALID_PLAN", "SKIPPED"):
+            final_keys[signal_key] = {"status": result.get("outcome_status"), "updated_at_utc": utc_now_iso()}
+    save_json_file(FORWARD_OUTCOME_STATE_FILE, {"updated_at_utc": utc_now_iso(), "final_signal_keys": final_keys})
+    return {"ok": True, "evaluated": processed, "written": written, "interval": interval, "window_ms": window_ms, "window_hours": window_hours, "force": force}
+
+
 @app.get("/ml/context-latest")
 def ml_context_latest(
     signal_key: str,
@@ -2785,6 +3010,89 @@ def ml_prediction_latest(
 ) -> Dict[str, Any]:
     verify_secret(x_signal_secret, x_webhook_secret)
     return {"ok": True, "row": _latest_by_signal(ML_PREDICTIONS_LOG, signal_key)}
+
+
+@app.post("/ml/outcome/evaluate")
+def ml_outcome_evaluate(
+    payload: Optional[ForwardOutcomeEvaluatePayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    req = payload.model_dump(mode="json") if payload else {}
+    max_rows = req.get("max_rows")
+    limit = req.get("limit")
+    force = bool(req.get("force") is True)
+    raw_lim = max_rows if str(max_rows or "").strip() else limit
+    lim = int(raw_lim) if str(raw_lim or "").strip() else env_int("FORWARD_OUTCOME_MAX_ROWS_PER_RUN", 200)
+    try:
+        return evaluate_forward_outcomes(limit=lim, force=force)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/ml/outcome/latest")
+def ml_outcome_latest(
+    signal_key: str,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return {"ok": True, "row": _latest_by_signal(FORWARD_OUTCOMES_LOG, signal_key)}
+
+
+@app.get("/ml/outcome/summary")
+def ml_outcome_summary(
+    date_wib: Optional[str] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    rows = _read_jsonl(FORWARD_OUTCOMES_LOG)
+    counts: Dict[str, int] = {}
+    filtered: List[Dict[str, Any]] = []
+    for r in rows:
+        if date_wib:
+            ev = str(r.get("evaluated_at_utc") or "").strip()
+            dt = parse_iso_utc(ev)
+            if not dt or dt.astimezone(WIB).date().isoformat() != str(date_wib):
+                continue
+        filtered.append(r)
+        k = str(r.get("outcome_status") or "UNKNOWN")
+        counts[k] = counts.get(k, 0) + 1
+    labeled = 0
+    win = 0
+    loss = 0
+    tp1 = tp2 = tp3 = sl = 0
+    for r in filtered:
+        if bool(r.get("include_ml_label")):
+            labeled += 1
+        tgt = str(r.get("label_target") or "")
+        if tgt == "TP1":
+            tp1 += 1; win += 1
+        elif tgt == "TP2":
+            tp2 += 1; win += 1
+        elif tgt == "TP3":
+            tp3 += 1; win += 1
+        elif tgt == "SL":
+            sl += 1; loss += 1
+    return {
+        "ok": True,
+        "date_wib": date_wib,
+        "total": len(filtered),
+        "labeled": labeled,
+        "win": win,
+        "loss": loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "sl": sl,
+        "pending": counts.get("PENDING", 0),
+        "skipped": counts.get("SKIPPED", 0),
+        "open_end": counts.get("OPEN_END", 0),
+        "data_gap": counts.get("DATA_GAP", 0),
+        "invalid_plan": counts.get("INVALID_PLAN", 0),
+    }
 
 @app.get("/ml/model/status")
 def ml_model_status(
