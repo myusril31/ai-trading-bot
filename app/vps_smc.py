@@ -171,6 +171,115 @@ def _load_internal_candles(symbol: str, interval: str) -> List[Dict[str, Any]]:
     return out
 
 
+
+def detect_pivots(candles: List[Dict[str, Any]], left: int = 2, right: int = 2) -> Dict[str, List[Dict[str, Any]]]:
+    swings_h: List[Dict[str, Any]] = []
+    swings_l: List[Dict[str, Any]] = []
+    n = len(candles)
+    if n < (left + right + 1):
+        return {"swing_highs": swings_h, "swing_lows": swings_l}
+    for i in range(left, n - right):
+        h = float(candles[i]["h"])
+        l = float(candles[i]["l"])
+        left_h = [float(candles[j]["h"]) for j in range(i - left, i)]
+        right_h = [float(candles[j]["h"]) for j in range(i + 1, i + 1 + right)]
+        left_l = [float(candles[j]["l"]) for j in range(i - left, i)]
+        right_l = [float(candles[j]["l"]) for j in range(i + 1, i + 1 + right)]
+        if all(h > x for x in left_h + right_h):
+            swings_h.append({"idx": i, "t": candles[i]["t"], "price": h, "type": "SWING_HIGH"})
+        if all(l < x for x in left_l + right_l):
+            swings_l.append({"idx": i, "t": candles[i]["t"], "price": l, "type": "SWING_LOW"})
+    return {"swing_highs": swings_h, "swing_lows": swings_l}
+
+
+def build_swing_summary(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    pivots = detect_pivots(candles)
+    last_h = pivots["swing_highs"][-1] if pivots["swing_highs"] else None
+    last_l = pivots["swing_lows"][-1] if pivots["swing_lows"] else None
+    return {
+        "last_swing_high": (last_h or {}).get("price"),
+        "last_swing_high_t": (last_h or {}).get("t"),
+        "last_swing_low": (last_l or {}).get("price"),
+        "last_swing_low_t": (last_l or {}).get("t"),
+        "swing_high_count": len(pivots["swing_highs"]),
+        "swing_low_count": len(pivots["swing_lows"]),
+    }
+
+
+def detect_equal_high_low(candles: List[Dict[str, Any]], pivots: Dict[str, List[Dict[str, Any]]], band_pct: float = 0.15) -> Dict[str, List[Dict[str, Any]]]:
+    recent_start = max(0, len(candles) - 50)
+    highs = [x for x in pivots.get("swing_highs", []) if int(x.get("idx", -1)) >= recent_start]
+    lows = [x for x in pivots.get("swing_lows", []) if int(x.get("idx", -1)) >= recent_start]
+
+    def _group(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        groups: List[Dict[str, Any]] = []
+        for item in items:
+            price = float(item["price"])
+            found = None
+            for g in groups:
+                mid = float(g["price"])
+                tol = abs(mid) * (band_pct / 100.0)
+                if tol == 0:
+                    tol = 1e-12
+                if abs(price - mid) <= tol:
+                    found = g
+                    break
+            if found is None:
+                groups.append({"price": price, "count": 1, "t": item["t"], "band_pct": band_pct})
+            else:
+                found["count"] += 1
+                found["price"] = (float(found["price"]) * (found["count"] - 1) + price) / found["count"]
+                found["t"] = item["t"]
+        return [g for g in groups if int(g["count"]) >= 2]
+
+    return {"eqh": _group(highs), "eql": _group(lows)}
+
+
+def detect_sweep(candles: List[Dict[str, Any]], swing_summary: Dict[str, Any], scan_n: int = 20) -> Dict[str, Any]:
+    out = {
+        "bullish_sweep": False,
+        "bearish_sweep": False,
+        "sweep_level": None,
+        "sweep_extreme": None,
+        "sweep_t": None,
+        "sweep_tag": None,
+    }
+    if not candles:
+        return out
+    scan = candles[-max(1, scan_n):]
+    last_low = swing_summary.get("last_swing_low")
+    last_high = swing_summary.get("last_swing_high")
+    if last_low is not None:
+        for c in reversed(scan):
+            if float(c["l"]) < float(last_low) and float(c["c"]) > float(last_low):
+                out.update({"bullish_sweep": True, "sweep_level": float(last_low), "sweep_extreme": float(c["l"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_LOW"})
+                break
+    if last_high is not None:
+        for c in reversed(scan):
+            if float(c["h"]) > float(last_high) and float(c["c"]) < float(last_high):
+                if not out["bullish_sweep"]:
+                    out.update({"sweep_level": float(last_high), "sweep_extreme": float(c["h"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_HIGH"})
+                out["bearish_sweep"] = True
+                break
+    return out
+
+
+def detect_fvg(candles: List[Dict[str, Any]], lookback: int = 35) -> Dict[str, Any]:
+    out = {"bullish_fvg": None, "bearish_fvg": None, "count_bullish": 0, "count_bearish": 0}
+    if len(candles) < 3:
+        return out
+    start = max(2, len(candles) - max(3, lookback))
+    for i in range(start, len(candles)):
+        c0 = candles[i - 2]
+        c2 = candles[i]
+        if float(c0["h"]) < float(c2["l"]):
+            out["count_bullish"] += 1
+            out["bullish_fvg"] = {"lo": float(c0["h"]), "hi": float(c2["l"]), "t": c2["t"], "idx": i}
+        if float(c0["l"]) > float(c2["h"]):
+            out["count_bearish"] += 1
+            out["bearish_fvg"] = {"lo": float(c2["h"]), "hi": float(c0["l"]), "t": c2["t"], "idx": i}
+    return out
+
 def vps_smc_status() -> Dict[str, Any]:
     state = _load_state()
     return {
@@ -216,15 +325,50 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 status = "DATA_GAP"
                 reason = f"missing_{intervals['stageb']}_candles"
 
+            primitive_status = "SKIPPED_DATA_GAP"
+            entry_swing_summary: Dict[str, Any] = {}
+            entry_eq: Dict[str, Any] = {"eqh": [], "eql": []}
+            entry_sweep: Dict[str, Any] = {
+                "bullish_sweep": False,
+                "bearish_sweep": False,
+                "sweep_level": None,
+                "sweep_extreme": None,
+                "sweep_t": None,
+                "sweep_tag": None,
+            }
+            stageb_fvg: Dict[str, Any] = {"bullish_fvg": None, "bearish_fvg": None, "count_bullish": 0, "count_bearish": 0}
+            htf_swing_summary: Dict[str, Any] = {}
+            if status == "READY":
+                try:
+                    entry_pivots = detect_pivots(entry)
+                    entry_swing_summary = build_swing_summary(entry)
+                    entry_eq = detect_equal_high_low(entry, entry_pivots)
+                    entry_sweep = detect_sweep(entry, entry_swing_summary)
+                    stageb_fvg = detect_fvg(stageb)
+                    htf_swing_summary = build_swing_summary(htf)
+                    primitive_status = "READY"
+                except Exception as pexc:
+                    primitive_status = "ERROR"
+                    _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {
+                        "created_at_utc": _utc_now_iso(),
+                        "symbol": symbol,
+                        "error": f"primitive:{pexc}",
+                    })
             results.append({
                 "symbol": symbol,
                 "status": status,
+                "primitive_status": primitive_status,
                 "htf_count": len(htf),
                 "entry_count": len(entry),
                 "stageb_count": len(stageb),
                 "latest_htf_close_time_ms": htf[-1]["t"] if htf else None,
                 "latest_entry_close_time_ms": entry[-1]["t"] if entry else None,
                 "latest_stageb_close_time_ms": stageb[-1]["t"] if stageb else None,
+                "entry_swing_summary": entry_swing_summary,
+                "entry_eq": entry_eq,
+                "entry_sweep": entry_sweep,
+                "stageb_fvg": stageb_fvg,
+                "htf_swing_summary": htf_swing_summary,
                 "reason": reason,
             })
         except Exception as exc:
@@ -246,6 +390,13 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         "results_summary": {
             "ready": len([r for r in results if r.get("status") == "READY"]),
             "data_gap": len([r for r in results if r.get("status") == "DATA_GAP"]),
+            "primitive_ready": len([r for r in results if r.get("primitive_status") == "READY"]),
+            "primitive_error": len([r for r in results if r.get("primitive_status") == "ERROR"]),
+            "primitive_skipped": len([r for r in results if r.get("primitive_status") == "SKIPPED_DATA_GAP"]),
+            "bullish_sweep_count": len([r for r in results if (r.get("entry_sweep") or {}).get("bullish_sweep")]),
+            "bearish_sweep_count": len([r for r in results if (r.get("entry_sweep") or {}).get("bearish_sweep")]),
+            "bullish_fvg_count": sum(int(((r.get("stageb_fvg") or {}).get("count_bullish") or 0)) for r in results),
+            "bearish_fvg_count": sum(int(((r.get("stageb_fvg") or {}).get("count_bearish") or 0)) for r in results),
         },
         "error": last_error,
     }
