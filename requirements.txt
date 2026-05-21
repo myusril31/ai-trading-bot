@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 pydantic==2.10.4
 google-api-python-client
 google-auth
+websocket-client==1.8.0
