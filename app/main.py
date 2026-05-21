@@ -3,6 +3,7 @@ import os
 import time
 import hmac
 import hashlib
+import pickle
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -17,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 
-APP_VERSION = "v0.20-ml-phase1-shadow-dataset"
+APP_VERSION = "v0.20a-ml-phase1-complete-shadow-only"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -516,7 +517,7 @@ def build_binance_context(symbol: str) -> Dict[str, Any]:
 def build_fred_context() -> Dict[str, Any]:
     api_key = str(os.getenv("FRED_API_KEY") or "").strip()
     if not api_key:
-        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN"}
+        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN", "fred_context_quality": "API_FAILED"}
     base = os.getenv("FRED_BASE", "https://api.stlouisfed.org/fred").rstrip("/")
     def last_two(series: str) -> tuple[Optional[float], Optional[float]]:
         data = http_get_json(f"{base}/series/observations?series_id={series}&api_key={api_key}&file_type=json&sort_order=desc&limit=6", timeout=3.0)
@@ -535,10 +536,10 @@ def build_fred_context() -> Dict[str, Any]:
             "vol_status": "STRESS" if (vix or 0) >= 30 else "ELEVATED" if (vix or 0) >= 20 else "NORMAL" if (vix or 0) >= 14 else "CALM",
             "equity_risk": "RISK_ON" if (spx is not None and spx_old is not None and spx > spx_old) else "RISK_OFF" if (spx is not None and spx_old is not None and spx < spx_old) else "NEUTRAL",
             "usd_pressure": "USD_UP" if (dxy is not None and dxy_old is not None and dxy > dxy_old) else "USD_DOWN" if (dxy is not None and dxy_old is not None and dxy < dxy_old) else "NEUTRAL",
-            "macro_regime": "MIXED",
+            "macro_regime": "MIXED", "fred_context_quality": "FULL",
         }
     except Exception:
-        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN"}
+        return {"macro_regime": "UNKNOWN", "equity_risk": "UNKNOWN", "yield_pressure": "UNKNOWN", "usd_pressure": "UNKNOWN", "vol_status": "UNKNOWN", "fred_context_quality": "API_FAILED"}
 
 
 
@@ -613,15 +614,68 @@ def build_macro_event_context(signal_time_wib: Any, events: Optional[List[Dict[s
     }
 
 
+
+
+def _norm_macro_header(h: Any) -> str:
+    key = str(h or "").strip().upper()
+    mapping = {
+        "EVENT_ID": "event_id",
+        "EVENT_NAME": "event_name",
+        "CURRENCY": "currency",
+        "IMPACT": "impact",
+        "EVENT_TS_WIB": "event_time_wib",
+        "PRE_BLACKOUT_MIN": "blackout_before_min",
+        "POST_BLACKOUT_MIN": "blackout_after_min",
+        "STATUS": "status",
+        "NOTES": "notes",
+    }
+    return mapping.get(key, str(h or "").strip().lower())
+
+
+def _normalize_macro_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row or {})
+    st = str(out.get("status") or "").upper().strip()
+    out["status"] = st
+    imp = str(out.get("impact") or "UNKNOWN").upper().strip()
+    out["impact"] = imp if imp in ("HIGH", "MEDIUM", "LOW") else "UNKNOWN"
+    for k in ("blackout_before_min", "blackout_after_min"):
+        try:
+            out[k] = int(out.get(k) or 0)
+        except Exception:
+            out[k] = 0
+    return out
 def load_macro_events_from_gsheet_if_configured() -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     source = str(os.getenv("MACRO_EVENT_SOURCE", "GSHEET")).upper().strip()
     if source != "GSHEET":
         return None, "gsheet_source_disabled"
-    creds = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GSHEET_CREDENTIALS_FILE") or "").strip()
-    token = str(os.getenv("GSHEET_TOKEN") or "").strip()
-    if not creds and not token:
+    sheet_id = str(os.getenv("MACRO_EVENT_SPREADSHEET_ID") or os.getenv("INST_MACRO_EVENTS_SPREADSHEET_ID") or os.getenv("MACRO_EVENTS_SPREADSHEET_ID") or "").strip()
+    sheet_name = str(os.getenv("MACRO_EVENT_SHEET_NAME") or os.getenv("INST_MACRO_EVENTS_SHEET_NAME") or "INST_MACRO_EVENTS").strip()
+    sheet_range = f"{sheet_name}!A:Z"
+    creds = str(os.getenv("MACRO_EVENT_SERVICE_ACCOUNT_FILE") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GSHEET_CREDENTIALS_FILE") or "").strip()
+    if not creds:
         return None, "gsheet_credentials_missing"
-    return None, "gsheet_provider_unavailable"
+    if not sheet_id:
+        return None, "gsheet_sheet_id_missing"
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+    except Exception:
+        return None, "gsheet_provider_unavailable"
+    try:
+        c = Credentials.from_service_account_file(creds, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        svc = build("sheets", "v4", credentials=c, cache_discovery=False)
+        vals = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=sheet_range).execute().get("values", [])
+        if not vals:
+            return [], None
+        headers = [_norm_macro_header(x) for x in vals[0]]
+        rows: List[Dict[str, Any]] = []
+        for r in vals[1:]:
+            raw = {headers[i]: r[i] if i < len(r) else "" for i in range(len(headers))}
+            row = _normalize_macro_row(raw)
+            rows.append(row)
+        return rows, None
+    except Exception as e:
+        return None, f"gsheet_read_failed:{e}"
 
 
 def daily_stop_active(state: Dict[str, Any]) -> tuple[bool, str]:
@@ -2132,6 +2186,87 @@ def close_all_positions_in_state(
     }
 
 
+
+def load_ml_model_meta() -> Dict[str, Any]:
+    meta_path = Path(os.getenv("ML_MODEL_META_PATH", "state/ml_models/logistic_v1_meta.json"))
+    data = load_json_file(meta_path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def build_ml_feature_row(p: Dict[str, Any], context: Optional[Dict[str, Any]] = None, response: Optional[Dict[str, Any]] = None, feature_columns: Optional[List[str]] = None) -> Dict[str, Any]:
+    c = context or {}
+    r = response or {}
+    def _num(v: Any, d: float = 0.0) -> float:
+        try:
+            if v is None:
+                return d
+            return float(v)
+        except Exception:
+            return d
+    direction = str(direction_of(p)).upper()
+    base = {
+        "score": _num(p.get("score")),
+        "priority": _num(p.get("priority")),
+        "entry": _num(p.get("entry_mid") or p.get("entry_lo")),
+        "tp1": _num(p.get("tp1")),
+        "sl": _num(p.get("sl")),
+        "cost_gate_pass": 1.0 if bool(r.get("cost_gate_pass")) else 0.0,
+        "btc_regime_bull": 1.0 if str(c.get("btc_regime")) == "BULL" else 0.0,
+        "btc_regime_bear": 1.0 if str(c.get("btc_regime")) == "BEAR" else 0.0,
+        "funding_positive": 1.0 if str(c.get("funding_status","")).startswith("POSITIVE") else 0.0,
+        "event_risk_high": 1.0 if str(c.get("event_risk_level")) == "HIGH" else 0.0,
+        "direction_long": 1.0 if direction == "LONG" else 0.0,
+        "direction_short": 1.0 if direction == "SHORT" else 0.0,
+    }
+    cols = feature_columns or list(base.keys())
+    return {cname: base.get(cname, 0.0) for cname in cols}
+
+
+def run_shadow_prediction(p: Dict[str, Any], context: Dict[str, Any], response: Dict[str, Any], now: str) -> Dict[str, Any]:
+    model_version = os.getenv("ML_MODEL_VERSION", "logistic_v1")
+    model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
+    pred = {"signal_key": signal_key_of(p), "created_at_utc": now, "p_win": None, "ml_score": None, "ml_confidence": "NONE", "model_version": model_version, "decision_effect": "SHADOW_ONLY"}
+    if not model_path.exists():
+        pred["ml_action"] = "NO_MODEL"
+        return pred
+    try:
+        model = pickle.loads(model_path.read_bytes())
+        meta = load_ml_model_meta()
+        feature_columns = meta.get("feature_columns") if isinstance(meta, dict) else None
+        feats = build_ml_feature_row(p, context=context, response=response, feature_columns=feature_columns if isinstance(feature_columns, list) else None)
+        try:
+            import pandas as pd
+        except Exception as dep_err:
+            raise RuntimeError(f"missing_runtime_dependency:pandas:{dep_err}")
+        X = pd.DataFrame([feats])
+        p_win = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)
+            p_win = float(proba[0][1] if len(proba[0]) > 1 else proba[0][0])
+        elif hasattr(model, "predict"):
+            raw = model.predict(X)
+            p_win = float(raw[0])
+        if p_win is None:
+            raise RuntimeError("prediction_output_empty")
+        p_win = max(0.0, min(1.0, p_win))
+        score = p_win * 100.0
+        pred["p_win"] = p_win
+        pred["ml_score"] = score
+        pred["ml_confidence"] = "HIGH" if (p_win >= 0.70 or p_win < 0.45) else ("MEDIUM" if (0.60 <= p_win < 0.70 or 0.45 <= p_win < 0.52) else "LOW")
+        if p_win >= 0.70:
+            pred["ml_action"] = "BOOST"
+        elif p_win >= 0.60:
+            pred["ml_action"] = "HOLD"
+        elif p_win >= 0.52:
+            pred["ml_action"] = "DOWNGRADE"
+        else:
+            pred["ml_action"] = "AVOID"
+        return pred
+    except Exception as e:
+        pred["ml_action"] = "MODEL_ERROR"
+        pred["reason"] = f"predict_failed:{e}"
+        return pred
+
 def build_context_snapshot(p: Dict[str, Any]) -> Dict[str, Any]:
     if not env_bool("ML_CONTEXT_ENABLED", True):
         return {"context_quality": "DISABLED", "context_errors": [], "macro_event_context_quality": "DISABLED"}
@@ -2267,13 +2402,7 @@ def safe_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Di
             "net_tp1_after_cost": response.get("net_tp1_after_cost"), "label_win": None, "label_target": None, "label_R": None, "outcome_status": "PENDING", **context,
         })
         if env_bool("ML_PREDICTION_ENABLED", True) and str(os.getenv("ML_PREDICTION_MODE", "SHADOW_ONLY")).upper() == "SHADOW_ONLY":
-            model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
-            pred = {"signal_key": signal_key_of(p), "created_at_utc": now, "p_win": None, "ml_score": None, "ml_confidence": "NONE", "model_version": os.getenv("ML_MODEL_VERSION", "logistic_v1"), "decision_effect": "SHADOW_ONLY"}
-            if model_path.exists():
-                pred["ml_action"] = "MODEL_ERROR"
-                pred["reason"] = "model_present_but_predictor_unavailable"
-            else:
-                pred["ml_action"] = "NO_MODEL"
+            pred = run_shadow_prediction(p, context if isinstance(context, dict) else {}, response, now)
             append_jsonl(ML_PREDICTIONS_LOG, pred)
     except Exception as e:
         append_jsonl(ML_CONTEXT_ERRORS_LOG, {"created_at_utc": utc_now_iso(), "signal_key": signal_key_of(p), "error": str(e)})
@@ -2357,6 +2486,17 @@ def ml_prediction_latest(
 ) -> Dict[str, Any]:
     verify_secret(x_signal_secret, x_webhook_secret)
     return {"ok": True, "row": _latest_by_signal(ML_PREDICTIONS_LOG, signal_key)}
+
+@app.get("/ml/model/status")
+def ml_model_status(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
+    meta = load_ml_model_meta()
+    return {"ok": True, "model_version": os.getenv("ML_MODEL_VERSION", "logistic_v1"), "model_exists": model_path.exists(), "model_path": str(model_path), "meta": meta if meta else None}
+
 
 
 @app.post("/webhook/signal")

@@ -20,3 +20,9 @@ __pycache__/
 app/*.bak
 app/*.save
 app/main.py.bak*
+
+# explicit safety
+state/private/
+state/ml_models/*.pkl
+**/google_service_account.json
+*.service-account.json
