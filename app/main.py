@@ -21,8 +21,10 @@ except Exception:
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+import app.vps_smc as vps_smc
 
-APP_VERSION = "v0.22a-4h-candle-store"
+
+APP_VERSION = "v0.24-p0-vps-smc-framework"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -129,6 +131,11 @@ class ForwardOutcomeEvaluatePayload(BaseModel):
     limit: Optional[int] = None
     max_rows: Optional[int] = None
     force: Optional[bool] = False
+
+
+class VpsSmcRunOncePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    symbols: Optional[List[str]] = None
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -5051,6 +5058,38 @@ def startup_market_data_collector() -> None:
     except Exception as e:
         print(f"[market_data] startup failed (non-fatal): {e}")
 
+
+
+
+@app.get("/vps-smc/status")
+def vps_smc_status_endpoint(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return vps_smc.vps_smc_status()
+
+
+@app.post("/vps-smc/run-once")
+def vps_smc_run_once_endpoint(
+    payload: Optional[VpsSmcRunOncePayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    symbols = payload.symbols if payload else None
+    return vps_smc.vps_smc_run_once(symbols)
+
+
+@app.get("/vps-smc/signals/latest")
+def vps_smc_signals_latest_endpoint(
+    symbol: str,
+    limit: int = 10,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return vps_smc.vps_smc_latest_signals(symbol=symbol, limit=limit)
 
 @app.get("/market/candles/status")
 def market_candles_status(
