@@ -281,6 +281,200 @@ def detect_fvg(candles: List[Dict[str, Any]], lookback: int = 35) -> Dict[str, A
     return out
 
 
+def calc_atr(candles: List[Dict[str, Any]], length: int = 10) -> Optional[float]:
+    if len(candles) < (length + 1):
+        return None
+    trs: List[float] = []
+    start = len(candles) - length
+    for i in range(start, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]
+        high = float(c["h"])
+        low = float(c["l"])
+        prev_close = float(prev["c"])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if not trs:
+        return None
+    return sum(trs) / len(trs)
+
+
+def detect_displacement(candles: List[Dict[str, Any]], direction: str, atr_len: int, atr_mult: float, min_body_pct: float, lookback: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "has_displacement": False, "direction": None, "displacement_t": None, "displacement_idx": None,
+        "body_pct": None, "range": None, "atr": None, "reason": None,
+    }
+    if direction not in ("LONG", "SHORT"):
+        out["reason"] = "invalid_direction"
+        return out
+    scan = candles[-max(1, lookback):] if candles else []
+    for offset in range(len(scan) - 1, -1, -1):
+        c = scan[offset]
+        full_idx = len(candles) - len(scan) + offset
+        atr_window_end = full_idx + 1
+        atr_window = candles[:atr_window_end]
+        atr = calc_atr(atr_window, atr_len)
+        if atr is None:
+            continue
+        o = float(c["o"])
+        h = float(c["h"])
+        l = float(c["l"])
+        close = float(c["c"])
+        crange = h - l
+        if crange <= 0:
+            continue
+        body = close - o
+        body_abs = abs(body)
+        body_pct = (body_abs / crange) * 100.0
+        directional_ok = (direction == "LONG" and body > 0) or (direction == "SHORT" and body < 0)
+        range_ok = crange >= (atr * atr_mult)
+        body_ok = body_pct >= min_body_pct
+        if directional_ok and range_ok and body_ok:
+            out.update({
+                "has_displacement": True,
+                "direction": direction,
+                "displacement_t": c.get("t"),
+                "displacement_idx": full_idx,
+                "body_pct": body_pct,
+                "range": crange,
+                "atr": atr,
+                "reason": "ok",
+            })
+            return out
+    out["reason"] = "not_found"
+    return out
+
+
+def detect_reclaim(stageb_candles: List[Dict[str, Any]], direction: str, reclaim_level: Optional[float], lookback: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"has_reclaim": False, "reclaim_level": reclaim_level, "reclaim_t": None, "reclaim_idx": None, "reason": None}
+    if reclaim_level is None:
+        out["reason"] = "missing_reclaim_level"
+        return out
+    if direction not in ("LONG", "SHORT"):
+        out["reason"] = "invalid_direction"
+        return out
+    scan = stageb_candles[-max(1, lookback):] if stageb_candles else []
+    for offset in range(len(scan) - 1, -1, -1):
+        c = scan[offset]
+        full_idx = len(stageb_candles) - len(scan) + offset
+        low = float(c["l"])
+        high = float(c["h"])
+        close = float(c["c"])
+        if direction == "LONG" and low < float(reclaim_level) and close > float(reclaim_level):
+            out.update({"has_reclaim": True, "reclaim_t": c.get("t"), "reclaim_idx": full_idx, "reason": "ok"})
+            return out
+        if direction == "SHORT" and high > float(reclaim_level) and close < float(reclaim_level):
+            out.update({"has_reclaim": True, "reclaim_t": c.get("t"), "reclaim_idx": full_idx, "reason": "ok"})
+            return out
+    out["reason"] = "not_found"
+    return out
+
+
+def select_fvg_poi(stageb_fvg: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": None}
+    if direction == "LONG":
+        fvg = (stageb_fvg or {}).get("bullish_fvg")
+        if fvg:
+            out.update({"has_fvg": True, "fvg_type": "BULLISH", "fvg_lo": fvg.get("lo"), "fvg_hi": fvg.get("hi"), "fvg_t": fvg.get("t"), "reason": "ok"})
+            return out
+        out["reason"] = "missing_bullish_fvg"
+        return out
+    if direction == "SHORT":
+        fvg = (stageb_fvg or {}).get("bearish_fvg")
+        if fvg:
+            out.update({"has_fvg": True, "fvg_type": "BEARISH", "fvg_lo": fvg.get("lo"), "fvg_hi": fvg.get("hi"), "fvg_t": fvg.get("t"), "reason": "ok"})
+            return out
+        out["reason"] = "missing_bearish_fvg"
+        return out
+    out["reason"] = "invalid_direction"
+    return out
+
+
+def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
+    sweep = (context or {}).get("entry_sweep") or {}
+    bullish = bool(sweep.get("bullish_sweep"))
+    bearish = bool(sweep.get("bearish_sweep"))
+    direction = "NONE"
+    reason = "no_sweep_direction"
+    if bullish and bearish:
+        direction = "MIXED"
+        reason = "mixed_sweep_direction"
+    elif bullish:
+        direction = "LONG"
+        reason = "bullish_sweep"
+    elif bearish:
+        direction = "SHORT"
+        reason = "bearish_sweep"
+    return {"stageb_direction": direction, "direction_reason": reason}
+
+
+def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    direction_info = derive_stageb_direction(result)
+    direction = direction_info["stageb_direction"]
+    context_status = str(result.get("context_status") or "ERROR")
+    liq_gate_status = str(result.get("liq_gate_status") or "BLOCK")
+
+    out: Dict[str, Any] = {
+        "stageb_status": "INVALID",
+        "stageb_direction": direction,
+        "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
+        "stageb_displacement": {"has_displacement": False, "direction": None, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
+        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built"},
+        "stageb_confirm_reason": None,
+        "stageb_invalid_reason": None,
+    }
+
+    if context_status in ("DATA_GAP", "HTF_DATA_GAP", "ERROR"):
+        out["stageb_invalid_reason"] = "context_not_ready"
+        return out
+    if direction == "MIXED":
+        out["stageb_invalid_reason"] = "mixed_sweep_direction"
+        return out
+    if direction == "NONE":
+        out["stageb_status"] = "IDLE"
+        out["stageb_confirm_reason"] = "no_sweep_direction"
+        out["stageb_invalid_reason"] = None
+        return out
+
+    reclaim_level = (result.get("liq_ctx") or {}).get("sweep_level")
+    if reclaim_level is None:
+        reclaim_level = (result.get("liq_ctx") or {}).get("nearest_liq_price")
+
+    out["stageb_reclaim"] = detect_reclaim(stageb_candles, direction, reclaim_level, _env_int("VPS_SMC_RECLAIM_LOOKBACK_BARS", 20))
+    out["stageb_displacement"] = detect_displacement(
+        stageb_candles,
+        direction,
+        _env_int("VPS_SMC_DISPLACEMENT_ATR_LEN", 10),
+        _env_float("VPS_SMC_DISPLACEMENT_ATR_MULT", 1.15),
+        _env_float("VPS_SMC_DISPLACEMENT_MIN_BODY_PCT", 55.0),
+        _env_int("VPS_SMC_STAGEB_LOOKBACK_BARS", 60),
+    )
+    out["stageb_fvg_poi"] = select_fvg_poi((result.get("stageb_fvg") or {}), direction)
+
+    require_reclaim = _env_bool("VPS_SMC_REQUIRE_RECLAIM", True)
+    require_displacement = _env_bool("VPS_SMC_REQUIRE_DISPLACEMENT", True)
+    require_fvg = _env_bool("VPS_SMC_REQUIRE_FVG_FOR_CONFIRM", True)
+
+    reclaim_ok = bool(out["stageb_reclaim"].get("has_reclaim")) or (not require_reclaim)
+    displacement_ok = bool(out["stageb_displacement"].get("has_displacement")) or (not require_displacement)
+    fvg_ok = bool(out["stageb_fvg_poi"].get("has_fvg")) or (not require_fvg)
+
+    out["stageb_status"] = "WATCH"
+    reasons: List[str] = []
+    if liq_gate_status == "BLOCK":
+        reasons.append("liq_gate_blocked")
+    if reclaim_ok and displacement_ok and fvg_ok and context_status == "READY" and liq_gate_status != "BLOCK":
+        out["stageb_status"] = "CONFIRMED"
+        reasons.append("all_requirements_passed")
+    else:
+        if not reclaim_ok:
+            reasons.append("reclaim_missing")
+        if not displacement_ok:
+            reasons.append("displacement_missing")
+        if not fvg_ok:
+            reasons.append("fvg_missing")
+    out["stageb_confirm_reason"] = ",".join(reasons) if reasons else "watch"
+    return out
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
@@ -510,6 +704,42 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                         "symbol": symbol,
                         "error": f"context:{cexc}",
                     })
+            stageb_confirmation = {
+                "stageb_status": "INVALID",
+                "stageb_direction": "NONE",
+                "stageb_reclaim": {},
+                "stageb_displacement": {},
+                "stageb_fvg_poi": {},
+                "stageb_confirm_reason": None,
+                "stageb_invalid_reason": "not_built",
+            }
+            shadow_state = "INVALID"
+            if _env_bool("VPS_SMC_STAGEB_ENABLED", True):
+                try:
+                    stageb_confirmation = build_stageb_confirmation({
+                        "context_status": context_status,
+                        "liq_gate_status": liq_gate_status,
+                        "liq_ctx": liq_ctx,
+                        "entry_sweep": entry_sweep,
+                        "stageb_fvg": stageb_fvg,
+                    }, stageb)
+                    shadow_state = stageb_confirmation.get("stageb_status") or "INVALID"
+                except Exception as sexc:
+                    stageb_confirmation = {
+                        "stageb_status": "INVALID",
+                        "stageb_direction": "NONE",
+                        "stageb_reclaim": {},
+                        "stageb_displacement": {},
+                        "stageb_fvg_poi": {},
+                        "stageb_confirm_reason": None,
+                        "stageb_invalid_reason": f"stageb_error:{sexc}",
+                    }
+                    shadow_state = "INVALID"
+                    _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {
+                        "created_at_utc": _utc_now_iso(),
+                        "symbol": symbol,
+                        "error": f"stageb:{sexc}",
+                    })
             results.append({
                 "symbol": symbol,
                 "status": status,
@@ -532,6 +762,8 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "structure_15m": structure_15m,
                 "structure_reason": structure_reason,
                 "context_status": context_status,
+                "stageb_confirmation": stageb_confirmation,
+                "shadow_state": shadow_state,
                 "reason": reason,
             })
         except Exception as exc:
@@ -554,6 +786,16 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             result.setdefault("context_status", "DATA_GAP")
         else:
             result.setdefault("context_status", "ERROR")
+        result.setdefault("stageb_confirmation", {
+            "stageb_status": "INVALID",
+            "stageb_direction": "NONE",
+            "stageb_reclaim": {},
+            "stageb_displacement": {},
+            "stageb_fvg_poi": {},
+            "stageb_confirm_reason": None,
+            "stageb_invalid_reason": "not_built",
+        })
+        result.setdefault("shadow_state", (result.get("stageb_confirmation") or {}).get("stageb_status") or "INVALID")
 
     log_row = {
         "event_type": "VPS_SMC_RUN_ONCE",
@@ -579,6 +821,15 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "liq_block": len([r for r in results if r.get("liq_gate_status") == "BLOCK"]),
             "context_ready": len([r for r in results if r.get("context_status") == "READY"]),
             "context_blocked": len([r for r in results if r.get("context_status") == "BLOCKED"]),
+            "stageb_idle": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_status") == "IDLE")]),
+            "stageb_watch": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_status") == "WATCH")]),
+            "stageb_confirmed": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_status") == "CONFIRMED")]),
+            "stageb_invalid": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_status") == "INVALID")]),
+            "reclaim_pass": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_reclaim") or {}).get("has_reclaim")]),
+            "displacement_pass": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_displacement") or {}).get("has_displacement")]),
+            "fvg_poi_pass": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {}).get("has_fvg")]),
+            "long_candidates": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_direction") == "LONG")]),
+            "short_candidates": len([r for r in results if ((r.get("stageb_confirmation") or {}).get("stageb_direction") == "SHORT")]),
             "structure_up": len([r for r in results if r.get("structure_15m") == "UP"]),
             "structure_down": len([r for r in results if r.get("structure_15m") == "DOWN"]),
             "structure_range": len([r for r in results if r.get("structure_15m") == "RANGE"]),
