@@ -641,16 +641,20 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     if direction == "LONG":
         raw_tp1 = liq_ctx.get("last_buy_side_liq") or entry_sw.get("last_swing_high")
         tp1 = (entry_mid + (1.0 * risk)) if (raw_tp1 is None or float(raw_tp1) <= entry_mid) else float(raw_tp1)
+
         raw_tp2 = htf_sw.get("last_swing_high")
         tp2 = (entry_mid + (1.5 * risk)) if (raw_tp2 is None or float(raw_tp2) <= entry_mid) else float(raw_tp2)
+
         tp3 = (entry_mid + (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
         rr_tp2 = (tp2 - entry_mid) / risk
         sane = sl < entry_mid and tp2 > entry_mid
     else:
         raw_tp1 = liq_ctx.get("last_sell_side_liq") or entry_sw.get("last_swing_low")
         tp1 = (entry_mid - (1.0 * risk)) if (raw_tp1 is None or float(raw_tp1) >= entry_mid) else float(raw_tp1)
+
         raw_tp2 = htf_sw.get("last_swing_low")
         tp2 = (entry_mid - (1.5 * risk)) if (raw_tp2 is None or float(raw_tp2) >= entry_mid) else float(raw_tp2)
+
         tp3 = (entry_mid - (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
         rr_tp2 = (entry_mid - tp2) / risk
         sane = sl > entry_mid and tp2 < entry_mid
