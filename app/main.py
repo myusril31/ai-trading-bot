@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 import app.vps_smc as vps_smc
 
 
-APP_VERSION = "v0.24-p4-shadow-plan-score"
+APP_VERSION = "v0.24-p4a-shadow-plan-target-fallback"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
