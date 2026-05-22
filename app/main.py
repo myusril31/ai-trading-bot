@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 import app.vps_smc as vps_smc
 
 
-APP_VERSION = "v0.24-p4a-shadow-plan-target-fallback"
+APP_VERSION = "v0.24-p5-vps-smc-compare"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -136,6 +136,13 @@ class ForwardOutcomeEvaluatePayload(BaseModel):
 class VpsSmcRunOncePayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     symbols: Optional[List[str]] = None
+
+
+class VpsSmcComparePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lookback_minutes: Optional[int] = 180
+    symbols: Optional[List[str]] = None
+    run_vps_first: Optional[bool] = False
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -5090,6 +5097,21 @@ def vps_smc_signals_latest_endpoint(
 ) -> Dict[str, Any]:
     verify_secret(x_signal_secret, x_webhook_secret)
     return vps_smc.vps_smc_latest_signals(symbol=symbol, limit=limit)
+
+
+@app.post("/vps-smc/compare")
+def vps_smc_compare_endpoint(
+    payload: Optional[VpsSmcComparePayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    req = payload or VpsSmcComparePayload()
+    return vps_smc.vps_smc_compare(
+        lookback_minutes=req.lookback_minutes,
+        symbols=req.symbols,
+        run_vps_first=bool(req.run_vps_first),
+    )
 
 @app.get("/market/candles/status")
 def market_candles_status(
