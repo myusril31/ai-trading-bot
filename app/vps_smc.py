@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -99,6 +99,8 @@ def _default_state() -> Dict[str, Any]:
         "last_signal_count": 0,
         "last_error": None,
         "last_symbols": [],
+        "last_compare_utc": None,
+        "last_compare_counts": {},
         "logged_signal_keys": {},
         "updated_at_utc": _utc_now_iso(),
     }
@@ -141,6 +143,32 @@ def _intervals() -> Dict[str, str]:
 def _symbols_fallback() -> List[str]:
     allow = sorted(_csv_set("PAIR_ALLOWLIST"))
     return allow or ["BTCUSDT", "ETHUSDT", "UNIUSDT"]
+
+
+def _parse_iso_utc(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if not txt:
+        return None
+    try:
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _normalize_direction(raw: Any) -> Optional[str]:
+    d = str(raw or "").strip().upper()
+    if d in ("LONG", "BUY"):
+        return "LONG"
+    if d in ("SHORT", "SELL"):
+        return "SHORT"
+    return None
 
 
 def _candles_file(symbol: str, interval: str) -> Path:
@@ -711,8 +739,168 @@ def vps_smc_status() -> Dict[str, Any]:
         "last_run_utc": state.get("last_run_utc"),
         "last_signal_count": int(state.get("last_signal_count") or 0),
         "last_error": state.get("last_error"),
+        "last_compare_utc": state.get("last_compare_utc"),
+        "last_compare_counts": state.get("last_compare_counts") or {},
         "scheduler_enabled": _env_bool("VPS_SMC_SCHEDULER_ENABLED", False),
     }
+
+
+def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[List[str]] = None, run_vps_first: bool = False) -> Dict[str, Any]:
+    lookback = int(lookback_minutes or 180)
+    lookback = max(1, min(lookback, 7 * 24 * 60))
+    requested = [_normalize_symbol(s) for s in (symbols or []) if _normalize_symbol(s)]
+    target_symbols = requested or _symbols_fallback()
+    target_set = set(target_symbols)
+
+    if run_vps_first:
+        vps_smc_run_once(target_symbols)
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(minutes=lookback)
+    created_at_utc = now_utc.isoformat()
+    notes: List[str] = []
+
+    app_rows_raw: List[Dict[str, Any]] = []
+    ml_dataset_path = _log_dir() / "ml_dataset_rows.jsonl"
+    signals_path = _log_dir() / "signals.jsonl"
+    if ml_dataset_path.exists():
+        app_rows_raw = _read_jsonl(ml_dataset_path)
+    elif signals_path.exists():
+        app_rows_raw = _read_jsonl(signals_path)
+    else:
+        notes.append("missing_apps_logs")
+
+    vps_path = _log_dir() / "vps_smc_shadow_signals.jsonl"
+    vps_rows_raw = _read_jsonl(vps_path) if vps_path.exists() else []
+    if not vps_path.exists():
+        notes.append("missing_vps_shadow_logs")
+
+    app_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in app_rows_raw:
+        sample_type = str(row.get("sample_type") or "").strip().upper()
+        if sample_type == "VALIDATION_SAMPLE":
+            continue
+        if sample_type and sample_type != "FORWARD_SHADOW_PAPER":
+            continue
+        decision = str(row.get("execution_decision") or row.get("decision") or "").strip().upper()
+        if decision not in ("ACCEPT", "REJECT"):
+            continue
+        symbol = _normalize_symbol(row.get("symbol") or row.get("pair"))
+        if not symbol or symbol not in target_set:
+            continue
+        dt = _parse_iso_utc(row.get("created_at_utc") or row.get("event_at_utc") or row.get("timestamp_utc"))
+        if dt is None or dt < cutoff:
+            continue
+        app_by_symbol.setdefault(symbol, []).append({
+            "signal_key": row.get("signal_key") or row.get("signal_id"),
+            "direction_raw": row.get("direction") or row.get("dir"),
+            "direction": _normalize_direction(row.get("direction") or row.get("dir")),
+            "decision": decision,
+            "created_at_utc": dt.isoformat(),
+            "ts": dt.timestamp(),
+        })
+
+    vps_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in vps_rows_raw:
+        if str(row.get("source_mode") or "").strip().upper() != "SHADOW_ONLY":
+            continue
+        if bool(row.get("candidate_only")) is not True:
+            continue
+        if str(row.get("state") or "").strip().upper() != "CONFIRMED":
+            continue
+        symbol = _normalize_symbol(row.get("symbol") or row.get("pair"))
+        if not symbol or symbol not in target_set:
+            continue
+        dt = _parse_iso_utc(row.get("created_at_utc") or row.get("event_at_utc") or row.get("timestamp_utc"))
+        if dt is None or dt < cutoff:
+            continue
+        vps_by_symbol.setdefault(symbol, []).append({
+            "signal_key": row.get("signal_key"),
+            "direction": _normalize_direction(row.get("direction")),
+            "score": row.get("score"),
+            "priority": row.get("priority"),
+            "created_at_utc": dt.isoformat(),
+            "ts": dt.timestamp(),
+        })
+
+    rows: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for symbol in sorted(target_set):
+        app_items = sorted(app_by_symbol.get(symbol, []), key=lambda x: float(x.get("ts") or 0), reverse=True)
+        vps_items = sorted(vps_by_symbol.get(symbol, []), key=lambda x: float(x.get("ts") or 0), reverse=True)
+        app = app_items[0] if app_items else None
+        vps = vps_items[0] if vps_items else None
+
+        classification = "OVERLAP_AGREE"
+        reason = "direction_match"
+        if app and vps:
+            if (app.get("direction") or "") != (vps.get("direction") or ""):
+                classification = "CONFLICT"
+                reason = "direction_conflict"
+        elif app and not vps:
+            classification = "APP_ONLY"
+            reason = "no_vps_signal"
+        elif vps and not app:
+            classification = "VPS_ONLY"
+            reason = "no_app_signal"
+        else:
+            continue
+
+        compare_key = "|".join([
+            symbol,
+            classification,
+            str((app or {}).get("signal_key") or ""),
+            str((vps or {}).get("signal_key") or ""),
+            str(lookback),
+        ])
+        if compare_key in seen_keys:
+            continue
+        seen_keys.add(compare_key)
+        row_out = {
+            "created_at_utc": created_at_utc,
+            "lookback_minutes": lookback,
+            "symbol": symbol,
+            "classification": classification,
+            "app_signal_key": (app or {}).get("signal_key"),
+            "app_direction": (app or {}).get("direction_raw"),
+            "app_decision": (app or {}).get("decision"),
+            "app_created_at_utc": (app or {}).get("created_at_utc"),
+            "vps_signal_key": (vps or {}).get("signal_key"),
+            "vps_direction": (vps or {}).get("direction"),
+            "vps_score": (vps or {}).get("score"),
+            "vps_priority": (vps or {}).get("priority"),
+            "vps_created_at_utc": (vps or {}).get("created_at_utc"),
+            "reason": reason,
+            "compare_key": compare_key,
+        }
+        rows.append(row_out)
+
+    counts = {
+        "total": len(rows),
+        "overlap_agree": len([r for r in rows if r.get("classification") == "OVERLAP_AGREE"]),
+        "app_only": len([r for r in rows if r.get("classification") == "APP_ONLY"]),
+        "vps_only": len([r for r in rows if r.get("classification") == "VPS_ONLY"]),
+        "conflict": len([r for r in rows if r.get("classification") == "CONFLICT"]),
+    }
+    for row in rows:
+        _append_jsonl(_log_dir() / "vps_smc_compare.jsonl", row)
+
+    state = _load_state()
+    state["last_compare_utc"] = created_at_utc
+    state["last_compare_counts"] = counts
+    _save_state(state)
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "mode": "SHADOW_ONLY_COMPARE",
+        "lookback_minutes": lookback,
+        "symbols": sorted(target_set),
+        "counts": counts,
+        "rows": rows,
+    }
+    if notes:
+        out["reason"] = ",".join(notes)
+    return out
 
 
 def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
