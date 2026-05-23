@@ -6,6 +6,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+EXECUTION_BRIDGE_HANDLER = None
+
+
+def register_execution_bridge_handler(handler) -> None:
+    global EXECUTION_BRIDGE_HANDLER
+    EXECUTION_BRIDGE_HANDLER = handler
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1151,6 +1158,66 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         logged_signal_keys[signal_key] = signal_row["created_at_utc"]
         result["signal_logged"] = True
         result["signal_skip_reason"] = None
+        source_mode = str(os.getenv("SIGNAL_SOURCE_MODE", "APPS_SCRIPT_ONLY")).strip().upper() or "APPS_SCRIPT_ONLY"
+        vps_exec_enabled = _env_bool("VPS_SMC_EXECUTION_ENABLED", False)
+        competitor_mode = str(os.getenv("VPS_SMC_COMPETITOR_MODE", "SHADOW_ONLY")).strip().upper() or "SHADOW_ONLY"
+        if (
+            EXECUTION_BRIDGE_HANDLER is not None
+            and source_mode == "VPS_SMC_PRIMARY"
+            and vps_exec_enabled
+            and competitor_mode == "PRODUCTION_SIGNAL"
+        ):
+            bridge_payload = {
+                "source": "VPS_SMC",
+                "signal_source": "VPS_SMC",
+                "event_type": "SIGNAL_CONFIRMED",
+                "source_mode": "VPS_SMC_PRIMARY",
+                "execution_owner": "VPS_SMC",
+                "status": "CONFIRMED",
+                "state": "CONFIRMED",
+                "signal_key": signal_key,
+                "signal_id": signal_key,
+                "symbol": result.get("symbol"),
+                "pair": result.get("symbol"),
+                "direction": direction,
+                "entry": plan.get("entry_mid"),
+                "entry_mid": plan.get("entry_mid"),
+                "entry_lo": plan.get("entry_lo"),
+                "entry_hi": plan.get("entry_hi"),
+                "sl": plan.get("sl"),
+                "tp1": plan.get("tp1"),
+                "tp2": plan.get("tp2"),
+                "tp3": plan.get("tp3"),
+                "score": score_detail.get("score"),
+                "priority": score_detail.get("priority"),
+                "confirmed_bucket_ms": bucket_ms,
+                "signal_time_wib": None,
+                "htf_dir": htf_gate.get("htf_dir"),
+                "htf_bias": htf_gate.get("htf_bias"),
+                "htf_location": htf_gate.get("htf_location"),
+                "htf_structure": htf_gate.get("htf_structure"),
+                "liq_ctx": result.get("liq_ctx"),
+                "dist_to_zone_pct": liq_ctx.get("dist_to_zone_pct"),
+                "structure_15m": result.get("structure_15m"),
+                "sweep_tag": liq_ctx.get("sweep_tag"),
+                "sweep_extreme": liq_ctx.get("sweep_extreme"),
+                "reclaim_level": reclaim.get("reclaim_level"),
+                "fvg_type": poi.get("fvg_type"),
+                "fvg_lo": poi.get("fvg_lo"),
+                "fvg_hi": poi.get("fvg_hi"),
+                "notes": ",".join(score_detail.get("reasons") or []),
+            }
+            try:
+                result["execution_bridge"] = EXECUTION_BRIDGE_HANDLER(bridge_payload)
+            except Exception as exc:
+                result["execution_bridge"] = {"ok": False, "error": str(exc)}
+                _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {
+                    "created_at_utc": _utc_now_iso(),
+                    "event_type": "VPS_SMC_EXECUTION_BRIDGE_ERROR",
+                    "symbol": result.get("symbol"),
+                    "signal_key": signal_key,
+                    "error": str(exc),
+                })
         signal_count += 1
 
     log_row = {

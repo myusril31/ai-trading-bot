@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 import app.vps_smc as vps_smc
 
 
-APP_VERSION = "v0.24-p6a-ml-dataset-classifier-fix"
+APP_VERSION = "v0.25-p0-vps-smc-primary-execution-bridge"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -652,6 +652,14 @@ def get_mode() -> str:
     if mode == "RECEIVER_ONLY":
         return "RECEIVED_ONLY"
     return mode
+
+
+def signal_source_mode() -> str:
+    return str(os.getenv("SIGNAL_SOURCE_MODE", "APPS_SCRIPT_ONLY")).strip().upper() or "APPS_SCRIPT_ONLY"
+
+
+def apps_script_signal_mode() -> str:
+    return str(os.getenv("APPS_SCRIPT_SIGNAL_MODE", "PRIMARY_EXECUTION")).strip().upper() or "PRIMARY_EXECUTION"
 
 
 def verify_secret(x_signal_secret: Optional[str], x_webhook_secret: Optional[str]) -> None:
@@ -3321,50 +3329,73 @@ def webhook_signal(
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
 ) -> Dict[str, Any]:
     verify_secret(x_signal_secret, x_webhook_secret)
-
     p = payload_to_dict(payload)
-    mode = get_mode()
+    p["signal_source"] = "APPS_SCRIPT"
+    p["event_type"] = "SIGNAL_CONFIRMED"
+    if signal_source_mode() == "VPS_SMC_PRIMARY" and apps_script_signal_mode() == "BACKUP_COMPARE_ONLY":
+        p["source"] = p.get("source") or "apps_script_inst"
+        p["engine"] = p.get("engine") or "INST"
+        p["source_mode"] = "BACKUP_COMPARE_ONLY"
+        p["execution_owner"] = "NONE"
+        decision = {"decision": "BACKUP_ONLY", "reason": "source_not_primary", "gate": "source_gate"}
+        with LOCK:
+            append_jsonl(SIGNALS_LOG, build_signal_log(p))
+            state = load_state()
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "execution_owner": "NONE", "source_mode": "BACKUP_COMPARE_ONLY"}
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+        return response
+    p["source"] = p.get("source") or "APPS_SCRIPT"
+    return _process_signal_pipeline(p)
 
+
+def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
+    mode = get_mode()
     with LOCK:
         append_jsonl(SIGNALS_LOG, build_signal_log(p))
-
         state = load_state()
-
-        if mode == "RECEIVED_ONLY":
-            decision = {
-                "decision": "RECEIVED_ONLY",
-                "reason": "receiver_only_logger_mode_no_paper_gate_no_execution",
-                "gate": "mode_gate",
+        source = str(p.get("source") or "").strip().upper()
+        execution_owner = str(p.get("execution_owner") or "").strip().upper()
+        if execution_mode() == "DISABLED" and (source == "VPS_SMC" or execution_owner == "VPS_SMC"):
+            decision = {"decision": "REJECT", "reason": "execution_mode_disabled", "gate": "execution_mode_gate"}
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {
+                "ok": True,
+                "decision": decision["decision"],
+                "reason": decision["reason"],
+                "gate": decision["gate"],
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+                "execution_mode": execution_mode(),
             }
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+        if (source == "VPS_SMC" or execution_owner == "VPS_SMC") and execution_mode() not in ("DISABLED", "PAPER"):
+            decision = {"decision": "REJECT", "reason": "vps_smc_bridge_mode_not_allowed_in_p0", "gate": "vps_smc_bridge_mode_gate"}
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {
+                "ok": True,
+                "decision": decision["decision"],
+                "reason": decision["reason"],
+                "gate": decision["gate"],
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+                "execution_mode": execution_mode(),
+            }
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+        if mode == "RECEIVED_ONLY":
+            decision = {"decision": "RECEIVED_ONLY", "reason": "receiver_only_logger_mode_no_paper_gate_no_execution", "gate": "mode_gate"}
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
             notify_signal_decision_async(p, decision)
             fire_and_forget_ml_shadow_log(p, decision, {"ok": True, "decision": "RECEIVED_ONLY"}, state)
-
-            return {
-                "ok": True,
-                "decision": "RECEIVED_ONLY",
-                "reason": "v0.3 logger mode, no execution",
-                "signal_id": p.get("signal_id") or p.get("signal_key"),
-            }
-
-        # PAPER mode: accept/reject only. No Binance execution.
+            return {"ok": True, "decision": "RECEIVED_ONLY", "reason": "v0.3 logger mode, no execution", "signal_id": p.get("signal_id") or p.get("signal_key")}
         decision = paper_decide(p, state)
         state = apply_decision_to_state(p, decision, state)
         save_state(state)
-
         append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
-
         notify_signal_decision_async(p, decision)
-
-        response = {
-            "ok": True,
-            "decision": decision["decision"],
-            "reason": decision["reason"],
-            "gate": decision["gate"],
-            "signal_id": p.get("signal_id") or p.get("signal_key"),
-            "execution_mode": execution_mode(),
-        }
-
+        response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": execution_mode()}
         if decision.get("decision") == "ACCEPT":
             execution_event = handle_execution_after_accept(p)
             response["cost_gate_pass"] = execution_event.get("plan", {}).get("cost_gate_pass")
@@ -3379,9 +3410,20 @@ def webhook_signal(
                     response["execution_error_reason"] = execution_event.get("reason")
             elif execution_mode() == "TESTNET_ORDER_TEST":
                 response["testnet_order_result"] = execution_event.get("order_test_result")
-
         fire_and_forget_ml_shadow_log(p, decision, response, state)
         return response
+
+
+def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(payload or {})
+    p["signal_source"] = "VPS_SMC"
+    p["source"] = "VPS_SMC"
+    p["source_mode"] = "VPS_SMC_PRIMARY"
+    p["execution_owner"] = "VPS_SMC"
+    return _process_signal_pipeline(p)
+
+
+vps_smc.register_execution_bridge_handler(_vps_execution_bridge)
 
 
 @app.get("/paper/state")
