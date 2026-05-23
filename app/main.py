@@ -1401,6 +1401,18 @@ def build_signal_log(p: Dict[str, Any]) -> Dict[str, Any]:
         "pair": p.get("pair") or p.get("symbol"),
         "direction": p.get("direction") or p.get("dir"),
         "status": p.get("status") or p.get("state"),
+        "source": p.get("source"),
+        "signal_source": p.get("signal_source"),
+        "source_mode": p.get("source_mode"),
+        "execution_owner": p.get("execution_owner"),
+        "plan_sanity_ok": p.get("plan_sanity_ok"),
+        "plan_sanity_reason": p.get("plan_sanity_reason"),
+        "plan_invalid": p.get("plan_invalid"),
+        "raw_tp1": p.get("raw_tp1"),
+        "raw_tp2": p.get("raw_tp2"),
+        "raw_tp3": p.get("raw_tp3"),
+        "tp_normalized": p.get("tp_normalized"),
+        "tp_normalize_reason": p.get("tp_normalize_reason"),
         "payload": p,
     }
 
@@ -2013,8 +2025,9 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
-    mode = execution_mode()
+
+
+def shared_validate_plan_cost_gate(plan: Dict[str, Any], require_quantity: bool = True) -> tuple[bool, str]:
     direction = str(plan.get("direction") or "").strip().upper()
     entry_side = str(plan.get("entry_side") or "").strip().upper()
     exit_side = str(plan.get("exit_side") or "").strip().upper()
@@ -2025,6 +2038,48 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
         return False, "plan_sanity_invalid_direction_side_map"
     if direction == "SHORT" and (entry_side != "SELL" or exit_side != "BUY"):
         return False, "plan_sanity_invalid_direction_side_map"
+
+    if env_bool("ORDER_REQUIRE_SL", True) and not plan.get("sl"):
+        return False, "missing_sl"
+    if env_bool("ORDER_REQUIRE_TP", True) and not (plan.get("tp1") or plan.get("tp2") or plan.get("tp3")):
+        return False, "missing_tp"
+
+    entry_mid = to_float_or_none(plan.get("entry_mid"))
+    sl = to_float_or_none(plan.get("sl"))
+    tp1 = to_float_or_none(plan.get("tp1"))
+    if entry_mid is None:
+        return False, "missing_entry_mid"
+    if sl is None:
+        return False, "missing_sl"
+    if tp1 is None:
+        return False, "missing_tp1"
+
+    if direction == "LONG":
+        if sl >= entry_mid:
+            return False, "invalid_sl_side"
+        if tp1 <= entry_mid:
+            return False, "invalid_tp1_side"
+    else:
+        if sl <= entry_mid:
+            return False, "invalid_sl_side"
+        if tp1 >= entry_mid:
+            return False, "invalid_tp1_side"
+
+    if require_quantity:
+        qty_ok, qty_reason, _qty_res = enrich_plan_with_quantity(plan)
+        if not qty_ok:
+            return False, qty_reason
+    ensure_tp_split(plan)
+    cost = compute_cost_gate(plan)
+    plan["cost_breakdown"] = cost
+    plan.update(cost)
+    if env_bool("COST_GATE_ENABLED", True) and not bool(cost.get("cost_gate_pass")):
+        return False, f"cost_gate_failed:{cost.get('cost_gate_reason')}"
+
+    return True, "shared_plan_cost_gate_valid"
+
+def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
+    mode = execution_mode()
 
     if mode == "DISABLED":
         return False, "execution_mode_disabled"
@@ -2043,12 +2098,6 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
         if not env_bool("ENABLE_TESTNET_ORDERS", False):
             return False, "enable_testnet_orders_false"
 
-    if env_bool("ORDER_REQUIRE_SL", True) and not plan.get("sl"):
-        return False, "missing_sl"
-
-    if env_bool("ORDER_REQUIRE_TP", True) and not (plan.get("tp1") or plan.get("tp2") or plan.get("tp3")):
-        return False, "missing_tp"
-
     allowed = testnet_allowed_symbols()
     if allowed and plan.get("symbol") not in allowed:
         return False, f"symbol_not_allowed_for_testnet:{plan.get('symbol')}"
@@ -2056,15 +2105,9 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
     if env_bool("ISOLATED_MARGIN_ONLY", True) and plan.get("margin_type") != "ISOLATED":
         return False, "isolated_margin_required"
 
-    qty_ok, qty_reason, _qty_res = enrich_plan_with_quantity(plan)
-    if not qty_ok:
-        return False, qty_reason
-    ensure_tp_split(plan)
-    cost = compute_cost_gate(plan)
-    plan["cost_breakdown"] = cost
-    plan.update(cost)
-    if env_bool("COST_GATE_ENABLED", True) and not bool(cost.get("cost_gate_pass")):
-        return False, f"cost_gate_failed:{cost.get('cost_gate_reason')}"
+    ok, reason = shared_validate_plan_cost_gate(plan, require_quantity=True)
+    if not ok:
+        return False, reason
 
     return True, "execution_plan_valid"
 
@@ -2316,6 +2359,20 @@ def build_decision_log(p: Dict[str, Any], decision: Dict[str, Any], state: Dict[
         "signal_time_wib": p.get("signal_time_wib"),
         "run_ts_wib": p.get("run_ts_wib"),
         "confirmed_ts_wib": p.get("confirmed_ts_wib"),
+        "source": p.get("source"),
+        "signal_source": p.get("signal_source"),
+        "source_mode": p.get("source_mode"),
+        "execution_owner": p.get("execution_owner"),
+        "plan_sanity_ok": p.get("plan_sanity_ok"),
+        "plan_sanity_reason": p.get("plan_sanity_reason"),
+        "plan_invalid": p.get("plan_invalid"),
+        "raw_tp1": p.get("raw_tp1"),
+        "raw_tp2": p.get("raw_tp2"),
+        "raw_tp3": p.get("raw_tp3"),
+        "tp_normalized": p.get("tp_normalized"),
+        "tp_normalize_reason": p.get("tp_normalize_reason"),
+        "cost_gate_pass": decision.get("cost_gate_pass") if ("cost_gate_pass" in decision) else p.get("cost_gate_pass"),
+        "cost_gate_reason": decision.get("cost_gate_reason") or p.get("cost_gate_reason"),
 
         "state_snapshot": {
             "open_paper_positions": open_paper_count(state),
@@ -2960,10 +3017,13 @@ def safe_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Di
             "pair": pair_of(p), "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""), "direction": direction_of(p),
             "signal_time_wib": sample.get("signal_time_wib") or p.get("signal_time_wib"), "created_at_utc": now, "score": p.get("score"), "priority": p.get("priority"), "mode": get_mode(),
             "setup_type": p.get("setup_type"), "risk_profile": p.get("risk_profile"), "config_version": p.get("config_version"), "source_mode": p.get("source_mode"),
-            "signal_source": p.get("signal_source"), "source": p.get("source"), "engine": p.get("engine"), "event_type": p.get("event_type"),
+            "signal_source": p.get("signal_source"), "source": p.get("source"), "engine": p.get("engine"), "event_type": p.get("event_type"), "execution_owner": p.get("execution_owner"),
+            "plan_sanity_ok": p.get("plan_sanity_ok"), "plan_sanity_reason": p.get("plan_sanity_reason"), "plan_invalid": p.get("plan_invalid"),
+            "raw_tp1": p.get("raw_tp1"), "raw_tp2": p.get("raw_tp2"), "raw_tp3": p.get("raw_tp3"),
+            "tp_normalized": p.get("tp_normalized"), "tp_normalize_reason": p.get("tp_normalize_reason"),
             "execution_decision": decision.get("decision"), "reject_gate": decision.get("gate"), "reject_reason": decision.get("reason"),
             "do_not_queue": decision_do_not_queue(decision), "entry": p.get("entry_mid") or p.get("entry_lo"), "sl": p.get("sl"), "tp1": p.get("tp1"), "tp2": p.get("tp2"), "tp3": p.get("tp3"),
-            "paper_quantity": paper_qty, "paper_notional": paper_notional, "cost_gate_pass": response.get("cost_gate_pass"),
+            "paper_quantity": paper_qty, "paper_notional": paper_notional, "cost_gate_pass": response.get("cost_gate_pass"), "cost_gate_reason": response.get("cost_gate_reason"),
             "net_tp1_after_cost": response.get("net_tp1_after_cost"), "label_win": None, "label_target": None, "label_R": None, "outcome_status": "PENDING", **context,
             "exclude_label_reason": sample.get("exclude_label_reason"), "confirmed_bucket_ms": sample.get("confirmed_bucket_ms"), "time_source": sample.get("time_source"),
         })
@@ -3549,6 +3609,21 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             return response
 
         if current_execution_mode == "PAPER":
+            if env_bool("COST_GATE_ENABLED", True):
+                plan = build_execution_plan(p)
+                ok, reason = shared_validate_plan_cost_gate(plan, require_quantity=True)
+                p["cost_gate_pass"] = bool(ok)
+                p["cost_gate_reason"] = (None if ok else str(reason).split(":", 1)[1] if str(reason).startswith("cost_gate_failed:") else reason)
+                if not ok:
+                    gate = "cost_gate" if str(reason).startswith("cost_gate_failed:") else "plan_cost_gate"
+                    decision = {"decision": "REJECT", "reason": str(reason), "gate": gate, "cost_gate_pass": False, "cost_gate_reason": p.get("cost_gate_reason")}
+                    state = apply_decision_to_state(p, decision, state)
+                    save_state(state)
+                    append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+                    notify_signal_decision_async(p, decision)
+                    response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode, "cost_gate_pass": False, "cost_gate_reason": p.get("cost_gate_reason")}
+                    fire_and_forget_ml_shadow_log(p, decision, response, state)
+                    return response
             decision = paper_decide(p, state)
             state = apply_decision_to_state(p, decision, state)
             save_state(state)
