@@ -1450,6 +1450,11 @@ def vps_smc_scheduler_status() -> Dict[str, Any]:
     return {"ok": True, "enabled": _env_bool("VPS_SMC_SCHEDULER_ENABLED", False), "interval_sec": _env_int("VPS_SMC_SCHEDULER_INTERVAL_SEC", 300), "last_scheduler_run_utc": state.get("last_scheduler_run_utc"), "last_scheduler_status": state.get("last_scheduler_status") or "IDLE", "last_error": state.get("last_scheduler_error"), "running": bool(state.get("scheduler_running", False))}
 
 
+def scheduler_status() -> Dict[str, Any]:
+    """Backward-compatible alias used by /operator/status payload."""
+    return vps_smc_scheduler_status()
+
+
 def vps_smc_scheduler_run_once(symbols: Optional[List[str]] = None, run_vps: bool = True, run_compare: bool = True, mirror_gsheet: bool = False, lookback_minutes: int = 360) -> Dict[str, Any]:
     lock = _vps_scheduler_lock()
     if not lock.acquire(blocking=False):
