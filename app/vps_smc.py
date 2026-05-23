@@ -1,6 +1,8 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -101,6 +103,14 @@ def _default_state() -> Dict[str, Any]:
         "last_symbols": [],
         "last_compare_utc": None,
         "last_compare_counts": {},
+        "last_gsheet_mirror_utc": None,
+        "last_gsheet_mirror_counts": {},
+        "last_scheduler_run_utc": None,
+        "last_scheduler_status": "IDLE",
+        "last_scheduler_error": None,
+        "gsheet_mirrored_keys": {"shadow": {}, "compare": {}},
+        "gsheet_headers_written": {"shadow": False, "compare": False},
+        "scheduler_running": False,
         "logged_signal_keys": {},
         "updated_at_utc": _utc_now_iso(),
     }
@@ -1208,6 +1218,194 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
     }
 
 
+
+
+def _env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip() or default
+
+
+def _bool_str(v: Any) -> str:
+    return "true" if bool(v) else "false"
+
+
+def _gspreadsheet_id() -> str:
+    return _env_str("VPS_SMC_GSHEET_SPREADSHEET_ID") or _env_str("MACRO_EVENT_SPREADSHEET_ID")
+
+
+def _gservice_account_file() -> str:
+    return _env_str("VPS_SMC_GSHEET_SERVICE_ACCOUNT_FILE", "state/private/google_service_account.json") or _env_str("MACRO_EVENT_SERVICE_ACCOUNT_FILE")
+
+
+def _vps_scheduler_lock() -> threading.Lock:
+    if not hasattr(_vps_scheduler_lock, "_lock"):
+        setattr(_vps_scheduler_lock, "_lock", threading.Lock())
+    return getattr(_vps_scheduler_lock, "_lock")
+
+
+def _read_latest(path: Path, limit: int) -> List[Dict[str, Any]]:
+    rows = _read_jsonl(path)
+    take = max(1, min(int(limit or 100), _env_int("VPS_SMC_GSHEET_MAX_ROWS_PER_RUN", 100)))
+    return rows[-take:]
+
+
+def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: str, header: List[str], rows: List[List[Any]], create_header: bool, header_already_written: bool) -> bool:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+    header_now_written = bool(header_already_written)
+    if create_header and not header_now_written:
+        if rows:
+            service.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [header]},
+            ).execute()
+            header_now_written = True
+        else:
+            probe = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A1:Z1",
+            ).execute()
+            existing = probe.get("values") or []
+            if not existing:
+                service.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{sheet_name}!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [header]},
+                ).execute()
+            header_now_written = True
+
+    if rows:
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+    return header_now_written
+
+
+def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = False) -> Dict[str, Any]:
+    target_u = str(target or "ALL").strip().upper()
+    enabled = _env_bool("VPS_SMC_GSHEET_MIRROR_ENABLED", False)
+    counts = {"shadow_candidates_seen": 0, "shadow_candidates_written": 0, "compare_rows_seen": 0, "compare_rows_written": 0, "skipped_duplicate": 0, "errors": 0}
+    state = _load_state()
+    mirrored = state.get("gsheet_mirrored_keys") if isinstance(state.get("gsheet_mirrored_keys"), dict) else {"shadow": {}, "compare": {}}
+    mirrored.setdefault("shadow", {})
+    mirrored.setdefault("compare", {})
+    headers_written = state.get("gsheet_headers_written") if isinstance(state.get("gsheet_headers_written"), dict) else {"shadow": False, "compare": False}
+    headers_written.setdefault("shadow", False)
+    headers_written.setdefault("compare", False)
+    spreadsheet_id = _gspreadsheet_id()
+
+    if not enabled:
+        return {"ok": True, "enabled": False, "target": target_u, "spreadsheet_id": spreadsheet_id or None, "counts": counts, "reason": "gsheet_mirror_disabled"}
+
+    service_account_file = _gservice_account_file()
+    if not spreadsheet_id or not service_account_file:
+        reason = "credentials_missing"
+        _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {"created_at_utc": _utc_now_iso(), "error": reason})
+        return {"ok": _env_bool("VPS_SMC_GSHEET_FAIL_OPEN", True), "enabled": True, "target": target_u, "spreadsheet_id": spreadsheet_id or None, "counts": counts, "reason": reason}
+
+    shadow_header = ["created_at_utc","signal_key","symbol","direction","state","score","priority","risk_mult","source_mode","candidate_only","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","tp1","tp2","tp3","rr_tp2","notes"]
+    compare_header = ["created_at_utc","lookback_minutes","symbol","classification","app_signal_key","app_direction","app_decision","app_created_at_utc","vps_signal_key","vps_direction","vps_score","vps_priority","vps_created_at_utc","reason","compare_key"]
+    shadow_rows=[]; compare_rows=[]
+    try:
+        if target_u in ("ALL","SHADOW_SIGNALS"):
+            for r in _read_latest(_log_dir()/"vps_smc_shadow_signals.jsonl", limit):
+                if str(r.get("source_mode") or "").upper() != "SHADOW_ONLY" or bool(r.get("candidate_only")) is not True:
+                    continue
+                counts["shadow_candidates_seen"] += 1
+                key = str(r.get("signal_key") or "")
+                if key and (not force) and key in mirrored["shadow"]:
+                    counts["skipped_duplicate"] += 1; continue
+                shadow_rows.append([r.get(k) for k in shadow_header])
+                if key: mirrored["shadow"][key]=_utc_now_iso()
+        if target_u in ("ALL","COMPARE"):
+            for r in _read_latest(_log_dir()/"vps_smc_compare.jsonl", limit):
+                counts["compare_rows_seen"] += 1
+                key = str(r.get("compare_key") or "")
+                if key and (not force) and key in mirrored["compare"]:
+                    counts["skipped_duplicate"] += 1; continue
+                compare_rows.append([r.get(k) for k in compare_header])
+                if key: mirrored["compare"][key]=_utc_now_iso()
+
+        if target_u in ("ALL", "SHADOW_SIGNALS"):
+            headers_written["shadow"] = _sheet_append(
+                spreadsheet_id,
+                service_account_file,
+                _env_str("VPS_SMC_GSHEET_SHADOW_SHEET_NAME", "VPS_SMC_SHADOW_SIGNALS"),
+                shadow_header,
+                shadow_rows,
+                _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True),
+                bool(headers_written.get("shadow", False)),
+            )
+        if target_u in ("ALL", "COMPARE"):
+            headers_written["compare"] = _sheet_append(
+                spreadsheet_id,
+                service_account_file,
+                _env_str("VPS_SMC_GSHEET_COMPARE_SHEET_NAME", "VPS_SMC_COMPARE"),
+                compare_header,
+                compare_rows,
+                _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True),
+                bool(headers_written.get("compare", False)),
+            )
+        counts["shadow_candidates_written"] = len(shadow_rows)
+        counts["compare_rows_written"] = len(compare_rows)
+        state["gsheet_mirrored_keys"] = mirrored
+        state["gsheet_headers_written"] = headers_written
+        state["last_gsheet_mirror_utc"] = _utc_now_iso()
+        state["last_gsheet_mirror_counts"] = counts
+        _save_state(state)
+        _append_jsonl(_log_dir() / "vps_smc_gsheet_mirror.jsonl", {"created_at_utc": _utc_now_iso(), "target": target_u, "counts": counts})
+        return {"ok": True, "enabled": True, "target": target_u, "spreadsheet_id": spreadsheet_id, "counts": counts, "reason": None}
+    except Exception as exc:
+        counts["errors"] += 1
+        reason = f"gsheet_error:{exc}"
+        _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {"created_at_utc": _utc_now_iso(), "error": reason})
+        return {"ok": _env_bool("VPS_SMC_GSHEET_FAIL_OPEN", True), "enabled": True, "target": target_u, "spreadsheet_id": spreadsheet_id, "counts": counts, "reason": "gsheet_api_error"}
+
+
+def vps_smc_scheduler_status() -> Dict[str, Any]:
+    state = _load_state()
+    return {"ok": True, "enabled": _env_bool("VPS_SMC_SCHEDULER_ENABLED", False), "interval_sec": _env_int("VPS_SMC_SCHEDULER_INTERVAL_SEC", 300), "last_scheduler_run_utc": state.get("last_scheduler_run_utc"), "last_scheduler_status": state.get("last_scheduler_status") or "IDLE", "last_error": state.get("last_scheduler_error"), "running": bool(state.get("scheduler_running", False))}
+
+
+def vps_smc_scheduler_run_once(symbols: Optional[List[str]] = None, run_vps: bool = True, run_compare: bool = True, mirror_gsheet: bool = False, lookback_minutes: int = 360) -> Dict[str, Any]:
+    lock = _vps_scheduler_lock()
+    if not lock.acquire(blocking=False):
+        return {"ok": True, "mode": "SHADOW_ONLY_SCHEDULER_RUN_ONCE", "run_vps_result": None, "compare_result": None, "mirror_result": None, "error": "scheduler_already_running"}
+    state = _load_state(); state["scheduler_running"] = True; _save_state(state)
+    rv=None; cr=None; mr=None; err=None
+    try:
+        if run_vps:
+            rv = vps_smc_run_once(symbols)
+        if run_compare:
+            cr = vps_smc_compare(lookback_minutes=lookback_minutes, symbols=symbols, run_vps_first=False)
+        if mirror_gsheet:
+            mr = vps_smc_mirror_gsheet(target="ALL", limit=_env_int("VPS_SMC_GSHEET_MAX_ROWS_PER_RUN", 100), force=False)
+        state = _load_state(); state["last_scheduler_status"] = "OK"
+    except Exception as exc:
+        err = str(exc)
+        state = _load_state(); state["last_scheduler_status"] = "ERROR"; state["last_scheduler_error"] = err
+    state["scheduler_running"] = False
+    state["last_scheduler_run_utc"] = _utc_now_iso()
+    _save_state(state)
+    _append_jsonl(_log_dir()/"vps_smc_scheduler.jsonl", {"created_at_utc": _utc_now_iso(), "ok": err is None, "error": err})
+    lock.release()
+    return {"ok": err is None or _env_bool("VPS_SMC_SCHEDULER_FAIL_OPEN", True), "mode": "SHADOW_ONLY_SCHEDULER_RUN_ONCE", "run_vps_result": rv, "compare_result": cr, "mirror_result": mr, "error": err}
 def vps_smc_latest_signals(symbol: str, limit: int) -> Dict[str, Any]:
     symbol_norm = _normalize_symbol(symbol)
     rows = _read_jsonl(_log_dir() / "vps_smc_shadow_signals.jsonl")

@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 import app.vps_smc as vps_smc
 
 
-APP_VERSION = "v0.24-p5-vps-smc-compare"
+APP_VERSION = "v0.24-p6-gsheet-mirror-scheduler"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -143,6 +143,22 @@ class VpsSmcComparePayload(BaseModel):
     lookback_minutes: Optional[int] = 180
     symbols: Optional[List[str]] = None
     run_vps_first: Optional[bool] = False
+
+
+class VpsSmcMirrorPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    target: Optional[str] = "ALL"
+    limit: Optional[int] = 100
+    force: Optional[bool] = False
+
+
+class VpsSmcSchedulerRunOncePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    symbols: Optional[List[str]] = None
+    run_vps: Optional[bool] = True
+    run_compare: Optional[bool] = True
+    mirror_gsheet: Optional[bool] = False
+    lookback_minutes: Optional[int] = 360
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -5111,6 +5127,43 @@ def vps_smc_compare_endpoint(
         lookback_minutes=req.lookback_minutes,
         symbols=req.symbols,
         run_vps_first=bool(req.run_vps_first),
+    )
+
+
+@app.post("/vps-smc/mirror-gsheet")
+def vps_smc_mirror_gsheet_endpoint(
+    payload: Optional[VpsSmcMirrorPayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    req = payload or VpsSmcMirrorPayload()
+    return vps_smc.vps_smc_mirror_gsheet(target=req.target or "ALL", limit=int(req.limit or 100), force=bool(req.force))
+
+
+@app.get("/vps-smc/scheduler/status")
+def vps_smc_scheduler_status_endpoint(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return vps_smc.vps_smc_scheduler_status()
+
+
+@app.post("/vps-smc/scheduler/run-once")
+def vps_smc_scheduler_run_once_endpoint(
+    payload: Optional[VpsSmcSchedulerRunOncePayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    req = payload or VpsSmcSchedulerRunOncePayload()
+    return vps_smc.vps_smc_scheduler_run_once(
+        symbols=req.symbols,
+        run_vps=bool(req.run_vps),
+        run_compare=bool(req.run_compare),
+        mirror_gsheet=bool(req.mirror_gsheet),
+        lookback_minutes=int(req.lookback_minutes or 360),
     )
 
 @app.get("/market/candles/status")
