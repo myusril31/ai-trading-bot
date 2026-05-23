@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN
 from threading import Lock, Thread
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 try:
@@ -140,6 +140,22 @@ class MlDatasetReclassifyPayload(BaseModel):
     limit: Optional[int] = None
     force: Optional[bool] = False
 
+
+
+
+class MlTrainLogisticPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    model_version: Optional[str] = "logistic_v1"
+    force: Optional[bool] = True
+    min_rows: Optional[int] = 30
+    min_loss: Optional[int] = 5
+    mode: Optional[str] = "SMOKE_TRAIN"
+
+
+class MlPredictionScorePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    signal_key: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
 
 class VpsSmcRunOncePayload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -2800,52 +2816,98 @@ def load_ml_model_meta() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def build_ml_feature_row(p: Dict[str, Any], context: Optional[Dict[str, Any]] = None, response: Optional[Dict[str, Any]] = None, feature_columns: Optional[List[str]] = None) -> Dict[str, Any]:
-    c = context or {}
-    r = response or {}
-    def _num(v: Any, d: float = 0.0) -> float:
+
+
+def ml_gate_mode() -> str:
+    mode = str(os.getenv("ML_GATE_MODE", "SHADOW_ONLY")).strip().upper()
+    allowed = {"OFF", "SHADOW_ONLY", "ADVISORY", "SOFT_GATE", "HARD_GATE"}
+    return mode if mode in allowed else "SHADOW_ONLY"
+
+
+def _latest_rows_by_signal(path: Path) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _read_jsonl(path):
+        k = str(row.get("signal_key") or "").strip()
+        if k:
+            out[k] = row
+    return out
+
+
+def _ml_feature_names() -> List[str]:
+    names = ["direction", "score", "priority", "entry", "sl", "tp1", "tp2", "tp3", "sl_distance_pct", "tp1_distance_pct", "tp2_distance_pct", "tp3_distance_pct", "rr", "rr_tp1", "rr_tp2", "rr_tp3", "tp_normalized", "plan_sanity_ok"]
+    if env_bool("ML_FEATURE_INCLUDE_SYMBOL", True):
+        names.extend(["symbol", "pair"])
+    if env_bool("ML_FEATURE_INCLUDE_SIGNAL_SOURCE", True):
+        names.extend(["source", "signal_source"])
+    if env_bool("ML_FEATURE_INCLUDE_SOURCE_MODE", False):
+        names.append("source_mode")
+    return names
+
+
+def _time_for_row(row: Dict[str, Any]) -> Tuple[int, str]:
+    ms, src = _signal_time_and_source(row)
+    if ms is not None:
+        return ms, src
+    return 0, "missing"
+
+
+def build_logistic_feature_row(payload_or_dataset_row: Dict[str, Any], feature_names: Optional[List[str]] = None) -> Dict[str, Any]:
+    row = payload_or_dataset_row or {}
+    entry = to_float_or_none(row.get("entry") if row.get("entry") is not None else (row.get("entry_mid") if row.get("entry_mid") is not None else row.get("entry_lo")))
+    sl = to_float_or_none(row.get("sl")); tp1 = to_float_or_none(row.get("tp1")); tp2 = to_float_or_none(row.get("tp2")); tp3 = to_float_or_none(row.get("tp3"))
+    def _pct(v):
         try:
-            if v is None:
-                return d
-            return float(v)
+            return (abs(float(v) - float(entry)) / abs(float(entry))) if (entry is not None and entry != 0 and v is not None) else None
         except Exception:
-            return d
-    direction = str(direction_of(p)).upper()
+            return None
+    direction = str(row.get("direction") or row.get("dir") or "").upper()
     base = {
-        "score": _num(p.get("score")),
-        "priority": _num(p.get("priority")),
-        "entry": _num(p.get("entry_mid") or p.get("entry_lo")),
-        "tp1": _num(p.get("tp1")),
-        "sl": _num(p.get("sl")),
-        "cost_gate_pass": 1.0 if bool(r.get("cost_gate_pass")) else 0.0,
-        "btc_regime_bull": 1.0 if str(c.get("btc_regime")) == "BULL" else 0.0,
-        "btc_regime_bear": 1.0 if str(c.get("btc_regime")) == "BEAR" else 0.0,
-        "funding_positive": 1.0 if str(c.get("funding_status","")).startswith("POSITIVE") else 0.0,
-        "event_risk_high": 1.0 if str(c.get("event_risk_level")) == "HIGH" else 0.0,
-        "direction_long": 1.0 if direction == "LONG" else 0.0,
-        "direction_short": 1.0 if direction == "SHORT" else 0.0,
+        "symbol": row.get("symbol"), "pair": row.get("pair"), "direction": direction,
+        "score": row.get("score"), "priority": row.get("priority"), "entry": entry,
+        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "sl_distance_pct": _pct(sl), "tp1_distance_pct": _pct(tp1), "tp2_distance_pct": _pct(tp2), "tp3_distance_pct": _pct(tp3),
+        "rr": row.get("rr"), "rr_tp1": row.get("rr_tp1"), "rr_tp2": row.get("rr_tp2"), "rr_tp3": row.get("rr_tp3"),
+        "tp_normalized": row.get("tp_normalized"), "plan_sanity_ok": row.get("plan_sanity_ok"),
+        "source": row.get("source"), "signal_source": row.get("signal_source"), "source_mode": row.get("source_mode"),
     }
-    cols = feature_columns or list(base.keys())
-    return {cname: base.get(cname, 0.0) for cname in cols}
+    names = feature_names or _ml_feature_names()
+    return {k: base.get(k) for k in names}
 
 
-def run_shadow_prediction(p: Dict[str, Any], context: Dict[str, Any], response: Dict[str, Any], now: str) -> Dict[str, Any]:
+def _build_training_frame() -> Tuple[list, list, List[str], Dict[str, Any], List[int]]:
+    outcomes = _latest_rows_by_signal(FORWARD_OUTCOMES_LOG)
+    dataset = _latest_rows_by_signal(ML_DATASET_ROWS_LOG)
+    feats, labels, times = [], [], []
+    feature_names = _ml_feature_names()
+    win = loss = 0
+    for sk, out in outcomes.items():
+        if not bool(out.get("include_ml_label")):
+            continue
+        lw = out.get("label_win")
+        if lw not in (0, 1, 0.0, 1.0):
+            continue
+        drow = dataset.get(sk)
+        if not isinstance(drow, dict):
+            continue
+        tms, _ = _time_for_row(drow)
+        feats.append(build_logistic_feature_row(drow, feature_names=feature_names))
+        y = int(float(lw)); labels.append(y); times.append(tms)
+        if y == 1: win += 1
+        else: loss += 1
+    return feats, labels, feature_names, {"train_rows_total": len(labels), "win": win, "loss": loss}, times
+
+def score_ml_prediction_internal(signal_key: str, payload: Dict[str, Any], context: Optional[Dict[str, Any]] = None, response: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     model_version = os.getenv("ML_MODEL_VERSION", "logistic_v1")
     model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
-    pred = {"signal_key": signal_key_of(p), "created_at_utc": now, "p_win": None, "ml_score": None, "ml_confidence": "NONE", "model_version": model_version, "decision_effect": "SHADOW_ONLY"}
+    meta = load_ml_model_meta()
+    mode = ml_gate_mode()
     if not model_path.exists():
-        pred["ml_action"] = "NO_MODEL"
-        return pred
+        return {"ok": False, "signal_key": signal_key, "model_version": model_version, "ml_gate_mode": mode, "production_gate_ready": False, "reason": "model_not_found"}
     try:
+        import pandas as pd
         model = pickle.loads(model_path.read_bytes())
-        meta = load_ml_model_meta()
-        feature_columns = meta.get("feature_columns") if isinstance(meta, dict) else None
-        feats = build_ml_feature_row(p, context=context, response=response, feature_columns=feature_columns if isinstance(feature_columns, list) else None)
-        try:
-            import pandas as pd
-        except Exception as dep_err:
-            raise RuntimeError(f"missing_runtime_dependency:pandas:{dep_err}")
-        X = pd.DataFrame([feats])
+        feature_columns = list((meta or {}).get("feature_columns") or _ml_feature_names())
+        X = pd.DataFrame([build_logistic_feature_row(payload or {}, feature_columns)])
         p_win = None
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X)
@@ -2854,25 +2916,49 @@ def run_shadow_prediction(p: Dict[str, Any], context: Dict[str, Any], response: 
             raw = model.predict(X)
             p_win = float(raw[0])
         if p_win is None:
-            raise RuntimeError("prediction_output_empty")
-        p_win = max(0.0, min(1.0, p_win))
-        score = p_win * 100.0
-        pred["p_win"] = p_win
-        pred["ml_score"] = score
-        pred["ml_confidence"] = "HIGH" if (p_win >= 0.70 or p_win < 0.45) else ("MEDIUM" if (0.60 <= p_win < 0.70 or 0.45 <= p_win < 0.52) else "LOW")
-        if p_win >= 0.70:
-            pred["ml_action"] = "BOOST"
-        elif p_win >= 0.60:
-            pred["ml_action"] = "HOLD"
-        elif p_win >= 0.52:
-            pred["ml_action"] = "DOWNGRADE"
-        else:
-            pred["ml_action"] = "AVOID"
-        return pred
+            return {"ok": False, "signal_key": signal_key, "model_version": model_version, "ml_gate_mode": mode, "production_gate_ready": bool(meta.get("production_gate_ready")), "reason": "prediction_output_empty"}
+        p_win = max(0.0, min(1.0, float(p_win)))
     except Exception as e:
+        return {"ok": False, "signal_key": signal_key, "model_version": model_version, "ml_gate_mode": mode, "production_gate_ready": bool(meta.get("production_gate_ready")), "reason": f"predict_failed:{e}"}
+
+    prod_ready = bool(meta.get("production_gate_ready"))
+    ml_decision = "LOG_ONLY"
+    reason = "shadow_mode"
+    if mode == "HARD_GATE" and env_bool("ML_GATE_ENABLED", False) and (not env_bool("ML_GATE_REQUIRE_PRODUCTION_READY", True) or prod_ready):
+        th = env_float("ML_GATE_MIN_PROB_WIN", 0.60)
+        if p_win < th:
+            ml_decision = "REJECT_BY_ML_GATE"
+            reason = "hard_gate_threshold"
+
+    return {
+        "ok": True,
+        "signal_key": signal_key,
+        "model_version": model_version,
+        "probability_win": p_win,
+        "probability_loss": 1.0 - p_win,
+        "ml_decision": ml_decision,
+        "ml_gate_mode": mode,
+        "production_gate_ready": prod_ready,
+        "reason": reason,
+        "features_used": list((meta or {}).get("feature_columns") or _ml_feature_names()),
+        "signal_source": (payload or {}).get("signal_source"),
+        "source_mode": (payload or {}).get("source_mode"),
+        "execution_mode": execution_mode(),
+    }
+
+
+def run_shadow_prediction(p: Dict[str, Any], context: Dict[str, Any], response: Dict[str, Any], now: str) -> Dict[str, Any]:
+    score = score_ml_prediction_internal(signal_key_of(p), p, context=context, response=response)
+    pred = {"signal_key": signal_key_of(p), "created_at_utc": now, "p_win": score.get("probability_win"), "ml_score": None, "ml_confidence": "NONE", "model_version": score.get("model_version", os.getenv("ML_MODEL_VERSION", "logistic_v1")), "decision_effect": "SHADOW_ONLY"}
+    if not score.get("ok"):
         pred["ml_action"] = "MODEL_ERROR"
-        pred["reason"] = f"predict_failed:{e}"
+        pred["reason"] = score.get("reason")
         return pred
+    p_win = float(score.get("probability_win"))
+    pred["ml_score"] = p_win * 100.0
+    pred["ml_confidence"] = "HIGH" if (p_win >= 0.70 or p_win < 0.45) else ("MEDIUM" if (0.60 <= p_win < 0.70 or 0.45 <= p_win < 0.52) else "LOW")
+    pred["ml_action"] = "BOOST" if p_win >= 0.70 else "HOLD" if p_win >= 0.60 else "DOWNGRADE" if p_win >= 0.52 else "AVOID"
+    return pred
 
 def build_context_snapshot(p: Dict[str, Any]) -> Dict[str, Any]:
     if not env_bool("ML_CONTEXT_ENABLED", True):
@@ -3490,6 +3576,181 @@ def ml_outcome_summary(
         "invalid_plan": counts.get("INVALID_PLAN", 0),
     }
 
+
+
+def train_logistic_model(req: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        import pandas as pd
+        from sklearn.compose import ColumnTransformer
+        from sklearn.impute import SimpleImputer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, precision_score, recall_score
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder
+    except Exception as e:
+        return {"ok": False, "reason": f"missing_training_dependencies:{e}"}
+    feats, labels, feature_names, stats, times = _build_training_frame()
+    min_rows = int(req.get("min_rows") or 30)
+    min_loss = int(req.get("min_loss") or 5)
+    if len(labels) < min_rows or stats["loss"] < min_loss:
+        return {"ok": False, "reason": "insufficient_data", **stats, "min_rows": min_rows, "min_loss": min_loss}
+    model_version = str(req.get("model_version") or "logistic_v1")
+    model_path = Path(os.getenv("ML_MODEL_PATH", f"state/ml_models/{model_version}.pkl"))
+    meta_path = Path(os.getenv("ML_MODEL_META_PATH", f"state/ml_models/{model_version}_meta.json"))
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    if model_path.exists() and not bool(req.get("force") is True):
+        return {"ok": True, "reason": "model_exists", "model_path": str(model_path), "meta_path": str(meta_path), "model_exists": True}
+
+    rows = sorted(list(zip(times, feats, labels)), key=lambda x: x[0])
+    split_idx = max(1, int(len(rows) * 0.7))
+    train_rows, val_rows = rows[:split_idx], rows[split_idx:]
+    if not val_rows:
+        train_rows, val_rows = rows, []
+    X_train = pd.DataFrame([r[1] for r in train_rows]); y_train = pd.Series([r[2] for r in train_rows])
+
+    validation_reason_override = None
+    y_all = pd.Series(labels)
+    if len(set(int(v) for v in y_train.tolist())) < 2:
+        if len(set(int(v) for v in y_all.tolist())) >= 2:
+            train_rows = rows
+            val_rows = []
+            X_train = pd.DataFrame([r[1] for r in train_rows]); y_train = pd.Series([r[2] for r in train_rows])
+            validation_reason_override = "train_split_single_class_used_full_train"
+        else:
+            return {"ok": False, "reason": "single_class_training_data", **stats}
+
+    num_cols = [c for c in X_train.columns if pd.api.types.is_numeric_dtype(X_train[c])]
+    cat_cols = [c for c in X_train.columns if c not in num_cols]
+    pre = ColumnTransformer([("num", Pipeline([("imp", SimpleImputer(strategy="median"))]), num_cols), ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore"))]), cat_cols)])
+    model = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))])
+    model.fit(X_train, y_train)
+    model_path.write_bytes(pickle.dumps(model))
+
+    def calc_metrics(Xdf, yser):
+        pred = model.predict(Xdf)
+        proba = model.predict_proba(Xdf)[:,1] if hasattr(model,'predict_proba') else None
+        m = {"accuracy": float(accuracy_score(yser,pred)) if len(yser) else None, "roc_auc": None, "brier_score": None, "precision_loss_avoidance": None, "recall_loss_avoidance": None}
+        if proba is not None:
+            try: m["brier_score"] = float(brier_score_loss(yser, proba))
+            except: pass
+            try:
+                if len(set(yser.tolist())) >= 2: m["roc_auc"] = float(roc_auc_score(yser, proba))
+            except: pass
+        try:
+            loss_true = [1-int(v) for v in yser.tolist()]
+            loss_pred = [1-int(v) for v in pred.tolist()]
+            m["precision_loss_avoidance"] = float(precision_score(loss_true, loss_pred, zero_division=0))
+            m["recall_loss_avoidance"] = float(recall_score(loss_true, loss_pred, zero_division=0))
+        except: pass
+        return m
+
+    in_sample_metrics = calc_metrics(pd.DataFrame(feats), pd.Series(labels))
+    validation_ready = False
+    validation_reason = validation_reason_override
+    validation_metrics = None
+    validation_win = validation_loss = 0
+    validation_class_coverage_ok = False
+    val_start = val_end = None
+    if val_rows:
+        X_val = pd.DataFrame([r[1] for r in val_rows]); y_val = pd.Series([r[2] for r in val_rows])
+        validation_win = int(sum(1 for v in y_val.tolist() if v == 1)); validation_loss = int(sum(1 for v in y_val.tolist() if v == 0))
+        val_start = datetime.fromtimestamp(val_rows[0][0]/1000, timezone.utc).isoformat() if val_rows[0][0] else None
+        val_end = datetime.fromtimestamp(val_rows[-1][0]/1000, timezone.utc).isoformat() if val_rows[-1][0] else None
+        validation_class_coverage_ok = validation_win >= 1 and validation_loss >= 1
+        if len(val_rows) < 10:
+            validation_reason = validation_reason or "insufficient_rows"
+        elif not validation_class_coverage_ok:
+            if validation_win == 0 and validation_loss == 0:
+                validation_reason = validation_reason or "validation_single_class"
+            elif validation_win == 0:
+                validation_reason = validation_reason or "validation_no_win"
+            elif validation_loss == 0:
+                validation_reason = validation_reason or "validation_no_loss"
+            else:
+                validation_reason = validation_reason or "validation_single_class"
+        else:
+            validation_ready = True
+            validation_reason = None if validation_reason_override is None else validation_reason_override
+            validation_metrics = calc_metrics(X_val, y_val)
+    else:
+        validation_reason = validation_reason or "insufficient_rows"
+
+    train_rows_total = int(stats["train_rows_total"]); win = int(stats["win"]); loss = int(stats["loss"])
+    train_win = int(sum(1 for v in y_train.tolist() if int(v) == 1))
+    train_loss = int(sum(1 for v in y_train.tolist() if int(v) == 0))
+    train_period_start = datetime.fromtimestamp(train_rows[0][0]/1000, timezone.utc).isoformat() if train_rows and train_rows[0][0] else None
+    train_period_end = datetime.fromtimestamp(train_rows[-1][0]/1000, timezone.utc).isoformat() if train_rows and train_rows[-1][0] else None
+
+    smoke_ready = train_rows_total >= 30 and win >= 10 and loss >= 5
+    baseline_ready = train_rows_total >= 100 and loss >= 10
+    min_brier = env_float("ML_VALIDATION_MAX_BRIER", 0.25)
+    days_cov = ((max(times)-min(times))/86400000.0) if times and min(times) > 0 else 0.0
+    severe_leak = False
+    prod = bool(train_rows_total >= 500 and loss >= 100 and validation_ready and validation_loss >= 30 and validation_metrics and (validation_metrics.get("roc_auc") or 0) >= 0.60 and (validation_metrics.get("brier_score") is not None and validation_metrics.get("brier_score") <= min_brier) and (not severe_leak) and days_cov >= 30.0)
+
+    df_all = pd.DataFrame(feats)
+    feature_missing_rate = {c: float(df_all[c].isna().mean()) for c in df_all.columns}
+    categorical_unique_count = {c: int(df_all[c].nunique(dropna=True)) for c in cat_cols}
+    dropped_features = ["cost_gate_pass", "execution_decision", "reject_reason", "label_win", "label_R", "label_target", "outcome_status"]
+    leak_warn = ["source_mode_excluded_by_default", "cost_gate_pass_excluded_by_default"]
+    symbol_warn = ("symbol_small_sample_high_cardinality" if ("symbol" in df_all.columns and len(df_all) < 200 and df_all["symbol"].nunique(dropna=True) > 3) else None)
+
+    meta = {
+        "model_version": model_version, "created_at_utc": utc_now_iso(), "mode": str(req.get("mode") or "SMOKE_TRAIN"),
+        "train_rows_total": train_rows_total, "win": win, "loss": loss, "train_rows_used": len(train_rows), "train_win": train_win, "train_loss": train_loss, "train_period_start": train_period_start, "train_period_end": train_period_end,
+        "class_balance": {"win_ratio": (win/train_rows_total) if train_rows_total else 0.0, "loss_ratio": (loss/train_rows_total) if train_rows_total else 0.0},
+        "features": feature_names, "feature_columns": feature_names,
+        "in_sample_metrics": in_sample_metrics, "validation_metrics": validation_metrics, "validation_ready": validation_ready, "validation_reason": validation_reason,
+        "validation_rows": len(val_rows), "validation_win": validation_win, "validation_loss": validation_loss, "validation_class_coverage_ok": validation_class_coverage_ok,
+        "validation_period_start": val_start, "validation_period_end": val_end,
+        "feature_missing_rate": feature_missing_rate, "categorical_unique_count": categorical_unique_count,
+        "dropped_features": dropped_features, "leakage_risk_warnings": leak_warn,
+        "small_sample_warning": train_rows_total < 100, "symbol_overfit_warning": symbol_warn,
+        "smoke_ready": smoke_ready, "baseline_ready": baseline_ready,
+        "production_gate_ready": prod, "production_gate_ready_reason": "requires_large_oos_validated_sample" if not prod else "ready",
+        "recommended_ml_gate_mode": "SHADOW_ONLY" if not prod else "ADVISORY", "decision_effect": "SHADOW_ONLY_NOT_GATE" if not prod else "GATE_ELIGIBLE",
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "model_path": str(model_path), "meta_path": str(meta_path), "meta": meta}
+
+
+@app.post("/ml/model/train-logistic")
+def ml_model_train_logistic(payload: MlTrainLogisticPayload, x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"), x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret")) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return train_logistic_model(payload.model_dump(mode="json"))
+
+
+@app.post("/ml/model/evaluate")
+def ml_model_evaluate(x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"), x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret")) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    meta = load_ml_model_meta()
+    feats, labels, _, stats, _ = _build_training_frame()
+    out = {"ok": True, "dataset": stats, "meta": meta, "production_gate_ready": bool(meta.get("production_gate_ready")), "recommended_ml_gate_mode": meta.get("recommended_ml_gate_mode", "SHADOW_ONLY")}
+    if not feats:
+        return out
+    try:
+        import pandas as pd
+        model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
+        model = pickle.loads(model_path.read_bytes())
+        X = pd.DataFrame(feats)
+        y = labels
+        pred = model.predict(X)
+        out["metrics"] = {"accuracy": float(sum(int(a==b) for a,b in zip(pred,y))/len(y)) if y else None}
+    except Exception as e:
+        out["metrics_error"] = str(e)
+    return out
+
+
+@app.post("/ml/prediction/score")
+def ml_prediction_score(payload: MlPredictionScorePayload, x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"), x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret")) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    p = payload.payload or {}
+    signal_key = payload.signal_key or signal_key_of(p)
+    score = score_ml_prediction_internal(signal_key, p)
+    row = {"created_at_utc": utc_now_iso(), **score}
+    append_jsonl(ML_PREDICTIONS_LOG, row)
+    return score
+
 @app.get("/ml/model/status")
 def ml_model_status(
     x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
@@ -3498,7 +3759,7 @@ def ml_model_status(
     verify_secret(x_signal_secret, x_webhook_secret)
     model_path = Path(os.getenv("ML_MODEL_PATH", "state/ml_models/logistic_v1.pkl"))
     meta = load_ml_model_meta()
-    return {"ok": True, "model_version": os.getenv("ML_MODEL_VERSION", "logistic_v1"), "model_exists": model_path.exists(), "model_path": str(model_path), "meta": meta if meta else None}
+    return {"ok": True, "model_version": os.getenv("ML_MODEL_VERSION", "logistic_v1"), "model_exists": model_path.exists(), "model_path": str(model_path), "meta": meta if meta else None, "production_gate_ready": bool((meta or {}).get("production_gate_ready")), "recommended_ml_gate_mode": (meta or {}).get("recommended_ml_gate_mode", "SHADOW_ONLY")}
 
 
 
@@ -3625,6 +3886,15 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
                     fire_and_forget_ml_shadow_log(p, decision, response, state)
                     return response
             decision = paper_decide(p, state)
+            if env_bool("ML_PREDICTION_ENABLED", True):
+                score_res = score_ml_prediction_internal(signal_key_of(p), p)
+                p["ml_probability_win"] = score_res.get("probability_win")
+                p["ml_gate_mode"] = score_res.get("ml_gate_mode")
+                p["ml_gate_decision"] = score_res.get("ml_decision")
+                p["ml_gate_reason"] = score_res.get("reason")
+                p["ml_model_version"] = score_res.get("model_version")
+                if decision.get("decision") == "ACCEPT" and score_res.get("ml_decision") == "REJECT_BY_ML_GATE":
+                    decision = {"decision": "REJECT", "reason": "ml_hard_gate_reject", "gate": "ml_gate"}
             state = apply_decision_to_state(p, decision, state)
             save_state(state)
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
@@ -3634,6 +3904,20 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             return response
 
         decision = {"decision": "ACCEPT", "reason": "execution_mode_testnet_path", "gate": "execution_mode_gate"}
+        if env_bool("ML_PREDICTION_ENABLED", True):
+            score_res = score_ml_prediction_internal(signal_key_of(p), p)
+            p["ml_probability_win"] = score_res.get("probability_win")
+            p["ml_gate_mode"] = score_res.get("ml_gate_mode")
+            p["ml_gate_decision"] = score_res.get("ml_decision")
+            p["ml_gate_reason"] = score_res.get("reason")
+            p["ml_model_version"] = score_res.get("model_version")
+            if score_res.get("ml_decision") == "REJECT_BY_ML_GATE":
+                decision = {"decision": "REJECT", "reason": "ml_hard_gate_reject", "gate": "ml_gate"}
+                append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+                notify_signal_decision_async(p, decision)
+                response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+                fire_and_forget_ml_shadow_log(p, decision, response, state)
+                return response
         append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
         notify_signal_decision_async(p, decision)
         response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
