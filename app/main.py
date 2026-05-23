@@ -740,7 +740,12 @@ def pair_of(p: Dict[str, Any]) -> str:
 
 
 def direction_of(p: Dict[str, Any]) -> str:
-    return str(p.get("direction") or p.get("dir") or "").strip()
+    raw_direction = str(p.get("direction") or p.get("dir") or "").strip().upper()
+    if raw_direction in ("LONG", "BUY"):
+        return "Long"
+    if raw_direction in ("SHORT", "SELL"):
+        return "Short"
+    return ""
 
 
 def status_of(p: Dict[str, Any]) -> str:
@@ -1972,8 +1977,8 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
     tp2 = p.get("tp2")
     tp3 = p.get("tp3")
 
-    side = "BUY" if direction == "Long" else "SELL"
-    exit_side = "SELL" if direction == "Long" else "BUY"
+    side = "BUY" if direction == "Long" else ("SELL" if direction == "Short" else "")
+    exit_side = "SELL" if direction == "Long" else ("BUY" if direction == "Short" else "")
 
     return {
         "plan_id": f"PLAN|{signal_key_of(p)}",
@@ -2004,6 +2009,16 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
     mode = execution_mode()
+    direction = str(plan.get("direction") or "").strip().upper()
+    entry_side = str(plan.get("entry_side") or "").strip().upper()
+    exit_side = str(plan.get("exit_side") or "").strip().upper()
+
+    if direction not in ("LONG", "SHORT"):
+        return False, "invalid_direction"
+    if direction == "LONG" and (entry_side != "BUY" or exit_side != "SELL"):
+        return False, "plan_sanity_invalid_direction_side_map"
+    if direction == "SHORT" and (entry_side != "SELL" or exit_side != "BUY"):
+        return False, "plan_sanity_invalid_direction_side_map"
 
     if mode == "DISABLED":
         return False, "execution_mode_disabled"
