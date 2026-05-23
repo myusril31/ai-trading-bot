@@ -1143,7 +1143,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         liq_ctx = result.get("liq_ctx") or {}
         signal_row = {
             "signal_key": signal_key, "signal_source": "VPS_SMC", "source_mode": "SHADOW_ONLY", "candidate_only": True,
-            "symbol": result.get("symbol"), "pair": result.get("symbol"), "direction": direction, "state": "CONFIRMED", "mode": "SHADOW_ONLY",
+            "symbol": result.get("symbol"), "pair": f"BINANCE:{str(result.get('symbol') or '').upper()}.P", "direction": direction, "state": "CONFIRMED", "mode": "SHADOW_ONLY",
             "score": score_detail.get("score"), "priority": score_detail.get("priority"), "risk_mult": score_detail.get("risk_mult"),
             "signal_time_wib": None, "confirmed_bucket_ms": bucket_ms, "htf_dir": htf_gate.get("htf_dir"), "htf_bias": htf_gate.get("htf_bias"),
             "htf_location": htf_gate.get("htf_location"), "htf_structure": htf_gate.get("htf_structure"), "liq_ctx": result.get("liq_ctx"),
@@ -1178,7 +1178,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "signal_key": signal_key,
                 "signal_id": signal_key,
                 "symbol": result.get("symbol"),
-                "pair": result.get("symbol"),
+                "pair": f"BINANCE:{str(result.get('symbol') or '').upper()}.P",
                 "direction": direction,
                 "entry": plan.get("entry_mid"),
                 "entry_mid": plan.get("entry_mid"),
