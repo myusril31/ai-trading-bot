@@ -2165,7 +2165,7 @@ def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
             append_jsonl(EXECUTION_EVENTS_LOG, order_test_event)
             event = order_test_event
 
-        elif execution_mode() == "TESTNET_MARKET":
+        elif execution_mode() in ("TESTNET", "TESTNET_MARKET"):
             force = str((p.get("force_test") or p.get("force") or "")).strip().lower() in ("1", "true", "yes", "y", "on")
             session_guard = assert_controlled_test_session_clean(plan.get("symbol") or "", force=force, ignore_signal_key=signal_key)
             if not session_guard.get("ok"):
@@ -3441,26 +3441,59 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             notify_signal_decision_async(p, decision)
             fire_and_forget_ml_shadow_log(p, decision, {"ok": True, "decision": "RECEIVED_ONLY"}, state)
             return {"ok": True, "decision": "RECEIVED_ONLY", "reason": "v0.3 logger mode, no execution", "signal_id": p.get("signal_id") or p.get("signal_key")}
-        decision = paper_decide(p, state)
-        state = apply_decision_to_state(p, decision, state)
-        save_state(state)
+        current_execution_mode = execution_mode()
+
+        if current_execution_mode == "DISABLED":
+            decision = {"decision": "REJECT", "reason": "execution_mode_disabled", "gate": "execution_mode_gate"}
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+
+        if current_execution_mode == "LIVE_SMALL_CAPITAL":
+            safety = v014_safety_summary(symbol=pair_to_binance_symbol(pair_of(p)), ignore_signal_key=signal_key_of(p))
+            if not bool(safety.get("safe_to_continue")):
+                decision = {"decision": "REJECT", "reason": "live_preflight_failed", "gate": "live_preflight_gate"}
+                append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+                notify_signal_decision_async(p, decision)
+                response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode, "safety_summary": safety}
+                fire_and_forget_ml_shadow_log(p, decision, response, state)
+                return response
+            decision = {"decision": "REJECT", "reason": "live_execution_not_implemented", "gate": "execution_mode_gate"}
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+
+        if current_execution_mode == "PAPER":
+            decision = paper_decide(p, state)
+            state = apply_decision_to_state(p, decision, state)
+            save_state(state)
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+
+        decision = {"decision": "ACCEPT", "reason": "execution_mode_testnet_path", "gate": "execution_mode_gate"}
         append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
         notify_signal_decision_async(p, decision)
-        response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": execution_mode()}
-        if decision.get("decision") == "ACCEPT":
-            execution_event = handle_execution_after_accept(p)
-            response["cost_gate_pass"] = execution_event.get("plan", {}).get("cost_gate_pass")
-            response["cost_gate_reason"] = execution_event.get("plan", {}).get("cost_gate_reason")
-            if execution_event.get("reason") == "cost_gate_failed":
-                response["execution_skipped_reason"] = "cost_gate_failed"
-            if execution_mode() == "TESTNET_MARKET":
-                market_res = execution_event.get("market_order_result")
-                response["market_order_result"] = market_res
-                if not (market_res or {}).get("ok"):
-                    response["ok"] = False
-                    response["execution_error_reason"] = execution_event.get("reason")
-            elif execution_mode() == "TESTNET_ORDER_TEST":
-                response["testnet_order_result"] = execution_event.get("order_test_result")
+        response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+        execution_event = handle_execution_after_accept(p)
+        response["cost_gate_pass"] = execution_event.get("plan", {}).get("cost_gate_pass")
+        response["cost_gate_reason"] = execution_event.get("plan", {}).get("cost_gate_reason")
+        if execution_event.get("reason") == "cost_gate_failed":
+            response["execution_skipped_reason"] = "cost_gate_failed"
+        if current_execution_mode in ("TESTNET", "TESTNET_MARKET"):
+            market_res = execution_event.get("market_order_result")
+            response["market_order_result"] = market_res
+            if not (market_res or {}).get("ok"):
+                response["ok"] = False
+                response["execution_error_reason"] = execution_event.get("reason")
+        elif current_execution_mode == "TESTNET_ORDER_TEST":
+            response["testnet_order_result"] = execution_event.get("order_test_result")
         fire_and_forget_ml_shadow_log(p, decision, response, state)
         return response
 
