@@ -5,3 +5,6 @@ pydantic==2.10.4
 google-api-python-client
 google-auth
 websocket-client==1.8.0
+pandas
+scikit-learn
+numpy
