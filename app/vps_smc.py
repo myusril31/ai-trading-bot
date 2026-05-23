@@ -179,6 +179,16 @@ def _parse_iso_utc(raw: Any) -> Optional[datetime]:
         return None
 
 
+
+
+def _bucket_ms_to_wib_text(bucket_ms: Any) -> Optional[str]:
+    try:
+        ms = int(bucket_ms)
+    except Exception:
+        return None
+    dt = datetime.fromtimestamp(ms / 1000.0, timezone.utc).astimezone(timezone(timedelta(hours=7)))
+    return dt.strftime("%Y-%m-%d %H:%M:%S WIB")
+
 def _normalize_direction(raw: Any) -> Optional[str]:
     d = str(raw or "").strip().upper()
     if d in ("LONG", "BUY"):
@@ -1180,10 +1190,10 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             plan["tp2"] = tp_norm.get("tp2")
             plan["tp3"] = tp_norm.get("tp3")
         signal_row = {
-            "signal_key": signal_key, "signal_source": "VPS_SMC", "source_mode": "SHADOW_ONLY", "candidate_only": True,
+            "signal_key": signal_key, "source": "VPS_SMC", "signal_source": "VPS_SMC", "source_mode": "SHADOW_ONLY", "candidate_only": True,
             "symbol": result.get("symbol"), "pair": f"BINANCE:{str(result.get('symbol') or '').upper()}.P", "direction": direction, "state": "CONFIRMED", "mode": "SHADOW_ONLY",
             "score": score_detail.get("score"), "priority": score_detail.get("priority"), "risk_mult": score_detail.get("risk_mult"),
-            "signal_time_wib": None, "confirmed_bucket_ms": bucket_ms, "htf_dir": htf_gate.get("htf_dir"), "htf_bias": htf_gate.get("htf_bias"),
+            "signal_time_wib": _bucket_ms_to_wib_text(bucket_ms), "confirmed_bucket_ms": bucket_ms, "htf_dir": htf_gate.get("htf_dir"), "htf_bias": htf_gate.get("htf_bias"),
             "htf_location": htf_gate.get("htf_location"), "htf_structure": htf_gate.get("htf_structure"), "liq_ctx": result.get("liq_ctx"),
             "dist_to_zone_pct": liq_ctx.get("dist_to_zone_pct"), "structure_15m": result.get("structure_15m"), "sweep_tag": liq_ctx.get("sweep_tag"),
             "sweep_extreme": liq_ctx.get("sweep_extreme"), "reclaim_level": reclaim.get("reclaim_level"), "fvg_type": poi.get("fvg_type"),
@@ -1240,7 +1250,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "score": score_detail.get("score"),
                 "priority": score_detail.get("priority"),
                 "confirmed_bucket_ms": bucket_ms,
-                "signal_time_wib": None,
+                "signal_time_wib": _bucket_ms_to_wib_text(bucket_ms),
                 "htf_dir": htf_gate.get("htf_dir"),
                 "htf_bias": htf_gate.get("htf_bias"),
                 "htf_location": htf_gate.get("htf_location"),
@@ -1436,7 +1446,7 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
         _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {"created_at_utc": _utc_now_iso(), "error": reason})
         return {"ok": _env_bool("VPS_SMC_GSHEET_FAIL_OPEN", True), "enabled": True, "target": target_u, "spreadsheet_id": spreadsheet_id or None, "counts": counts, "reason": reason}
 
-    shadow_header = ["created_at_utc","signal_key","symbol","direction","state","score","priority","risk_mult","source_mode","candidate_only","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","raw_tp1","raw_tp2","raw_tp3","tp1","tp2","tp3","tp_normalized","tp_normalize_reason","rr_tp2","plan_sanity_ok","plan_sanity_reason","plan_invalid","notes"]
+    shadow_header = ["created_at_utc","source","signal_source","source_mode","signal_key","pair","symbol","direction","state","score","priority","risk_mult","candidate_only","signal_time_wib","confirmed_bucket_ms","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","raw_tp1","raw_tp2","raw_tp3","tp1","tp2","tp3","tp_normalized","tp_normalize_reason","rr_tp2","plan_sanity_ok","plan_sanity_reason","plan_invalid","notes"]
     compare_header = ["created_at_utc","lookback_minutes","symbol","classification","app_signal_key","app_direction","app_decision","app_created_at_utc","vps_signal_key","vps_direction","vps_score","vps_priority","vps_created_at_utc","reason","compare_key"]
     shadow_rows=[]; compare_rows=[]
     try:
