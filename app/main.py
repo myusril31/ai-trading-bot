@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict
 import app.vps_smc as vps_smc
 
 
-APP_VERSION = "v0.24-p6-gsheet-mirror-scheduler"
+APP_VERSION = "v0.24-p6a-ml-dataset-classifier-fix"
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
@@ -130,6 +130,14 @@ class ForwardOutcomeEvaluatePayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     limit: Optional[int] = None
     max_rows: Optional[int] = None
+    force: Optional[bool] = False
+
+
+class MlDatasetReclassifyPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    dry_run: Optional[bool] = True
+    backup: Optional[bool] = True
+    limit: Optional[int] = None
     force: Optional[bool] = False
 
 
@@ -820,13 +828,88 @@ def ml_enabled() -> bool:
     return env_bool("ML_DATA_COLLECTION_ENABLED", True)
 
 
-def classify_sample(p: Dict[str, Any]) -> Dict[str, Any]:
-    blob = json.dumps(p, ensure_ascii=False).upper()
-    key = str(signal_key_of(p) or "").upper()
-    tokens = ["SMOKE", "TEST", "VALIDATION", "MANUAL", "V0"]
-    if any(t in key or t in blob for t in tokens):
-        return {"sample_type": "VALIDATION_SAMPLE", "include_ml": False, "include_reason": "validation_or_test_sample"}
-    return {"sample_type": "FORWARD_SHADOW_PAPER", "include_ml": True, "include_reason": "forward_shadow_paper"}
+def _extract_signal_key_bucket_ms(signal_key: Any) -> Optional[int]:
+    parts = str(signal_key or "").strip().split("|")
+    if len(parts) < 3:
+        return None
+    tail = str(parts[-1]).strip()
+    if tail.isdigit():
+        return int(tail)
+    return None
+
+
+def _is_explicit_validation_sample(row: Dict[str, Any]) -> bool:
+    markers = ("SMOKE", "TEST", "VALIDATION", "MANUAL")
+    signal_key = str(row.get("signal_key") or row.get("signal_id") or "").upper()
+    source = str(row.get("source") or row.get("signal_source") or "").upper()
+    mode = str(row.get("mode") or row.get("source_mode") or "").upper()
+    if any(m in signal_key for m in markers):
+        return True
+    if any(m in source for m in markers):
+        return True
+    if "SMOKE_TEST" in mode:
+        return True
+    return False
+
+
+def _is_production_apps_script_signal(row: Dict[str, Any]) -> bool:
+    source = str(row.get("source") or row.get("signal_source") or "").strip().lower()
+    engine = str(row.get("engine") or "").strip().upper()
+    event_type = str(row.get("event_type") or "").strip().upper()
+    symbol = v010_normalize_symbol(row.get("symbol") or row.get("pair") or "")
+    signal_key = str(row.get("signal_key") or row.get("signal_id") or "")
+    direction = str(row.get("direction") or row.get("dir") or "").strip().upper()
+    entry = to_float_or_none(row.get("entry") or row.get("entry_mid") or row.get("entry_lo") or row.get("entry_price"))
+    sl = to_float_or_none(row.get("sl"))
+    tp1 = to_float_or_none(row.get("tp1"))
+    key_head = signal_key.split("|")[0].upper() if signal_key else ""
+    source_ok = source == "apps_script_inst" or engine == "INST"
+    event_ok = event_type == "SIGNAL_CONFIRMED"
+    symbol_ok = key_head.startswith("BINANCE:") and key_head.endswith("USDT.P")
+    if not symbol_ok:
+        symbol_ok = symbol.endswith("USDT")
+    direction_ok = direction in ("LONG", "SHORT")
+    plan_ok = entry is not None and sl is not None and tp1 is not None
+    if source_ok and event_ok and symbol_ok and direction_ok and plan_ok:
+        return True
+
+    # Legacy dataset fallback for backfill rows missing source/engine/event_type.
+    # Explicit validation markers are handled first in ml_classify_dataset_row().
+    decision = str(row.get("execution_decision") or "").strip().upper()
+    sample_type = str(row.get("sample_type") or "").strip().upper()
+    decision_or_sample_ok = decision in ("ACCEPT", "REJECT") or sample_type in ("VALIDATION_SAMPLE", "FORWARD_SHADOW_PAPER")
+    legacy_symbol_ok = key_head.startswith("BINANCE:") and key_head.endswith("USDT.P")
+    legacy_symbol_ok = legacy_symbol_ok and symbol.endswith("USDT")
+    return bool(legacy_symbol_ok and direction_ok and plan_ok and decision_or_sample_ok)
+
+
+def ml_classify_dataset_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row or {})
+    bucket_ms = _extract_signal_key_bucket_ms(out.get("signal_key") or out.get("signal_id"))
+    if bucket_ms is not None:
+        out["confirmed_bucket_ms"] = bucket_ms
+        out["time_source"] = "signal_key_bucket_ms"
+        if not out.get("signal_time_wib"):
+            out["signal_time_wib"] = datetime.fromtimestamp(bucket_ms / 1000.0, timezone.utc).astimezone(WIB).isoformat()
+    if _is_explicit_validation_sample(out):
+        out["sample_type"] = "VALIDATION_SAMPLE"
+        out["include_ml"] = False
+        out["include_reason"] = None
+        out["exclude_label_reason"] = "validation_sample"
+        return out
+    if _is_production_apps_script_signal(out):
+        out["sample_type"] = "FORWARD_SHADOW_PAPER"
+        out["include_ml"] = True
+        out["include_reason"] = "production_signal"
+        out["exclude_label_reason"] = None
+        return out
+    out["sample_type"] = str(out.get("sample_type") or "FORWARD_SHADOW_PAPER")
+    out["include_ml"] = bool(out.get("include_ml", True))
+    if out["include_ml"] and not out.get("include_reason"):
+        out["include_reason"] = "forward_shadow_paper"
+    if not out["include_ml"] and not out.get("exclude_label_reason"):
+        out["exclude_label_reason"] = "include_ml_false"
+    return out
 
 
 def build_binance_context(symbol: str) -> Dict[str, Any]:
@@ -2716,7 +2799,21 @@ def safe_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Di
         context = build_context_snapshot(p) if env_bool("ML_CONTEXT_FETCH_ON_SIGNAL", True) else {"context_quality": "DISABLED", "macro_event_context_quality": "DISABLED", "context_errors": []}
         if context:
             append_jsonl(ML_CONTEXT_SNAPSHOTS_LOG, {"created_at_utc": now, "signal_key": signal_key_of(p), **context})
-        sample = classify_sample(p)
+        sample = ml_classify_dataset_row({
+            "signal_key": signal_key_of(p),
+            "source": p.get("source"),
+            "engine": p.get("engine"),
+            "event_type": p.get("event_type"),
+            "signal_source": p.get("signal_source"),
+            "mode": get_mode(),
+            "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""),
+            "pair": pair_of(p),
+            "direction": direction_of(p),
+            "entry": p.get("entry_mid") or p.get("entry_lo"),
+            "sl": p.get("sl"),
+            "tp1": p.get("tp1"),
+            "signal_time_wib": p.get("signal_time_wib"),
+        })
         paper_qty = None
         paper_notional = None
         if str(decision.get("decision")) == "ACCEPT":
@@ -2731,14 +2828,16 @@ def safe_ml_shadow_log(p: Dict[str, Any], decision: Dict[str, Any], response: Di
                     paper_notional = paper_notional_usdt_default()
                     paper_qty = paper_notional / entry_price
         append_jsonl(ML_DATASET_ROWS_LOG, {
-            "signal_key": signal_key_of(p), "sample_type": sample["sample_type"], "include_ml": sample["include_ml"], "include_reason": sample["include_reason"],
+            "signal_key": signal_key_of(p), "sample_type": sample.get("sample_type"), "include_ml": sample.get("include_ml"), "include_reason": sample.get("include_reason"),
             "pair": pair_of(p), "symbol": v010_normalize_symbol(p.get("symbol") or p.get("pair") or ""), "direction": direction_of(p),
-            "signal_time_wib": p.get("signal_time_wib"), "created_at_utc": now, "score": p.get("score"), "priority": p.get("priority"), "mode": get_mode(),
+            "signal_time_wib": sample.get("signal_time_wib") or p.get("signal_time_wib"), "created_at_utc": now, "score": p.get("score"), "priority": p.get("priority"), "mode": get_mode(),
             "setup_type": p.get("setup_type"), "risk_profile": p.get("risk_profile"), "config_version": p.get("config_version"), "source_mode": p.get("source_mode"),
-            "signal_source": p.get("signal_source"), "execution_decision": decision.get("decision"), "reject_gate": decision.get("gate"), "reject_reason": decision.get("reason"),
+            "signal_source": p.get("signal_source"), "source": p.get("source"), "engine": p.get("engine"), "event_type": p.get("event_type"),
+            "execution_decision": decision.get("decision"), "reject_gate": decision.get("gate"), "reject_reason": decision.get("reason"),
             "do_not_queue": decision_do_not_queue(decision), "entry": p.get("entry_mid") or p.get("entry_lo"), "sl": p.get("sl"), "tp1": p.get("tp1"), "tp2": p.get("tp2"), "tp3": p.get("tp3"),
             "paper_quantity": paper_qty, "paper_notional": paper_notional, "cost_gate_pass": response.get("cost_gate_pass"),
             "net_tp1_after_cost": response.get("net_tp1_after_cost"), "label_win": None, "label_target": None, "label_R": None, "outcome_status": "PENDING", **context,
+            "exclude_label_reason": sample.get("exclude_label_reason"), "confirmed_bucket_ms": sample.get("confirmed_bucket_ms"), "time_source": sample.get("time_source"),
         })
         if env_bool("ML_PREDICTION_ENABLED", True) and str(os.getenv("ML_PREDICTION_MODE", "SHADOW_ONLY")).upper() == "SHADOW_ONLY":
             pred = run_shadow_prediction(p, context if isinstance(context, dict) else {}, response, now)
@@ -2815,6 +2914,61 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _dataset_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    out = {"validation_sample": 0, "forward_shadow_paper": 0, "include_ml_true": 0, "include_ml_false": 0}
+    for row in rows:
+        sample_type = str(row.get("sample_type") or "").upper()
+        if sample_type == "VALIDATION_SAMPLE":
+            out["validation_sample"] += 1
+        if sample_type == "FORWARD_SHADOW_PAPER":
+            out["forward_shadow_paper"] += 1
+        if bool(row.get("include_ml")):
+            out["include_ml_true"] += 1
+        else:
+            out["include_ml_false"] += 1
+    return out
+
+
+def reclassify_ml_dataset_rows(dry_run: bool = True, backup: bool = True, limit: Optional[int] = None) -> Dict[str, Any]:
+    rows = _read_jsonl(ML_DATASET_ROWS_LOG)
+    before = _dataset_summary(rows)
+    out_rows: List[Dict[str, Any]] = []
+    changed_rows = 0
+    changed_examples: List[Dict[str, Any]] = []
+    max_rows = max(0, int(limit)) if limit is not None else None
+    for idx, row in enumerate(rows):
+        if max_rows is not None and idx >= max_rows:
+            out_rows.append(dict(row))
+            continue
+        old_row = dict(row)
+        new_row = ml_classify_dataset_row(row)
+        if old_row != new_row:
+            changed_rows += 1
+            if len(changed_examples) < 10:
+                changed_examples.append({
+                    "signal_key": new_row.get("signal_key"),
+                    "old_sample_type": old_row.get("sample_type"),
+                    "new_sample_type": new_row.get("sample_type"),
+                    "old_include_ml": old_row.get("include_ml"),
+                    "new_include_ml": new_row.get("include_ml"),
+                    "reason": new_row.get("include_reason") or new_row.get("exclude_label_reason"),
+                })
+        out_rows.append(new_row)
+    after = _dataset_summary(out_rows)
+    backup_path = None
+    if not dry_run:
+        ensure_dirs()
+        if backup and ML_DATASET_ROWS_LOG.exists():
+            stamp = utc_now().strftime("%Y%m%d%H%M%S")
+            backup_file = LOG_DIR / f"ml_dataset_rows.jsonl.bak_{stamp}"
+            ML_DATASET_ROWS_LOG.replace(backup_file)
+            backup_path = str(backup_file)
+        with ML_DATASET_ROWS_LOG.open("w", encoding="utf-8") as f:
+            for row in out_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return {"ok": True, "dry_run": dry_run, "total_rows": len(rows), "changed_rows": changed_rows, "before": before, "after": after, "changed_examples": changed_examples, "backup_path": backup_path}
+
+
 def _forward_window_hours() -> int:
     hrs = env_int("FORWARD_OUTCOME_WINDOW_HOURS", 24)
     if hrs <= 0:
@@ -2824,6 +2978,15 @@ def _forward_window_hours() -> int:
 
 
 def _signal_time_and_source(row: Dict[str, Any]) -> (Optional[int], str):
+    bucket = row.get("confirmed_bucket_ms")
+    if bucket is not None:
+        try:
+            return int(bucket), "signal_key_bucket_ms"
+        except Exception:
+            pass
+    key_bucket = _extract_signal_key_bucket_ms(row.get("signal_key") or row.get("signal_id"))
+    if key_bucket is not None:
+        return key_bucket, "signal_key_bucket_ms"
     dt_wib = parse_wib_flexible(row.get("signal_time_wib"))
     if dt_wib:
         return int(dt_wib.astimezone(timezone.utc).timestamp() * 1000), "signal_time_wib"
@@ -3059,6 +3222,21 @@ def ml_outcome_evaluate(
         return evaluate_forward_outcomes(limit=lim, force=force)
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/ml/dataset/reclassify")
+def ml_dataset_reclassify(
+    payload: Optional[MlDatasetReclassifyPayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    req = payload.model_dump(mode="json") if payload else {}
+    return reclassify_ml_dataset_rows(
+        dry_run=bool(req.get("dry_run", True)),
+        backup=bool(req.get("backup", True)),
+        limit=req.get("limit"),
+    )
 
 
 @app.get("/ml/outcome/latest")
