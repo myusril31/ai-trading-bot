@@ -1967,6 +1967,7 @@ def compute_cost_gate(plan: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
+    normalize_tp_plan(p)
     pair = pair_of(p)
     symbol = pair_to_binance_symbol(pair)
     direction = direction_of(p)
@@ -1998,6 +1999,11 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
+        "raw_tp1": p.get("raw_tp1"),
+        "raw_tp2": p.get("raw_tp2"),
+        "raw_tp3": p.get("raw_tp3"),
+        "tp_normalized": p.get("tp_normalized"),
+        "tp_normalize_reason": p.get("tp_normalize_reason"),
         "leverage": env_int("DEFAULT_LEVERAGE", 2),
         "margin_type": "ISOLATED",
         "quantity": None,
@@ -2061,6 +2067,54 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
         return False, f"cost_gate_failed:{cost.get('cost_gate_reason')}"
 
     return True, "execution_plan_valid"
+
+
+def normalize_tp_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+    direction = str(payload.get("direction") or payload.get("dir") or "").strip().upper()
+    if direction in ("BUY",):
+        direction = "LONG"
+    if direction in ("SELL",):
+        direction = "SHORT"
+    if direction not in ("LONG", "SHORT"):
+        return {"ok": False, "reason": "invalid_direction", "plan_invalid": True}
+
+    entry_mid = to_float_or_none(payload.get("entry_mid") or payload.get("entry") or payload.get("entry_price"))
+    sl = to_float_or_none(payload.get("sl") or payload.get("invalid"))
+    tp1 = to_float_or_none(payload.get("tp1"))
+    tp2 = to_float_or_none(payload.get("tp2"))
+    tp3 = to_float_or_none(payload.get("tp3"))
+    raw_tp1 = to_float_or_none(payload.get("raw_tp1"))
+    raw_tp2 = to_float_or_none(payload.get("raw_tp2"))
+    raw_tp3 = to_float_or_none(payload.get("raw_tp3"))
+    payload["raw_tp1"] = raw_tp1 if raw_tp1 is not None else tp1
+    payload["raw_tp2"] = raw_tp2 if raw_tp2 is not None else tp2
+    payload["raw_tp3"] = raw_tp3 if raw_tp3 is not None else tp3
+    if entry_mid is None or sl is None or tp1 is None or tp2 is None or tp3 is None:
+        return {"ok": False, "reason": "missing_entry_or_sl_or_tp", "plan_invalid": True}
+
+    if direction == "LONG":
+        if sl >= entry_mid:
+            return {"ok": False, "reason": "invalid_sl_side", "plan_invalid": True}
+        valid_tps = sorted([x for x in [tp1, tp2, tp3] if x > entry_mid])
+        if len(valid_tps) < 3:
+            return {"ok": False, "reason": "not_enough_valid_tps_after_normalization", "plan_invalid": True}
+        normalized = [valid_tps[0], valid_tps[1], valid_tps[2]]
+    else:
+        if sl <= entry_mid:
+            return {"ok": False, "reason": "invalid_sl_side", "plan_invalid": True}
+        valid_tps = sorted([x for x in [tp1, tp2, tp3] if x < entry_mid], reverse=True)
+        if len(valid_tps) < 3:
+            return {"ok": False, "reason": "not_enough_valid_tps_after_normalization", "plan_invalid": True}
+        normalized = [valid_tps[0], valid_tps[1], valid_tps[2]]
+
+    payload["tp1"] = normalized[0]
+    payload["tp2"] = normalized[1]
+    payload["tp3"] = normalized[2]
+    was_normalized = not (tp1 == payload["tp1"] and tp2 == payload["tp2"] and tp3 == payload["tp3"])
+    previous_normalized = bool(payload.get("tp_normalized"))
+    payload["tp_normalized"] = bool(previous_normalized or was_normalized)
+    payload["tp_normalize_reason"] = "tp_order_resequenced" if payload["tp_normalized"] else None
+    return {"ok": True, "reason": "ok", "plan_invalid": False}
 
 
 def live_binance_key_detected() -> bool:
@@ -3466,6 +3520,18 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             fire_and_forget_ml_shadow_log(p, decision, response, state)
             return response
 
+        normalize_res = normalize_tp_plan(p)
+        p["plan_sanity_ok"] = bool(normalize_res.get("ok"))
+        p["plan_sanity_reason"] = normalize_res.get("reason")
+        p["plan_invalid"] = bool(normalize_res.get("plan_invalid"))
+        if not bool(normalize_res.get("ok")):
+            decision = {"decision": "REJECT", "reason": normalize_res.get("reason"), "gate": "plan_sanity_gate"}
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+            notify_signal_decision_async(p, decision)
+            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode, "plan_sanity_ok": False, "plan_sanity_reason": normalize_res.get("reason"), "plan_invalid": True}
+            fire_and_forget_ml_shadow_log(p, decision, response, state)
+            return response
+
         if current_execution_mode == "LIVE_SMALL_CAPITAL":
             safety = v014_safety_summary(symbol=pair_to_binance_symbol(pair_of(p)), ignore_signal_key=signal_key_of(p))
             if not bool(safety.get("safe_to_continue")):
@@ -3519,6 +3585,12 @@ def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
     p["source"] = "VPS_SMC"
     p["source_mode"] = "VPS_SMC_PRIMARY"
     p["execution_owner"] = "VPS_SMC"
+    if not (
+        ("plan_sanity_ok" in p)
+        and ("tp_normalized" in p)
+        and ("raw_tp1" in p or "raw_tp2" in p or "raw_tp3" in p)
+    ):
+        normalize_tp_plan(p)
     return _process_signal_pipeline(p)
 
 

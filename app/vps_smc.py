@@ -188,6 +188,32 @@ def _normalize_direction(raw: Any) -> Optional[str]:
     return None
 
 
+def _normalize_tps(direction: str, entry_mid: Any, sl: Any, tp1: Any, tp2: Any, tp3: Any) -> Dict[str, Any]:
+    d = str(direction or "").strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return {"ok": False, "reason": "invalid_direction", "plan_invalid": True}
+    try:
+        e = float(entry_mid)
+        s = float(sl)
+        t1 = float(tp1)
+        t2 = float(tp2)
+        t3 = float(tp3)
+    except Exception:
+        return {"ok": False, "reason": "missing_entry_or_sl_or_tp", "plan_invalid": True}
+    if d == "LONG":
+        if s >= e:
+            return {"ok": False, "reason": "invalid_sl_side", "plan_invalid": True}
+        sorted_tps = sorted([x for x in [t1, t2, t3] if x > e])
+    else:
+        if s <= e:
+            return {"ok": False, "reason": "invalid_sl_side", "plan_invalid": True}
+        sorted_tps = sorted([x for x in [t1, t2, t3] if x < e], reverse=True)
+    if len(sorted_tps) < 3:
+        return {"ok": False, "reason": "not_enough_valid_tps_after_normalization", "plan_invalid": True}
+    was_normalized = not (t1 == sorted_tps[0] and t2 == sorted_tps[1] and t3 == sorted_tps[2])
+    return {"ok": True, "reason": "ok", "plan_invalid": False, "tp1": sorted_tps[0], "tp2": sorted_tps[1], "tp3": sorted_tps[2], "raw_tp1": t1, "raw_tp2": t2, "raw_tp3": t3, "tp_normalized": was_normalized, "tp_normalize_reason": ("tp_order_resequenced" if was_normalized else None)}
+
+
 def _candles_file(symbol: str, interval: str) -> Path:
     return _market_data_dir() / f"{symbol}_{interval}.jsonl"
 
@@ -1141,6 +1167,18 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         poi = stageb.get("stageb_fvg_poi") or {}
         reclaim = stageb.get("stageb_reclaim") or {}
         liq_ctx = result.get("liq_ctx") or {}
+        tp_norm = _normalize_tps(
+            direction,
+            plan.get("entry_mid"),
+            plan.get("sl"),
+            plan.get("tp1"),
+            plan.get("tp2"),
+            plan.get("tp3"),
+        )
+        if bool(tp_norm.get("ok")):
+            plan["tp1"] = tp_norm.get("tp1")
+            plan["tp2"] = tp_norm.get("tp2")
+            plan["tp3"] = tp_norm.get("tp3")
         signal_row = {
             "signal_key": signal_key, "signal_source": "VPS_SMC", "source_mode": "SHADOW_ONLY", "candidate_only": True,
             "symbol": result.get("symbol"), "pair": f"BINANCE:{str(result.get('symbol') or '').upper()}.P", "direction": direction, "state": "CONFIRMED", "mode": "SHADOW_ONLY",
@@ -1152,6 +1190,9 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "fvg_lo": poi.get("fvg_lo"), "fvg_hi": poi.get("fvg_hi"), "entry_lo": plan.get("entry_lo"), "entry_hi": plan.get("entry_hi"),
             "entry_mid": plan.get("entry_mid"), "sl": plan.get("sl"), "invalid": plan.get("invalid"), "tp1": plan.get("tp1"),
             "tp2": plan.get("tp2"), "tp3": plan.get("tp3"), "rr_tp2": plan.get("rr_tp2"), "notes": ",".join(score_detail.get("reasons") or []),
+            "raw_tp1": tp_norm.get("raw_tp1"), "raw_tp2": tp_norm.get("raw_tp2"), "raw_tp3": tp_norm.get("raw_tp3"),
+            "tp_normalized": tp_norm.get("tp_normalized"), "tp_normalize_reason": tp_norm.get("tp_normalize_reason"),
+            "plan_sanity_ok": tp_norm.get("ok"), "plan_sanity_reason": tp_norm.get("reason"), "plan_invalid": tp_norm.get("plan_invalid"),
             "created_at_utc": _utc_now_iso(),
         }
         _append_jsonl(_log_dir() / "vps_smc_shadow_signals.jsonl", signal_row)
@@ -1188,6 +1229,14 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "tp1": plan.get("tp1"),
                 "tp2": plan.get("tp2"),
                 "tp3": plan.get("tp3"),
+                "raw_tp1": tp_norm.get("raw_tp1"),
+                "raw_tp2": tp_norm.get("raw_tp2"),
+                "raw_tp3": tp_norm.get("raw_tp3"),
+                "tp_normalized": tp_norm.get("tp_normalized"),
+                "tp_normalize_reason": tp_norm.get("tp_normalize_reason"),
+                "plan_sanity_ok": tp_norm.get("ok"),
+                "plan_sanity_reason": tp_norm.get("reason"),
+                "plan_invalid": tp_norm.get("plan_invalid"),
                 "score": score_detail.get("score"),
                 "priority": score_detail.get("priority"),
                 "confirmed_bucket_ms": bucket_ms,
@@ -1327,8 +1376,14 @@ def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: st
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     header_now_written = bool(header_already_written)
-    if create_header and not header_now_written:
-        if rows:
+    if create_header:
+        probe = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1:ZZ1",
+        ).execute()
+        existing = probe.get("values") or []
+        existing_header = existing[0] if existing else []
+        if not existing_header:
             service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=f"{sheet_name}!A1",
@@ -1337,20 +1392,15 @@ def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: st
                 body={"values": [header]},
             ).execute()
             header_now_written = True
-        else:
-            probe = service.spreadsheets().values().get(
+        elif existing_header != header:
+            service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A1:Z1",
+                range=f"{sheet_name}!A1",
+                valueInputOption="RAW",
+                body={"values": [header]},
             ).execute()
-            existing = probe.get("values") or []
-            if not existing:
-                service.spreadsheets().values().append(
-                    spreadsheetId=spreadsheet_id,
-                    range=f"{sheet_name}!A1",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": [header]},
-                ).execute()
+            header_now_written = True
+        else:
             header_now_written = True
 
     if rows:
@@ -1386,7 +1436,7 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
         _append_jsonl(_log_dir() / "vps_smc_errors.jsonl", {"created_at_utc": _utc_now_iso(), "error": reason})
         return {"ok": _env_bool("VPS_SMC_GSHEET_FAIL_OPEN", True), "enabled": True, "target": target_u, "spreadsheet_id": spreadsheet_id or None, "counts": counts, "reason": reason}
 
-    shadow_header = ["created_at_utc","signal_key","symbol","direction","state","score","priority","risk_mult","source_mode","candidate_only","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","tp1","tp2","tp3","rr_tp2","notes"]
+    shadow_header = ["created_at_utc","signal_key","symbol","direction","state","score","priority","risk_mult","source_mode","candidate_only","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","raw_tp1","raw_tp2","raw_tp3","tp1","tp2","tp3","tp_normalized","tp_normalize_reason","rr_tp2","plan_sanity_ok","plan_sanity_reason","plan_invalid","notes"]
     compare_header = ["created_at_utc","lookback_minutes","symbol","classification","app_signal_key","app_direction","app_decision","app_created_at_utc","vps_signal_key","vps_direction","vps_score","vps_priority","vps_created_at_utc","reason","compare_key"]
     shadow_rows=[]; compare_rows=[]
     try:
