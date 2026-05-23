@@ -573,17 +573,28 @@ def market_collector_main(symbols: List[str], intervals: List[str]) -> None:
 
 def operator_status_payload(symbol: str = "") -> Dict[str, Any]:
     safety = v014_safety_summary(symbol)
+    scheduler_status = vps_smc.scheduler_status()
+    verdict = "GO" if bool(safety.get("safe_to_continue")) and execution_mode() == "LIVE_SMALL_CAPITAL" else "NO_GO"
     return {
         "ok": safety.get("ok"),
         "mode": get_mode(),
         "execution_mode": safety.get("execution_mode"),
         "binance_env": safety.get("binance_env"),
+        "signal_source_mode": signal_source_mode(),
+        "apps_script_signal_mode": apps_script_signal_mode(),
+        "vps_smc_execution_enabled": env_bool("VPS_SMC_EXECUTION_ENABLED", False),
+        "live_trading_enabled": env_bool("LIVE_TRADING_ENABLED", False),
+        "live_go_confirm": env_bool("LIVE_GO_CONFIRM", False),
         "safe_to_continue": safety.get("safe_to_continue"),
         "mismatch_state": safety.get("mismatch_state"),
         "open_paper_positions": safety.get("open_paper_positions"),
         "symbol": safety.get("symbol"),
         "positionAmt": safety.get("positionAmt"),
         "open_algo_count": safety.get("open_algo_count"),
+        "scheduler_status": scheduler_status,
+        "candle_websocket_status": {"connected": MARKET_WS_CONNECTED, "bootstrap_done": MARKET_BOOTSTRAP_DONE, "last_error": MARKET_LAST_ERROR},
+        "last_vps_smc_error": scheduler_status.get("last_error"),
+        "final_verdict": verdict,
         "reasons": safety.get("reasons") or [],
         "timestamp_utc": safety.get("timestamp_utc"),
     }
@@ -617,6 +628,21 @@ def decision_do_not_queue(decision: Dict[str, Any]) -> bool:
 def format_signal_decision_message(p: Dict[str, Any], decision: Dict[str, Any]) -> str:
     score = p.get("score")
     priority = p.get("priority")
+    if str(p.get("signal_source") or "").upper() == "VPS_SMC":
+        return "\n".join([
+            "📡 VPS SMC REALTIME SIGNAL",
+            "Source: VPS_BINANCE_REALTIME",
+            f"Execution Owner: {p.get('execution_owner') or '-'}",
+            f"Mode: {execution_mode()}",
+            f"Decision: {decision.get('decision')}",
+            f"Gate: {decision.get('gate')}",
+            f"Reason: {decision.get('reason')}",
+            f"Pair: {pair_of(p) or '-'}",
+            f"Dir: {direction_of(p) or '-'}",
+            f"Entry: {p.get('entry') or p.get('entry_mid') or '-'}",
+            f"SL: {p.get('sl') or '-'}",
+            f"TP1/TP2/TP3: {p.get('tp1') or '-'} / {p.get('tp2') or '-'} / {p.get('tp3') or '-'}",
+        ])
     return "\n".join([
         "📡 SIGNAL DECISION",
         f"Pair: {pair_of(p) or '-'}",
@@ -660,6 +686,31 @@ def signal_source_mode() -> str:
 
 def apps_script_signal_mode() -> str:
     return str(os.getenv("APPS_SCRIPT_SIGNAL_MODE", "PRIMARY_EXECUTION")).strip().upper() or "PRIMARY_EXECUTION"
+
+def canonical_pair_from_symbol(symbol: str) -> str:
+    sym = v010_normalize_symbol(symbol)
+    return f"BINANCE:{sym}.P" if sym else ""
+
+
+def pair_allowlist_candidates(pair: str) -> list[str]:
+    p = normalize_pair(pair)
+    sym = v010_normalize_symbol(p)
+    cands = []
+    if p:
+        cands.append(p)
+    cp = canonical_pair_from_symbol(sym)
+    if cp and cp not in cands:
+        cands.append(cp)
+    if sym and sym not in cands:
+        cands.append(sym)
+    return cands
+
+
+def vps_smc_bridge_enabled_for_mode(mode: str) -> bool:
+    mode = str(mode or "").upper()
+    if mode in ("DISABLED", "PAPER", "TESTNET", "TESTNET_DRY_RUN", "TESTNET_ORDER_TEST", "TESTNET_MARKET", "LIVE_SMALL_CAPITAL"):
+        return True
+    return False
 
 
 def verify_secret(x_signal_secret: Optional[str], x_webhook_secret: Optional[str]) -> None:
@@ -1238,7 +1289,7 @@ def paper_decide(p: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     if allowlist_enabled:
         if not allowlist:
             return make_reject("pair_allowlist_empty", "allowlist_gate")
-        if pair not in allowlist:
+        if not any(c in allowlist for c in pair_allowlist_candidates(pair)):
             return make_reject(f"pair_not_allowlisted:{pair}", "allowlist_gate")
 
     # 4A) kill switch
@@ -3337,7 +3388,7 @@ def webhook_signal(
         p["engine"] = p.get("engine") or "INST"
         p["source_mode"] = "BACKUP_COMPARE_ONLY"
         p["execution_owner"] = "NONE"
-        decision = {"decision": "BACKUP_ONLY", "reason": "source_not_primary", "gate": "source_gate"}
+        decision = {"decision": "BACKUP_ONLY", "reason": "SOURCE_NOT_PRIMARY", "gate": "source_gate"}
         with LOCK:
             append_jsonl(SIGNALS_LOG, build_signal_log(p))
             state = load_state()
@@ -3370,8 +3421,8 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             }
             fire_and_forget_ml_shadow_log(p, decision, response, state)
             return response
-        if (source == "VPS_SMC" or execution_owner == "VPS_SMC") and execution_mode() not in ("DISABLED", "PAPER"):
-            decision = {"decision": "REJECT", "reason": "vps_smc_bridge_mode_not_allowed_in_p0", "gate": "vps_smc_bridge_mode_gate"}
+        if (source == "VPS_SMC" or execution_owner == "VPS_SMC") and not vps_smc_bridge_enabled_for_mode(execution_mode()):
+            decision = {"decision": "REJECT", "reason": "vps_smc_bridge_mode_not_enabled", "gate": "vps_smc_bridge_mode_gate"}
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
             notify_signal_decision_async(p, decision)
             response = {
@@ -5492,28 +5543,79 @@ def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[s
     recon = v014_reconcile_state(symbol=symbol, ignore_signal_key=ignore_signal_key)
     open_paper_positions = len(v014_open_paper_positions_for_symbol(symbol, ignore_signal_key=ignore_signal_key)) if symbol else open_paper_count(load_state())
     reasons = list(recon.get("reasons") or [])
-    live_key_detected = live_binance_key_detected()
-    if binance_env() != "TESTNET":
-        reasons.append("binance_env_not_testnet")
-    if live_key_detected:
-        reasons.append("live_key_detected")
-    if execution_mode() in ("LIVE", "PROD", "MAINNET"):
-        reasons.append(f"execution_mode_not_allowed:{execution_mode()}")
-    if env_bool("TESTNET_KILL_SWITCH", False):
-        reasons.append("testnet_kill_switch_active")
 
-    safe_to_continue = (
-        binance_env() == "TESTNET"
-        and not live_key_detected
-        and execution_mode() not in ("LIVE", "PROD", "MAINNET")
-        and not env_bool("TESTNET_KILL_SWITCH", False)
-        and recon.get("mismatch_state") == "CLEAN"
-        and open_paper_positions == 0
-    )
+    mode = execution_mode()
+    env = binance_env()
+    live_key_detected = live_binance_key_detected()
+    signal_mode = signal_source_mode()
+    app_mode = apps_script_signal_mode()
+    vps_exec_enabled = env_bool("VPS_SMC_EXECUTION_ENABLED", False)
+    competitor_mode = str(os.getenv("VPS_SMC_COMPETITOR_MODE", "")).strip().upper()
+
+    if mode in ("LIVE", "PROD", "MAINNET"):
+        reasons.append(f"execution_mode_not_allowed:{mode}")
+
+    if mode == "LIVE_SMALL_CAPITAL":
+        if env != "LIVE":
+            reasons.append("binance_env_not_live")
+        if not env_bool("LIVE_GO_CONFIRM", False):
+            reasons.append("live_go_confirm_missing")
+        if not env_bool("LIVE_TRADING_ENABLED", False):
+            reasons.append("live_trading_not_enabled")
+        if not live_key_detected:
+            reasons.append("live_key_missing")
+        if signal_mode != "VPS_SMC_PRIMARY":
+            reasons.append("signal_source_mode_not_vps_smc_primary")
+        if app_mode != "BACKUP_COMPARE_ONLY":
+            reasons.append("apps_script_signal_mode_not_backup_compare_only")
+        if not vps_exec_enabled:
+            reasons.append("vps_smc_execution_disabled")
+        if competitor_mode != "PRODUCTION_SIGNAL":
+            reasons.append("vps_smc_competitor_mode_not_production_signal")
+        if env_bool("TESTNET_KILL_SWITCH", False):
+            reasons.append("testnet_kill_switch_active")
+        if env_bool("EMERGENCY_CLOSE_ENABLED", False):
+            reasons.append("emergency_close_enabled")
+        if env_bool("KILL_SWITCH", False):
+            reasons.append("kill_switch_active")
+
+        safe_to_continue = (
+            env == "LIVE"
+            and mode == "LIVE_SMALL_CAPITAL"
+            and env_bool("LIVE_TRADING_ENABLED", False)
+            and env_bool("LIVE_GO_CONFIRM", False)
+            and live_key_detected
+            and signal_mode == "VPS_SMC_PRIMARY"
+            and app_mode == "BACKUP_COMPARE_ONLY"
+            and vps_exec_enabled
+            and competitor_mode == "PRODUCTION_SIGNAL"
+            and not env_bool("TESTNET_KILL_SWITCH", False)
+            and not env_bool("EMERGENCY_CLOSE_ENABLED", False)
+            and not env_bool("KILL_SWITCH", False)
+            and recon.get("mismatch_state") == "CLEAN"
+            and open_paper_positions == 0
+        )
+    else:
+        if env != "TESTNET":
+            reasons.append("binance_env_not_testnet")
+        if live_key_detected:
+            reasons.append("live_key_detected")
+        if env_bool("TESTNET_KILL_SWITCH", False):
+            reasons.append("testnet_kill_switch_active")
+
+        safe_to_continue = (
+            env == "TESTNET"
+            and not live_key_detected
+            and mode not in ("LIVE", "PROD", "MAINNET")
+            and not env_bool("TESTNET_KILL_SWITCH", False)
+            and recon.get("mismatch_state") == "CLEAN"
+            and open_paper_positions == 0
+        )
+
     return {
         "ok": bool(recon.get("ok")),
-        "execution_mode": execution_mode(),
-        "binance_env": binance_env(),
+        "execution_mode": mode,
+        "binance_env": env,
         "enable_testnet_orders": env_bool("ENABLE_TESTNET_ORDERS", False),
         "order_test_endpoint_only": env_bool("ORDER_TEST_ENDPOINT_ONLY", True),
         "testnet_kill_switch": env_bool("TESTNET_KILL_SWITCH", False),
