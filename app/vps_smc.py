@@ -115,8 +115,8 @@ def _default_state() -> Dict[str, Any]:
         "last_scheduler_run_utc": None,
         "last_scheduler_status": "IDLE",
         "last_scheduler_error": None,
-        "gsheet_mirrored_keys": {"shadow": {}, "compare": {}},
-        "gsheet_headers_written": {"shadow": False, "compare": False},
+        "gsheet_mirrored_keys": {"shadow": {}, "compare": {}, "outcomes": {}},
+        "gsheet_headers_written": {"shadow": False, "compare": False, "outcomes": False},
         "scheduler_running": False,
         "logged_signal_keys": {},
         "updated_at_utc": _utc_now_iso(),
@@ -1377,7 +1377,32 @@ def _read_latest(path: Path, limit: int) -> List[Dict[str, Any]]:
     return rows[-take:]
 
 
-def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: str, header: List[str], rows: List[List[Any]], create_header: bool, header_already_written: bool) -> bool:
+def _row_timestamp_value(row: Dict[str, Any]) -> tuple:
+    for key in ("updated_at_utc", "evaluated_at_utc", "created_at_utc"):
+        dt = _parse_iso_utc(row.get(key))
+        if dt is not None:
+            return (1, dt.timestamp())
+    return (0, 0.0)
+
+
+def _read_latest_outcomes(path: Path, limit: int) -> List[Dict[str, Any]]:
+    rows = _read_jsonl(path)
+    latest_by_key: Dict[str, Dict[str, Any]] = {}
+    latest_rank: Dict[str, tuple] = {}
+    for idx, row in enumerate(rows):
+        key = str(row.get("signal_key") or "").strip()
+        if not key:
+            continue
+        rank = (*_row_timestamp_value(row), idx)
+        if key not in latest_rank or rank >= latest_rank[key]:
+            latest_by_key[key] = row
+            latest_rank[key] = rank
+    deduped = sorted(latest_by_key.values(), key=lambda r: (*_row_timestamp_value(r), str(r.get("signal_key") or "")))
+    take = max(1, min(int(limit or 100), _env_int("VPS_SMC_GSHEET_MAX_ROWS_PER_RUN", 100)))
+    return deduped[-take:]
+
+
+def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: str, header: List[str], rows: List[List[Any]], create_header: bool, header_already_written: bool, clear_on_header_change: bool = False) -> bool:
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
 
@@ -1403,12 +1428,26 @@ def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: st
             ).execute()
             header_now_written = True
         elif existing_header != header:
-            service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A1",
-                valueInputOption="RAW",
-                body={"values": [header]},
-            ).execute()
+            if clear_on_header_change:
+                service.spreadsheets().values().clear(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{sheet_name}!A:ZZ",
+                    body={},
+                ).execute()
+                service.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{sheet_name}!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [header]},
+                ).execute()
+            else:
+                service.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{sheet_name}!A1",
+                    valueInputOption="RAW",
+                    body={"values": [header]},
+                ).execute()
             header_now_written = True
         else:
             header_now_written = True
@@ -1424,17 +1463,37 @@ def _sheet_append(spreadsheet_id: str, service_account_file: str, sheet_name: st
     return header_now_written
 
 
+def _sheet_header_matches(spreadsheet_id: str, service_account_file: str, sheet_name: str, header: List[str]) -> bool:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    probe = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A1:ZZ1",
+    ).execute()
+    existing = probe.get("values") or []
+    existing_header = existing[0] if existing else []
+    if not existing_header:
+        return True
+    return existing_header == header
+
+
 def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = False) -> Dict[str, Any]:
     target_u = str(target or "ALL").strip().upper()
     enabled = _env_bool("VPS_SMC_GSHEET_MIRROR_ENABLED", False)
-    counts = {"shadow_candidates_seen": 0, "shadow_candidates_written": 0, "compare_rows_seen": 0, "compare_rows_written": 0, "skipped_duplicate": 0, "errors": 0}
+    counts = {"shadow_candidates_seen": 0, "shadow_candidates_written": 0, "compare_rows_seen": 0, "compare_rows_written": 0, "outcomes_seen": 0, "outcomes_latest": 0, "outcomes_written": 0, "skipped_duplicate": 0, "errors": 0}
     state = _load_state()
-    mirrored = state.get("gsheet_mirrored_keys") if isinstance(state.get("gsheet_mirrored_keys"), dict) else {"shadow": {}, "compare": {}}
+    mirrored = state.get("gsheet_mirrored_keys") if isinstance(state.get("gsheet_mirrored_keys"), dict) else {"shadow": {}, "compare": {}, "outcomes": {}}
     mirrored.setdefault("shadow", {})
     mirrored.setdefault("compare", {})
-    headers_written = state.get("gsheet_headers_written") if isinstance(state.get("gsheet_headers_written"), dict) else {"shadow": False, "compare": False}
+    mirrored.setdefault("outcomes", {})
+    headers_written = state.get("gsheet_headers_written") if isinstance(state.get("gsheet_headers_written"), dict) else {"shadow": False, "compare": False, "outcomes": False}
     headers_written.setdefault("shadow", False)
     headers_written.setdefault("compare", False)
+    headers_written.setdefault("outcomes", False)
     spreadsheet_id = _gspreadsheet_id()
 
     if not enabled:
@@ -1448,7 +1507,8 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
 
     shadow_header = ["created_at_utc","source","signal_source","source_mode","signal_key","pair","symbol","direction","state","score","priority","risk_mult","candidate_only","signal_time_wib","confirmed_bucket_ms","htf_bias","htf_location","htf_structure","structure_15m","sweep_tag","entry_lo","entry_hi","entry_mid","sl","raw_tp1","raw_tp2","raw_tp3","tp1","tp2","tp3","tp_normalized","tp_normalize_reason","rr_tp2","plan_sanity_ok","plan_sanity_reason","plan_invalid","notes"]
     compare_header = ["created_at_utc","lookback_minutes","symbol","classification","app_signal_key","app_direction","app_decision","app_created_at_utc","vps_signal_key","vps_direction","vps_score","vps_priority","vps_created_at_utc","reason","compare_key"]
-    shadow_rows=[]; compare_rows=[]
+    outcome_header = ["created_at_utc","evaluated_at_utc","updated_at_utc","signal_key","pair","symbol","direction","signal_time_wib","entry","sl","tp1","tp2","tp3","outcome_status","label_target","label_win","label_R","include_ml_label","exclude_label_reason","first_hit","hit_time_utc","hit_time_wib","bars_to_hit","max_favorable_r","max_adverse_r","data_gap","open_end","notes"]
+    shadow_rows=[]; compare_rows=[]; outcome_rows=[]
     try:
         if target_u in ("ALL","SHADOW_SIGNALS"):
             for r in _read_latest(_log_dir()/"vps_smc_shadow_signals.jsonl", limit):
@@ -1468,16 +1528,35 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
                     counts["skipped_duplicate"] += 1; continue
                 compare_rows.append([r.get(k) for k in compare_header])
                 if key: mirrored["compare"][key]=_utc_now_iso()
+        if target_u in ("ALL", "OUTCOMES"):
+            raw_outcomes = _read_jsonl(_log_dir()/"forward_outcomes.jsonl")
+            counts["outcomes_seen"] = len(raw_outcomes)
+            latest_rows = _read_latest_outcomes(_log_dir()/"forward_outcomes.jsonl", limit)
+            counts["outcomes_latest"] = len(latest_rows)
+            for r in latest_rows:
+                signal_key = str(r.get("signal_key") or "").strip()
+                ts = str(r.get("updated_at_utc") or r.get("evaluated_at_utc") or r.get("created_at_utc") or "").strip()
+                key = f"{signal_key}|{ts}" if signal_key else ""
+                if key and (not force) and key in mirrored["outcomes"]:
+                    counts["skipped_duplicate"] += 1
+                    continue
+                outcome_rows.append([r.get(k) for k in outcome_header])
+                if key:
+                    mirrored["outcomes"][key] = _utc_now_iso()
 
         if target_u in ("ALL", "SHADOW_SIGNALS"):
+            shadow_sheet_name = _env_str("VPS_SMC_GSHEET_SHADOW_SHEET_NAME", "VPS_SMC_SHADOW_SIGNALS")
+            if _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True) and not _sheet_header_matches(spreadsheet_id, service_account_file, shadow_sheet_name, shadow_header):
+                mirrored["shadow"] = {}
             headers_written["shadow"] = _sheet_append(
                 spreadsheet_id,
                 service_account_file,
-                _env_str("VPS_SMC_GSHEET_SHADOW_SHEET_NAME", "VPS_SMC_SHADOW_SIGNALS"),
+                shadow_sheet_name,
                 shadow_header,
                 shadow_rows,
                 _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True),
                 bool(headers_written.get("shadow", False)),
+                clear_on_header_change=True,
             )
         if target_u in ("ALL", "COMPARE"):
             headers_written["compare"] = _sheet_append(
@@ -1489,8 +1568,23 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
                 _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True),
                 bool(headers_written.get("compare", False)),
             )
+        if target_u in ("ALL", "OUTCOMES"):
+            outcome_sheet_name = _env_str("VPS_SMC_GSHEET_OUTCOME_SHEET_NAME", "FORWARD_OUTCOMES")
+            if _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True) and not _sheet_header_matches(spreadsheet_id, service_account_file, outcome_sheet_name, outcome_header):
+                mirrored["outcomes"] = {}
+            headers_written["outcomes"] = _sheet_append(
+                spreadsheet_id,
+                service_account_file,
+                outcome_sheet_name,
+                outcome_header,
+                outcome_rows,
+                _env_bool("VPS_SMC_GSHEET_CREATE_HEADER", True),
+                bool(headers_written.get("outcomes", False)),
+                clear_on_header_change=True,
+            )
         counts["shadow_candidates_written"] = len(shadow_rows)
         counts["compare_rows_written"] = len(compare_rows)
+        counts["outcomes_written"] = len(outcome_rows)
         state["gsheet_mirrored_keys"] = mirrored
         state["gsheet_headers_written"] = headers_written
         state["last_gsheet_mirror_utc"] = _utc_now_iso()
