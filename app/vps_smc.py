@@ -838,6 +838,17 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
     out["selected_sweep_level"] = None
     out["selected_sweep_extreme"] = None
     out["selected_sweep_t"] = None
+    entry_sweep = result.get("entry_sweep") or {}
+    if direction == "LONG":
+        out["selected_sweep_tag"] = "SWEEP_LOW"
+        out["selected_sweep_level"] = entry_sweep.get("bullish_sweep_level")
+        out["selected_sweep_extreme"] = entry_sweep.get("bullish_sweep_extreme")
+        out["selected_sweep_t"] = entry_sweep.get("bullish_sweep_t")
+    elif direction == "SHORT":
+        out["selected_sweep_tag"] = "SWEEP_HIGH"
+        out["selected_sweep_level"] = entry_sweep.get("bearish_sweep_level")
+        out["selected_sweep_extreme"] = entry_sweep.get("bearish_sweep_extreme")
+        out["selected_sweep_t"] = entry_sweep.get("bearish_sweep_t")
 
     if context_status in ("DATA_GAP", "HTF_DATA_GAP", "ERROR"):
         out["stageb_invalid_reason"] = "context_not_ready"
@@ -871,17 +882,6 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
     fvg_lookback = _env_int("VPS_SMC_FVG_LOOKBACK_BARS_5M", 35)
 
     liq_ctx = result.get("liq_ctx") or {}
-    entry_sweep = result.get("entry_sweep") or {}
-    if direction == "LONG":
-        out["selected_sweep_tag"] = "SWEEP_LOW"
-        out["selected_sweep_level"] = entry_sweep.get("bullish_sweep_level")
-        out["selected_sweep_extreme"] = entry_sweep.get("bullish_sweep_extreme")
-        out["selected_sweep_t"] = entry_sweep.get("bullish_sweep_t")
-    elif direction == "SHORT":
-        out["selected_sweep_tag"] = "SWEEP_HIGH"
-        out["selected_sweep_level"] = entry_sweep.get("bearish_sweep_level")
-        out["selected_sweep_extreme"] = entry_sweep.get("bearish_sweep_extreme")
-        out["selected_sweep_t"] = entry_sweep.get("bearish_sweep_t")
 
     # Existing confirmed state: keep stable, dedup will use confirmed_t.
     if active_state == "CONFIRMED":
