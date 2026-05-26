@@ -325,16 +325,35 @@ def detect_sweep(candles: List[Dict[str, Any]], swing_summary: Dict[str, Any], s
         "sweep_extreme": None,
         "sweep_t": None,
         "sweep_tag": None,
+        "bullish_sweep_level": None,
+        "bullish_sweep_extreme": None,
+        "bullish_sweep_t": None,
+        "bullish_sweep_tag": None,
+        "bearish_sweep_level": None,
+        "bearish_sweep_extreme": None,
+        "bearish_sweep_t": None,
+        "bearish_sweep_tag": None,
+        "mixed_sweep_detected": False,
+        "selected_direction": "NONE",
+        "selected_direction_reason": "no_sweep_direction",
+        "selected_sweep_level": None,
+        "selected_sweep_extreme": None,
+        "selected_sweep_t": None,
+        "selected_sweep_tag": None,
     }
     if not candles:
         return out
     scan = candles[-max(1, scan_n):]
     last_low = swing_summary.get("last_swing_low")
     last_high = swing_summary.get("last_swing_high")
+    bullish_hit: Optional[Dict[str, Any]] = None
+    bearish_hit: Optional[Dict[str, Any]] = None
     if last_low is not None:
         for c in reversed(scan):
             if float(c["l"]) < float(last_low) and float(c["c"]) > float(last_low):
+                bullish_hit = {"direction": "LONG", "sweep_level": float(last_low), "sweep_extreme": float(c["l"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_LOW"}
                 out.update({"bullish_sweep": True, "sweep_level": float(last_low), "sweep_extreme": float(c["l"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_LOW"})
+                out.update({"bullish_sweep_level": float(last_low), "bullish_sweep_extreme": float(c["l"]), "bullish_sweep_t": c["t"], "bullish_sweep_tag": "SWEEP_LOW"})
                 break
     if last_high is not None:
         for c in reversed(scan):
@@ -342,7 +361,10 @@ def detect_sweep(candles: List[Dict[str, Any]], swing_summary: Dict[str, Any], s
                 if not out["bullish_sweep"]:
                     out.update({"sweep_level": float(last_high), "sweep_extreme": float(c["h"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_HIGH"})
                 out["bearish_sweep"] = True
+                bearish_hit = {"direction": "SHORT", "sweep_level": float(last_high), "sweep_extreme": float(c["h"]), "sweep_t": c["t"], "sweep_tag": "SWEEP_HIGH"}
+                out.update({"bearish_sweep_level": float(last_high), "bearish_sweep_extreme": float(c["h"]), "bearish_sweep_t": c["t"], "bearish_sweep_tag": "SWEEP_HIGH"})
                 break
+    out["mixed_sweep_detected"] = bool(out["bullish_sweep"] and out["bearish_sweep"])
     return out
 
 
@@ -771,19 +793,27 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
 
 def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     sweep = (context or {}).get("entry_sweep") or {}
+    htf_gate = (context or {}).get("htf_gate") or {}
+    htf_bias = str(htf_gate.get("htf_bias") or htf_gate.get("htf_dir") or "").upper()
+    if htf_bias in ("BULLISH", "BULL", "LONG"):
+        return {"stageb_direction": "LONG", "direction_reason": "htf_bias_bullish"}
+    if htf_bias in ("BEARISH", "BEAR", "SHORT"):
+        return {"stageb_direction": "SHORT", "direction_reason": "htf_bias_bearish"}
     bullish = bool(sweep.get("bullish_sweep"))
     bearish = bool(sweep.get("bearish_sweep"))
-    direction = "NONE"
-    reason = "no_sweep_direction"
+    direction = "NONE"; reason = "no_sweep_direction"
     if bullish and bearish:
-        direction = "MIXED"
-        reason = "mixed_sweep_direction"
+        try:
+            b_t = int(sweep.get("bullish_sweep_t"))
+            s_t = int(sweep.get("bearish_sweep_t"))
+        except Exception:
+            b_t, s_t = 0, 0
+        direction = "LONG" if b_t >= s_t else "SHORT"
+        reason = "latest_directional_sweep_fallback"
     elif bullish:
-        direction = "LONG"
-        reason = "bullish_sweep"
+        direction = "LONG"; reason = "bullish_sweep"
     elif bearish:
-        direction = "SHORT"
-        reason = "bearish_sweep"
+        direction = "SHORT"; reason = "bearish_sweep"
     return {"stageb_direction": direction, "direction_reason": reason}
 
 
@@ -802,15 +832,16 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
     context_status = str(result.get("context_status") or "ERROR")
     liq_gate_status = str(result.get("liq_gate_status") or "BLOCK")
     out = _semi_stageb_base(direction)
+    out["selected_direction"] = direction
+    out["selected_direction_reason"] = direction_info.get("direction_reason")
+    out["selected_sweep_tag"] = None
+    out["selected_sweep_level"] = None
+    out["selected_sweep_extreme"] = None
+    out["selected_sweep_t"] = None
 
     if context_status in ("DATA_GAP", "HTF_DATA_GAP", "ERROR"):
         out["stageb_invalid_reason"] = "context_not_ready"
         out["stageb_confirm_reason"] = "context_not_ready"
-        return out
-
-    if direction == "MIXED":
-        out["stageb_invalid_reason"] = "mixed_sweep_direction"
-        out["stageb_confirm_reason"] = "mixed_sweep_direction"
         return out
 
     if direction == "NONE":
@@ -841,6 +872,16 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
 
     liq_ctx = result.get("liq_ctx") or {}
     entry_sweep = result.get("entry_sweep") or {}
+    if direction == "LONG":
+        out["selected_sweep_tag"] = "SWEEP_LOW"
+        out["selected_sweep_level"] = entry_sweep.get("bullish_sweep_level")
+        out["selected_sweep_extreme"] = entry_sweep.get("bullish_sweep_extreme")
+        out["selected_sweep_t"] = entry_sweep.get("bullish_sweep_t")
+    elif direction == "SHORT":
+        out["selected_sweep_tag"] = "SWEEP_HIGH"
+        out["selected_sweep_level"] = entry_sweep.get("bearish_sweep_level")
+        out["selected_sweep_extreme"] = entry_sweep.get("bearish_sweep_extreme")
+        out["selected_sweep_t"] = entry_sweep.get("bearish_sweep_t")
 
     # Existing confirmed state: keep stable, dedup will use confirmed_t.
     if active_state == "CONFIRMED":
@@ -867,9 +908,20 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
 
     # Create WAIT_DISPLACEMENT from a fresh sweep->reclaim.
     if active_state not in ("WAIT_DISPLACEMENT", "WAIT_RETEST"):
-        sweep_t = entry_sweep.get("sweep_t")
-        sweep_level = entry_sweep.get("sweep_level") or liq_ctx.get("sweep_level") or liq_ctx.get("nearest_liq_price")
-        sweep_extreme = entry_sweep.get("sweep_extreme") or liq_ctx.get("sweep_extreme")
+        if direction in ("LONG", "SHORT"):
+            sweep_t = out.get("selected_sweep_t")
+            sweep_level = out.get("selected_sweep_level")
+            sweep_extreme = out.get("selected_sweep_extreme")
+            if sweep_t is None or sweep_level is None:
+                out["stageb_status"] = "WATCH"
+                out["stageb_state_machine"] = "IDLE"
+                out["stageb_confirm_reason"] = "selected_sweep_missing_for_direction"
+                out["stageb_invalid_reason"] = "selected_sweep_missing_for_direction"
+                return out
+        else:
+            sweep_t = entry_sweep.get("sweep_t")
+            sweep_level = entry_sweep.get("sweep_level") or liq_ctx.get("sweep_level") or liq_ctx.get("nearest_liq_price")
+            sweep_extreme = entry_sweep.get("sweep_extreme") or liq_ctx.get("sweep_extreme")
 
         if sweep_t is None or sweep_level is None:
             out["stageb_status"] = "IDLE"
@@ -1446,6 +1498,21 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "sweep_extreme": None,
                 "sweep_t": None,
                 "sweep_tag": None,
+                "bullish_sweep_level": None,
+                "bullish_sweep_extreme": None,
+                "bullish_sweep_t": None,
+                "bullish_sweep_tag": None,
+                "bearish_sweep_level": None,
+                "bearish_sweep_extreme": None,
+                "bearish_sweep_t": None,
+                "bearish_sweep_tag": None,
+                "mixed_sweep_detected": False,
+                "selected_direction": "NONE",
+                "selected_direction_reason": "no_sweep_direction",
+                "selected_sweep_level": None,
+                "selected_sweep_extreme": None,
+                "selected_sweep_t": None,
+                "selected_sweep_tag": None,
             }
             stageb_fvg: Dict[str, Any] = {"bullish_fvg": None, "bearish_fvg": None, "count_bullish": 0, "count_bearish": 0}
             htf_swing_summary: Dict[str, Any] = {}
@@ -1537,6 +1604,12 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                         "symbol": symbol,
                         "error": f"stageb:{sexc}",
                     })
+            entry_sweep["selected_direction"] = (stageb_confirmation.get("selected_direction") or "NONE")
+            entry_sweep["selected_direction_reason"] = (stageb_confirmation.get("selected_direction_reason") or "no_sweep_direction")
+            entry_sweep["selected_sweep_tag"] = stageb_confirmation.get("selected_sweep_tag")
+            entry_sweep["selected_sweep_level"] = stageb_confirmation.get("selected_sweep_level")
+            entry_sweep["selected_sweep_extreme"] = stageb_confirmation.get("selected_sweep_extreme")
+            entry_sweep["selected_sweep_t"] = stageb_confirmation.get("selected_sweep_t")
             results.append({
                 "symbol": symbol,
                 "status": status,
@@ -1737,6 +1810,28 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                     "error": str(exc),
                 })
         signal_count += 1
+
+    for result in results:
+        entry_sweep = result.get("entry_sweep") or {}
+        stageb = result.get("stageb_confirmation") or {}
+        htf_gate = result.get("htf_gate") or {}
+        result["run_once_debug"] = {
+            "symbol": result.get("symbol"),
+            "htf_bias": htf_gate.get("htf_bias"),
+            "bullish_sweep": entry_sweep.get("bullish_sweep"),
+            "bearish_sweep": entry_sweep.get("bearish_sweep"),
+            "mixed_sweep_detected": entry_sweep.get("mixed_sweep_detected"),
+            "selected_direction": stageb.get("selected_direction"),
+            "selected_direction_reason": stageb.get("selected_direction_reason"),
+            "selected_sweep_tag": stageb.get("selected_sweep_tag"),
+            "selected_sweep_level": stageb.get("selected_sweep_level"),
+            "selected_sweep_extreme": stageb.get("selected_sweep_extreme"),
+            "selected_sweep_t": stageb.get("selected_sweep_t"),
+            "stageb_state_machine": stageb.get("stageb_state_machine"),
+            "stageb_confirm_reason": stageb.get("stageb_confirm_reason"),
+            "plan_status": result.get("plan_status"),
+            "signal_skip_reason": result.get("signal_skip_reason"),
+        }
 
     log_row = {
         "event_type": "VPS_SMC_RUN_ONCE",
