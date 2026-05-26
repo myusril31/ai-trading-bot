@@ -472,6 +472,303 @@ def select_fvg_poi(stageb_fvg: Dict[str, Any], direction: str) -> Dict[str, Any]
     return out
 
 
+
+# ===== FULL SEMI APPS SCRIPT PARITY STATE MACHINE =====
+# Persisted per-symbol StageB lifecycle:
+# IDLE -> WAIT_DISPLACEMENT -> WAIT_RETEST -> CONFIRMED -> EXPIRED/INVALID
+def _semi_state_file() -> Path:
+    return _state_dir() / "vps_smc" / "semi_stageb_state.json"
+
+
+def _load_semi_states() -> Dict[str, Any]:
+    path = _semi_state_file()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_semi_states(states: Dict[str, Any]) -> None:
+    _ensure_dirs()
+    path = _semi_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(states, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def _semi_key(symbol: Any) -> str:
+    return _normalize_symbol(symbol) or "UNKNOWN"
+
+
+def _semi_bar_t(c: Dict[str, Any]) -> Optional[int]:
+    try:
+        return int(c.get("t"))
+    except Exception:
+        try:
+            return int(c.get("tBucketMs"))
+        except Exception:
+            return None
+
+
+def _semi_bars_since(candles: List[Dict[str, Any]], from_t: Any) -> int:
+    try:
+        t0 = int(from_t)
+    except Exception:
+        return 999999
+    return len([c for c in (candles or []) if (_semi_bar_t(c) or 0) > t0])
+
+
+def _semi_last_close(candles: List[Dict[str, Any]]) -> Optional[float]:
+    try:
+        return float((candles or [])[-1]["c"])
+    except Exception:
+        return None
+
+
+def _semi_invalidated(direction: str, candles: List[Dict[str, Any]], sweep_extreme: Any) -> bool:
+    last_close = _semi_last_close(candles)
+    if last_close is None or sweep_extreme is None:
+        return False
+    try:
+        ext = float(sweep_extreme)
+    except Exception:
+        return False
+
+    # Same idea as Apps Script invalid beyond sweep + buffer.
+    buf = (_env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)) / 100.0
+    d = str(direction or "").upper()
+
+    if d == "LONG":
+        return last_close < ext * (1 - buf)
+    if d == "SHORT":
+        return last_close > ext * (1 + buf)
+    return False
+
+
+def _semi_find_reclaim_after(
+    candles: List[Dict[str, Any]],
+    direction: str,
+    reclaim_level: Any,
+    sweep_t: Any,
+    max_bars: int,
+) -> Dict[str, Any]:
+    out = {"has_reclaim": False, "reclaim_level": reclaim_level, "reclaim_t": None, "reclaim_idx": None, "reason": "not_found", "mode": None}
+    try:
+        level = float(reclaim_level)
+        st = int(sweep_t)
+    except Exception:
+        out["reason"] = "missing_reclaim_level_or_sweep_t"
+        return out
+
+    d = str(direction or "").upper()
+    bars = candles or []
+    after = [(i, c) for i, c in enumerate(bars) if (_semi_bar_t(c) or 0) >= st]
+    after = after[: max(1, int(max_bars or 8)) + 1]
+
+    for i, c in after:
+        try:
+            low = float(c["l"])
+            high = float(c["h"])
+            close = float(c["c"])
+            t = _semi_bar_t(c)
+        except Exception:
+            continue
+
+        if d == "LONG" and low < level and close > level:
+            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "STRICT"})
+            return out
+        if d == "SHORT" and high > level and close < level:
+            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "STRICT"})
+            return out
+
+    # Relax mode: allow close back through level without requiring wick cross on that exact 5m candle.
+    if _env_bool("VPS_SMC_RECLAIM_RELAX_MODE", True):
+        for i, c in after:
+            try:
+                close = float(c["c"])
+                t = _semi_bar_t(c)
+            except Exception:
+                continue
+            if d == "LONG" and close > level:
+                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "RELAX"})
+                return out
+            if d == "SHORT" and close < level:
+                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "RELAX"})
+                return out
+
+    return out
+
+
+def _semi_find_displacement_after(
+    candles: List[Dict[str, Any]],
+    direction: str,
+    after_t: Any,
+    max_bars: int,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "has_displacement": False,
+        "direction": direction,
+        "displacement_t": None,
+        "displacement_idx": None,
+        "body_pct": None,
+        "range": None,
+        "atr": None,
+        "reason": "not_found",
+    }
+    try:
+        t0 = int(after_t)
+    except Exception:
+        out["reason"] = "missing_after_t"
+        return out
+
+    d = str(direction or "").upper()
+    bars = candles or []
+    candidates = [(i, c) for i, c in enumerate(bars) if (_semi_bar_t(c) or 0) > t0]
+    candidates = candidates[: max(1, int(max_bars or 10))]
+
+    atr_len = _env_int("VPS_SMC_DISPLACEMENT_ATR_LEN", 14)
+    atr_mult = _env_float("VPS_SMC_DISPLACEMENT_ATR_MULT", 1.15)
+    min_body_pct = _env_float("VPS_SMC_DISPLACEMENT_MIN_BODY_PCT", 55.0)
+
+    for i, c in candidates:
+        try:
+            o = float(c["o"])
+            h = float(c["h"])
+            l = float(c["l"])
+            close = float(c["c"])
+            crange = h - l
+            if crange <= 0:
+                continue
+            body = close - o
+            body_pct = abs(body) / crange * 100.0
+            atr = calc_atr(bars[: i + 1], atr_len)
+            if atr is None:
+                continue
+            directional_ok = (d == "LONG" and body > 0) or (d == "SHORT" and body < 0)
+            range_ok = crange >= (atr * atr_mult)
+            body_ok = body_pct >= min_body_pct
+            if directional_ok and range_ok and body_ok:
+                out.update({
+                    "has_displacement": True,
+                    "displacement_t": _semi_bar_t(c),
+                    "displacement_idx": i,
+                    "body_pct": body_pct,
+                    "range": crange,
+                    "atr": atr,
+                    "reason": "ok",
+                })
+                return out
+        except Exception:
+            continue
+
+    return out
+
+
+def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t: Any, lookback: int) -> Dict[str, Any]:
+    out = {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "fvg_idx": None, "reason": "not_found"}
+    try:
+        t0 = int(after_t)
+    except Exception:
+        out["reason"] = "missing_after_t"
+        return out
+
+    d = str(direction or "").upper()
+    bars = candles or []
+    if len(bars) < 3:
+        out["reason"] = "not_enough_candles"
+        return out
+
+    start = max(2, len(bars) - max(3, int(lookback or 35)))
+    for i in range(len(bars) - 1, start - 1, -1):
+        c0 = bars[i - 2]
+        c2 = bars[i]
+        t2 = _semi_bar_t(c2) or 0
+        if t2 < t0:
+            continue
+        try:
+            if d == "LONG" and float(c0["h"]) < float(c2["l"]):
+                out.update({"has_fvg": True, "fvg_type": "BULLISH", "fvg_lo": float(c0["h"]), "fvg_hi": float(c2["l"]), "fvg_t": t2, "fvg_idx": i, "reason": "ok"})
+                return out
+            if d == "SHORT" and float(c0["l"]) > float(c2["h"]):
+                out.update({"has_fvg": True, "fvg_type": "BEARISH", "fvg_lo": float(c2["h"]), "fvg_hi": float(c0["l"]), "fvg_t": t2, "fvg_idx": i, "reason": "ok"})
+                return out
+        except Exception:
+            continue
+
+    return out
+
+
+def _semi_find_retest_rejection(
+    candles: List[Dict[str, Any]],
+    direction: str,
+    poi: Dict[str, Any],
+    after_t: Any,
+    max_bars: int,
+) -> Dict[str, Any]:
+    out = {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_found"}
+    try:
+        zlo = min(float(poi.get("fvg_lo")), float(poi.get("fvg_hi")))
+        zhi = max(float(poi.get("fvg_lo")), float(poi.get("fvg_hi")))
+        t0 = int(after_t)
+    except Exception:
+        out["reason"] = "missing_poi_or_after_t"
+        return out
+
+    d = str(direction or "").upper()
+    bars = candles or []
+    candidates = [(i, c) for i, c in enumerate(bars) if (_semi_bar_t(c) or 0) > t0]
+    candidates = candidates[: max(1, int(max_bars or 18))]
+
+    touched = False
+    for i, c in candidates:
+        try:
+            low = float(c["l"])
+            high = float(c["h"])
+            close = float(c["c"])
+            o = float(c["o"])
+            t = _semi_bar_t(c)
+        except Exception:
+            continue
+
+        overlaps = low <= zhi and high >= zlo
+        if not overlaps:
+            continue
+
+        touched = True
+        rejection_ok = (d == "LONG" and close > zhi and close > o) or (d == "SHORT" and close < zlo and close < o)
+        if rejection_ok:
+            out.update({"has_retest": True, "has_rejection_close": True, "retest_t": t, "retest_idx": i, "reason": "ok"})
+            return out
+
+    if touched:
+        out["reason"] = "touched_poi_no_rejection_close"
+    else:
+        out["reason"] = "waiting_poi_retest"
+    return out
+
+
+def _semi_stageb_base(direction: str) -> Dict[str, Any]:
+    return {
+        "stageb_status": "INVALID",
+        "stageb_direction": direction,
+        "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
+        "stageb_displacement": {"has_displacement": False, "direction": direction, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
+        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built"},
+        "stageb_retest": {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_built"},
+        "stageb_confirm_reason": None,
+        "stageb_invalid_reason": None,
+        "stageb_state_machine": "IDLE",
+        "confirmed_t": None,
+        "confirmed_t_wib": None,
+    }
+
+
 def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     sweep = (context or {}).get("entry_sweep") or {}
     bullish = bool(sweep.get("bullish_sweep"))
@@ -491,72 +788,226 @@ def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    symbol = _semi_key(result.get("symbol"))
     direction_info = derive_stageb_direction(result)
-    direction = direction_info["stageb_direction"]
+    detected_direction = direction_info["stageb_direction"]
+
+    states = _load_semi_states()
+    st = states.get(symbol) if isinstance(states.get(symbol), dict) else {}
+
+    active_state = str(st.get("state") or "IDLE").upper()
+    active_direction = str(st.get("direction") or "").upper()
+    direction = active_direction if active_state in ("WAIT_DISPLACEMENT", "WAIT_RETEST", "CONFIRMED") and active_direction in ("LONG", "SHORT") else detected_direction
+
     context_status = str(result.get("context_status") or "ERROR")
     liq_gate_status = str(result.get("liq_gate_status") or "BLOCK")
-
-    out: Dict[str, Any] = {
-        "stageb_status": "INVALID",
-        "stageb_direction": direction,
-        "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
-        "stageb_displacement": {"has_displacement": False, "direction": None, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
-        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built"},
-        "stageb_confirm_reason": None,
-        "stageb_invalid_reason": None,
-    }
+    out = _semi_stageb_base(direction)
 
     if context_status in ("DATA_GAP", "HTF_DATA_GAP", "ERROR"):
         out["stageb_invalid_reason"] = "context_not_ready"
+        out["stageb_confirm_reason"] = "context_not_ready"
         return out
+
     if direction == "MIXED":
         out["stageb_invalid_reason"] = "mixed_sweep_direction"
+        out["stageb_confirm_reason"] = "mixed_sweep_direction"
         return out
+
     if direction == "NONE":
         out["stageb_status"] = "IDLE"
+        out["stageb_state_machine"] = active_state if active_state in ("WAIT_DISPLACEMENT", "WAIT_RETEST") else "IDLE"
         out["stageb_confirm_reason"] = "no_sweep_direction"
         out["stageb_invalid_reason"] = None
         return out
 
-    reclaim_level = (result.get("liq_ctx") or {}).get("sweep_level")
-    if reclaim_level is None:
-        reclaim_level = (result.get("liq_ctx") or {}).get("nearest_liq_price")
+    if liq_gate_status == "BLOCK" and active_state not in ("WAIT_DISPLACEMENT", "WAIT_RETEST", "CONFIRMED"):
+        out["stageb_status"] = "WATCH"
+        out["stageb_confirm_reason"] = "liq_gate_blocked"
+        return out
 
-    out["stageb_reclaim"] = detect_reclaim(stageb_candles, direction, reclaim_level, _env_int("VPS_SMC_RECLAIM_LOOKBACK_BARS", 20))
-    out["stageb_displacement"] = detect_displacement(
-        stageb_candles,
-        direction,
-        _env_int("VPS_SMC_DISPLACEMENT_ATR_LEN", 10),
-        _env_float("VPS_SMC_DISPLACEMENT_ATR_MULT", 1.15),
-        _env_float("VPS_SMC_DISPLACEMENT_MIN_BODY_PCT", 55.0),
-        _env_int("VPS_SMC_STAGEB_LOOKBACK_BARS", 60),
-    )
-    out["stageb_fvg_poi"] = select_fvg_poi((result.get("stageb_fvg") or {}), direction)
+    if _semi_invalidated(direction, stageb_candles, st.get("sweep_extreme") or (result.get("liq_ctx") or {}).get("sweep_extreme")):
+        states.pop(symbol, None)
+        _save_semi_states(states)
+        out["stageb_status"] = "INVALID"
+        out["stageb_state_machine"] = "INVALID"
+        out["stageb_invalid_reason"] = "invalidated_beyond_sweep_extreme_buffer"
+        out["stageb_confirm_reason"] = "invalidated_beyond_sweep_extreme_buffer"
+        return out
 
-    require_reclaim = _env_bool("VPS_SMC_REQUIRE_RECLAIM", True)
-    require_displacement = _env_bool("VPS_SMC_REQUIRE_DISPLACEMENT", True)
-    require_fvg = _env_bool("VPS_SMC_REQUIRE_FVG_FOR_CONFIRM", True)
+    max_reclaim = _env_int("VPS_SMC_MAX_RECLAIM_AGE_BARS_5M", 8)
+    max_disp = _env_int("VPS_SMC_SWEEP_MAX_AGE_BARS_5M", 10)
+    max_retest = _env_int("VPS_SMC_RETEST_MAX_AGE_BARS_5M", 18)
+    fvg_lookback = _env_int("VPS_SMC_FVG_LOOKBACK_BARS_5M", 35)
 
-    reclaim_ok = bool(out["stageb_reclaim"].get("has_reclaim")) or (not require_reclaim)
-    displacement_ok = bool(out["stageb_displacement"].get("has_displacement")) or (not require_displacement)
-    fvg_ok = bool(out["stageb_fvg_poi"].get("has_fvg")) or (not require_fvg)
+    liq_ctx = result.get("liq_ctx") or {}
+    entry_sweep = result.get("entry_sweep") or {}
+
+    # Existing confirmed state: keep stable, dedup will use confirmed_t.
+    if active_state == "CONFIRMED":
+        confirmed_t = st.get("confirmed_t")
+        if confirmed_t is not None and _semi_bars_since(stageb_candles, confirmed_t) > max_retest:
+            states.pop(symbol, None)
+            _save_semi_states(states)
+            out["stageb_status"] = "EXPIRED"
+            out["stageb_state_machine"] = "EXPIRED"
+            out["stageb_confirm_reason"] = "confirmed_ttl_expired"
+            out["stageb_invalid_reason"] = "confirmed_ttl_expired"
+            return out
+
+        out["stageb_status"] = "CONFIRMED"
+        out["stageb_state_machine"] = "CONFIRMED"
+        out["stageb_reclaim"] = st.get("reclaim") or out["stageb_reclaim"]
+        out["stageb_displacement"] = st.get("displacement") or out["stageb_displacement"]
+        out["stageb_fvg_poi"] = st.get("poi") or out["stageb_fvg_poi"]
+        out["stageb_retest"] = st.get("retest") or out["stageb_retest"]
+        out["confirmed_t"] = confirmed_t
+        out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
+        out["stageb_confirm_reason"] = "already_confirmed"
+        return out
+
+    # Create WAIT_DISPLACEMENT from a fresh sweep->reclaim.
+    if active_state not in ("WAIT_DISPLACEMENT", "WAIT_RETEST"):
+        sweep_t = entry_sweep.get("sweep_t")
+        sweep_level = entry_sweep.get("sweep_level") or liq_ctx.get("sweep_level") or liq_ctx.get("nearest_liq_price")
+        sweep_extreme = entry_sweep.get("sweep_extreme") or liq_ctx.get("sweep_extreme")
+
+        if sweep_t is None or sweep_level is None:
+            out["stageb_status"] = "IDLE"
+            out["stageb_state_machine"] = "IDLE"
+            out["stageb_confirm_reason"] = "no_valid_sweep"
+            return out
+
+        reclaim = _semi_find_reclaim_after(stageb_candles, direction, sweep_level, sweep_t, max_reclaim)
+        out["stageb_reclaim"] = reclaim
+
+        if not reclaim.get("has_reclaim"):
+            out["stageb_status"] = "WATCH"
+            out["stageb_state_machine"] = "IDLE"
+            out["stageb_confirm_reason"] = "reclaim_missing"
+            return out
+
+        st = {
+            "state": "WAIT_DISPLACEMENT",
+            "direction": direction,
+            "sweep_t": sweep_t,
+            "sweep_level": sweep_level,
+            "sweep_extreme": sweep_extreme,
+            "reclaim": reclaim,
+            "reclaim_t": reclaim.get("reclaim_t"),
+            "created_at_utc": _utc_now_iso(),
+            "updated_at_utc": _utc_now_iso(),
+        }
+        states[symbol] = st
+        _save_semi_states(states)
+        active_state = "WAIT_DISPLACEMENT"
+
+    # WAIT_DISPLACEMENT: wait max 10 bars after reclaim.
+    if active_state == "WAIT_DISPLACEMENT":
+        reclaim = st.get("reclaim") or {}
+        reclaim_t = st.get("reclaim_t") or reclaim.get("reclaim_t")
+        out["stageb_reclaim"] = reclaim or out["stageb_reclaim"]
+
+        waited = _semi_bars_since(stageb_candles, reclaim_t)
+        if waited > max_disp:
+            states.pop(symbol, None)
+            _save_semi_states(states)
+            out["stageb_status"] = "EXPIRED"
+            out["stageb_state_machine"] = "EXPIRED"
+            out["stageb_confirm_reason"] = f"no_displacement_within_{max_disp}_bars"
+            out["stageb_invalid_reason"] = f"no_displacement_within_{max_disp}_bars"
+            return out
+
+        disp = st.get("displacement") if isinstance(st.get("displacement"), dict) and st.get("displacement", {}).get("has_displacement") else _semi_find_displacement_after(stageb_candles, direction, reclaim_t, max_disp)
+        out["stageb_displacement"] = disp
+
+        if not disp.get("has_displacement"):
+            out["stageb_status"] = "WATCH"
+            out["stageb_state_machine"] = "WAIT_DISPLACEMENT"
+            out["stageb_confirm_reason"] = f"wait_displacement_{waited}/{max_disp}"
+            st["updated_at_utc"] = _utc_now_iso()
+            states[symbol] = st
+            _save_semi_states(states)
+            return out
+
+        poi = st.get("poi") if isinstance(st.get("poi"), dict) and st.get("poi", {}).get("has_fvg") else _semi_find_fvg_after(stageb_candles, direction, disp.get("displacement_t"), fvg_lookback)
+        out["stageb_fvg_poi"] = poi
+
+        if not poi.get("has_fvg"):
+            out["stageb_status"] = "WATCH"
+            out["stageb_state_machine"] = "WAIT_DISPLACEMENT"
+            out["stageb_confirm_reason"] = "displacement_ok_wait_fvg_poi"
+            st["displacement"] = disp
+            st["updated_at_utc"] = _utc_now_iso()
+            states[symbol] = st
+            _save_semi_states(states)
+            return out
+
+        st["state"] = "WAIT_RETEST"
+        st["displacement"] = disp
+        st["poi"] = poi
+        st["displacement_t"] = disp.get("displacement_t")
+        st["poi_t"] = poi.get("fvg_t")
+        st["updated_at_utc"] = _utc_now_iso()
+        states[symbol] = st
+        _save_semi_states(states)
+        active_state = "WAIT_RETEST"
+
+    # WAIT_RETEST: wait max 18 bars after displacement/POI, then require retest + rejection close.
+    if active_state == "WAIT_RETEST":
+        reclaim = st.get("reclaim") or {}
+        disp = st.get("displacement") or {}
+        poi = st.get("poi") or {}
+
+        out["stageb_reclaim"] = reclaim or out["stageb_reclaim"]
+        out["stageb_displacement"] = disp or out["stageb_displacement"]
+        out["stageb_fvg_poi"] = poi or out["stageb_fvg_poi"]
+
+        after_t = max(int(disp.get("displacement_t") or 0), int(poi.get("fvg_t") or 0))
+        waited = _semi_bars_since(stageb_candles, after_t)
+
+        if waited > max_retest:
+            states.pop(symbol, None)
+            _save_semi_states(states)
+            out["stageb_status"] = "EXPIRED"
+            out["stageb_state_machine"] = "EXPIRED"
+            out["stageb_confirm_reason"] = f"no_poi_retest_within_{max_retest}_bars"
+            out["stageb_invalid_reason"] = f"no_poi_retest_within_{max_retest}_bars"
+            return out
+
+        retest = _semi_find_retest_rejection(stageb_candles, direction, poi, after_t, max_retest)
+        out["stageb_retest"] = retest
+
+        if not (retest.get("has_retest") and retest.get("has_rejection_close")):
+            out["stageb_status"] = "WATCH"
+            out["stageb_state_machine"] = "WAIT_RETEST"
+            out["stageb_confirm_reason"] = f"wait_retest_rejection:{retest.get('reason')}:{waited}/{max_retest}"
+            st["updated_at_utc"] = _utc_now_iso()
+            states[symbol] = st
+            _save_semi_states(states)
+            return out
+
+        confirmed_t = retest.get("retest_t") or after_t
+        st["state"] = "CONFIRMED"
+        st["retest"] = retest
+        st["confirmed_t"] = confirmed_t
+        st["updated_at_utc"] = _utc_now_iso()
+        states[symbol] = st
+        _save_semi_states(states)
+
+        out["stageb_status"] = "CONFIRMED"
+        out["stageb_state_machine"] = "CONFIRMED"
+        out["stageb_retest"] = retest
+        out["confirmed_t"] = confirmed_t
+        out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
+        out["stageb_confirm_reason"] = "fvg_retest_rejection_close"
+        return out
 
     out["stageb_status"] = "WATCH"
-    reasons: List[str] = []
-    if liq_gate_status == "BLOCK":
-        reasons.append("liq_gate_blocked")
-    if reclaim_ok and displacement_ok and fvg_ok and context_status == "READY" and liq_gate_status != "BLOCK":
-        out["stageb_status"] = "CONFIRMED"
-        reasons.append("all_requirements_passed")
-    else:
-        if not reclaim_ok:
-            reasons.append("reclaim_missing")
-        if not displacement_ok:
-            reasons.append("displacement_missing")
-        if not fvg_ok:
-            reasons.append("fvg_missing")
-    out["stageb_confirm_reason"] = ",".join(reasons) if reasons else "watch"
+    out["stageb_state_machine"] = active_state
+    out["stageb_confirm_reason"] = "watch"
     return out
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
@@ -708,7 +1159,7 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     entry_sw = result.get("entry_swing_summary") or {}
     htf_sw = result.get("htf_swing_summary") or {}
     sweep_extreme = liq_ctx.get("sweep_extreme")
-    buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08)
+    buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)
     buffer_mult = buffer_pct / 100.0
     if sweep_extreme is None:
         sweep_extreme = entry_sw.get("last_swing_low") if direction == "LONG" else entry_sw.get("last_swing_high")
@@ -721,27 +1172,27 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
         return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["invalid_risk"]}, "invalid_plan"
     if direction == "LONG":
         raw_tp1 = liq_ctx.get("last_buy_side_liq") or entry_sw.get("last_swing_high")
-        tp1 = (entry_mid + (1.0 * risk)) if (raw_tp1 is None or float(raw_tp1) <= entry_mid) else float(raw_tp1)
+        tp1 = (entry_mid + (_env_float("VPS_SMC_TP1_R", 1.0) * risk)) if (raw_tp1 is None or float(raw_tp1) <= entry_mid) else float(raw_tp1)
 
         raw_tp2 = htf_sw.get("last_swing_high")
-        tp2 = (entry_mid + (1.5 * risk)) if (raw_tp2 is None or float(raw_tp2) <= entry_mid) else float(raw_tp2)
+        tp2 = (entry_mid + (_env_float("VPS_SMC_TP2_R", 1.5) * risk)) if (raw_tp2 is None or float(raw_tp2) <= entry_mid) else float(raw_tp2)
 
-        tp3 = (entry_mid + (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
+        tp3 = (entry_mid + (_env_float("VPS_SMC_TP3_R", 2.5) * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
         rr_tp2 = (tp2 - entry_mid) / risk
         sane = sl < entry_mid and tp2 > entry_mid
     else:
         raw_tp1 = liq_ctx.get("last_sell_side_liq") or entry_sw.get("last_swing_low")
-        tp1 = (entry_mid - (1.0 * risk)) if (raw_tp1 is None or float(raw_tp1) >= entry_mid) else float(raw_tp1)
+        tp1 = (entry_mid - (_env_float("VPS_SMC_TP1_R", 1.0) * risk)) if (raw_tp1 is None or float(raw_tp1) >= entry_mid) else float(raw_tp1)
 
         raw_tp2 = htf_sw.get("last_swing_low")
-        tp2 = (entry_mid - (1.5 * risk)) if (raw_tp2 is None or float(raw_tp2) >= entry_mid) else float(raw_tp2)
+        tp2 = (entry_mid - (_env_float("VPS_SMC_TP2_R", 1.5) * risk)) if (raw_tp2 is None or float(raw_tp2) >= entry_mid) else float(raw_tp2)
 
-        tp3 = (entry_mid - (2.5 * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
+        tp3 = (entry_mid - (_env_float("VPS_SMC_TP3_R", 2.5) * risk)) if _env_bool("VPS_SMC_TP3_ENABLED", True) else None
         rr_tp2 = (entry_mid - tp2) / risk
         sane = sl > entry_mid and tp2 < entry_mid
     if not sane:
         return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["sanity_check_failed"]}, "invalid_plan"
-    if rr_tp2 < _env_float("VPS_SMC_RR_MIN_TP2", 0.95):
+    if rr_tp2 < _env_float("VPS_SMC_RR_MIN_TP2", 1.50):
         return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["rr_below_min"]}, "invalid_plan"
     plan = {"entry_lo": entry_lo, "entry_hi": entry_hi, "entry_mid": entry_mid, "sl": sl, "invalid": sl, "tp1": float(tp1), "tp2": float(tp2), "tp3": (float(tp3) if tp3 is not None else None), "rr_tp2": rr_tp2}
     score = 60
@@ -1003,8 +1454,8 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                     entry_pivots = detect_pivots(entry)
                     entry_swing_summary = build_swing_summary(entry)
                     entry_eq = detect_equal_high_low(entry, entry_pivots)
-                    entry_sweep = detect_sweep(entry, entry_swing_summary)
-                    stageb_fvg = detect_fvg(stageb)
+                    entry_sweep = detect_sweep(entry, entry_swing_summary, _env_int("VPS_SMC_SWEEP_LOOKBACK_BARS_5M", 20))
+                    stageb_fvg = detect_fvg(stageb, _env_int("VPS_SMC_FVG_LOOKBACK_BARS_5M", 35))
                     htf_swing_summary = build_swing_summary(htf)
                     primitive_status = "READY"
                 except Exception as pexc:
@@ -1060,11 +1511,14 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             if _env_bool("VPS_SMC_STAGEB_ENABLED", True):
                 try:
                     stageb_confirmation = build_stageb_confirmation({
+                        "symbol": symbol,
                         "context_status": context_status,
                         "liq_gate_status": liq_gate_status,
                         "liq_ctx": liq_ctx,
                         "entry_sweep": entry_sweep,
                         "stageb_fvg": stageb_fvg,
+                        "htf_gate": htf_gate,
+                        "structure_15m": structure_15m,
                     }, stageb)
                     shadow_state = stageb_confirmation.get("stageb_status") or "INVALID"
                 except Exception as sexc:
@@ -1162,7 +1616,8 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         if _env_bool("VPS_SMC_SCORE_ENABLED", True) and float(score_detail.get("score") or 0.0) < _env_float("VPS_SMC_SCORE_MIN", 70.0):
             result["signal_skip_reason"] = "score_below_min"
             continue
-        bucket_ms = _bucket_ms(result.get("latest_stageb_close_time_ms"), _env_int("VPS_SMC_DEDUP_BUCKET_MIN", 15))
+        bucket_src_ms = ((result.get("stageb_confirmation") or {}).get("confirmed_t") or result.get("latest_stageb_close_time_ms"))
+        bucket_ms = _bucket_ms(bucket_src_ms, _env_int("VPS_SMC_DEDUP_BUCKET_MIN", 15))
         direction = str(((result.get("stageb_confirmation") or {}).get("stageb_direction") or "NONE")).upper()
         signal_key = f"{result.get('symbol')}|{direction}|{bucket_ms}"
         result["signal_key"] = signal_key
@@ -1203,6 +1658,10 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "raw_tp1": tp_norm.get("raw_tp1"), "raw_tp2": tp_norm.get("raw_tp2"), "raw_tp3": tp_norm.get("raw_tp3"),
             "tp_normalized": tp_norm.get("tp_normalized"), "tp_normalize_reason": tp_norm.get("tp_normalize_reason"),
             "plan_sanity_ok": tp_norm.get("ok"), "plan_sanity_reason": tp_norm.get("reason"), "plan_invalid": tp_norm.get("plan_invalid"),
+            "stageb_state_machine": stageb.get("stageb_state_machine"),
+            "stageb_retest": stageb.get("stageb_retest"),
+            "confirmed_t": stageb.get("confirmed_t"),
+            "confirmed_t_wib": stageb.get("confirmed_t_wib"),
             "created_at_utc": _utc_now_iso(),
         }
         _append_jsonl(_log_dir() / "vps_smc_shadow_signals.jsonl", signal_row)
@@ -1377,6 +1836,85 @@ def _read_latest(path: Path, limit: int) -> List[Dict[str, Any]]:
     return rows[-take:]
 
 
+
+def _canonical_symbol_from_row(row: Dict[str, Any]) -> Any:
+    raw_symbol = str(row.get("symbol") or "").strip()
+    if raw_symbol:
+        return raw_symbol.replace(".P", "").split(":")[-1].upper()
+
+    raw_pair = str(row.get("pair") or "").strip()
+    if raw_pair:
+        x = raw_pair.split("|", 1)[0].split(":", 1)[-1].replace(".P", "")
+        if x:
+            return x.upper()
+
+    raw_key = str(row.get("signal_key") or "").strip()
+    if raw_key:
+        first = raw_key.split("|", 1)[0]
+        x = first.split(":", 1)[-1].replace(".P", "")
+        if x:
+            return x.upper()
+
+    return None
+
+
+def _canonical_pair_from_row(row: Dict[str, Any]) -> Any:
+    raw_pair = str(row.get("pair") or "").strip()
+    if raw_pair:
+        if raw_pair.startswith("BINANCE:") and raw_pair.endswith(".P"):
+            return raw_pair
+        # If old rows used bare symbol as pair.
+        if ":" not in raw_pair and "|" not in raw_pair:
+            return f"BINANCE:{raw_pair.replace('.P', '').upper()}.P"
+
+    raw_key = str(row.get("signal_key") or "").strip()
+    if raw_key.startswith("BINANCE:"):
+        first = raw_key.split("|", 1)[0]
+        if first.endswith(".P"):
+            return first
+        return f"{first}.P"
+
+    sym = _canonical_symbol_from_row(row)
+    if sym:
+        return f"BINANCE:{sym}.P"
+
+    return raw_pair or None
+
+
+def _canonical_direction_from_row(row: Dict[str, Any]) -> Any:
+    d = str(row.get("direction") or row.get("dir") or "").strip().upper()
+    if d in ("BUY", "LONG"):
+        return "LONG"
+    if d in ("SELL", "SHORT"):
+        return "SHORT"
+    return d or None
+
+
+def _canonical_display_row(row: Dict[str, Any], default_source: str = "VPS_SMC") -> Dict[str, Any]:
+    out = dict(row or {})
+    out["source"] = out.get("source") or out.get("signal_source") or default_source
+    out["signal_source"] = out.get("signal_source") or default_source
+    out["pair"] = _canonical_pair_from_row(out)
+    out["symbol"] = _canonical_symbol_from_row(out)
+    out["direction"] = _canonical_direction_from_row(out)
+
+    # Derive signal_time_wib for old rows if bucket exists.
+    if not out.get("signal_time_wib"):
+        try:
+            ms = out.get("confirmed_bucket_ms")
+            if ms is None:
+                sk = str(out.get("signal_key") or "")
+                parts = sk.split("|")
+                if len(parts) >= 3:
+                    ms = parts[-1]
+            if ms is not None:
+                dt = datetime.fromtimestamp(int(float(ms)) / 1000, timezone.utc).astimezone(_WIB)
+                out["signal_time_wib"] = dt.strftime("%Y-%m-%d %H:%M:%S WIB")
+        except Exception:
+            pass
+    return out
+
+
 def _row_timestamp_value(row: Dict[str, Any]) -> tuple:
     for key in ("updated_at_utc", "evaluated_at_utc", "created_at_utc"):
         dt = _parse_iso_utc(row.get(key))
@@ -1518,7 +2056,8 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
                 key = str(r.get("signal_key") or "")
                 if key and (not force) and key in mirrored["shadow"]:
                     counts["skipped_duplicate"] += 1; continue
-                shadow_rows.append([r.get(k) for k in shadow_header])
+                display_row = _canonical_display_row(r, default_source="VPS_SMC")
+                shadow_rows.append([display_row.get(k) for k in shadow_header])
                 if key: mirrored["shadow"][key]=_utc_now_iso()
         if target_u in ("ALL","COMPARE"):
             for r in _read_latest(_log_dir()/"vps_smc_compare.jsonl", limit):
@@ -1540,7 +2079,8 @@ def vps_smc_mirror_gsheet(target: str = "ALL", limit: int = 100, force: bool = F
                 if key and (not force) and key in mirrored["outcomes"]:
                     counts["skipped_duplicate"] += 1
                     continue
-                outcome_rows.append([r.get(k) for k in outcome_header])
+                display_row = _canonical_display_row(r, default_source=(r.get("signal_source") or "UNKNOWN"))
+                outcome_rows.append([display_row.get(k) for k in outcome_header])
                 if key:
                     mirrored["outcomes"][key] = _utc_now_iso()
 
