@@ -317,6 +317,48 @@ def detect_equal_high_low(candles: List[Dict[str, Any]], pivots: Dict[str, List[
     return {"eqh": _group(highs), "eql": _group(lows)}
 
 
+def _atr_wilder(candles: List[Dict[str, Any]], period: int) -> List[Optional[float]]:
+    if period <= 1 or len(candles) < 2:
+        return [None for _ in candles]
+    trs: List[float] = []
+    for i, c in enumerate(candles):
+        h = float(c["h"]); l = float(c["l"])
+        if i == 0:
+            trs.append(h - l)
+            continue
+        pc = float(candles[i - 1]["c"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    out: List[Optional[float]] = [None for _ in candles]
+    if len(trs) < period:
+        return out
+    atr = sum(trs[:period]) / float(period)
+    out[period - 1] = atr
+    for i in range(period, len(trs)):
+        atr = ((atr * (period - 1)) + trs[i]) / float(period)
+        out[i] = atr
+    return out
+
+
+def _atr_sma_tr_available(candles: List[Dict[str, Any]], period: int) -> List[Optional[float]]:
+    if period <= 0 or not candles:
+        return [None for _ in candles]
+    trs: List[float] = []
+    for i, c in enumerate(candles):
+        h = float(c["h"]); l = float(c["l"])
+        if i == 0:
+            tr = h - l
+        else:
+            pc = float(candles[i - 1]["c"])
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    out: List[Optional[float]] = []
+    for i in range(len(trs)):
+        n = min(period, i + 1)
+        seg = trs[i + 1 - n:i + 1]
+        out.append((sum(seg) / float(n)) if seg else None)
+    return out
+
+
 def detect_sweep(candles: List[Dict[str, Any]], swing_summary: Dict[str, Any], scan_n: int = 20) -> Dict[str, Any]:
     out = {
         "bullish_sweep": False,
@@ -794,6 +836,13 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
 def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     sweep = (context or {}).get("entry_sweep") or {}
     htf_gate = (context or {}).get("htf_gate") or {}
+    htf_bias_appstyle = str(htf_gate.get("htf_bias_appstyle") or "").upper()
+    swing_bias_num = int(htf_gate.get("htf_swing_bias_num") or 0)
+    last_swing_dir = str(((htf_gate.get("htf_last_swing_event") or {}).get("dir") or "")).upper()
+    if htf_bias_appstyle in ("BULLISH", "BULL") or swing_bias_num == 1 or last_swing_dir == "LONG":
+        return {"stageb_direction": "LONG", "direction_reason": "htf_appstyle_bullish"}
+    if htf_bias_appstyle in ("BEARISH", "BEAR") or swing_bias_num == -1 or last_swing_dir == "SHORT":
+        return {"stageb_direction": "SHORT", "direction_reason": "htf_appstyle_bearish"}
     htf_bias = str(htf_gate.get("htf_bias") or htf_gate.get("htf_dir") or "").upper()
     if htf_bias in ("BULLISH", "BULL", "LONG"):
         return {"stageb_direction": "LONG", "direction_reason": "htf_bias_bullish"}
@@ -1078,6 +1127,9 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
             "htf_gate_status": "HTF_DATA_GAP", "htf_dir": "NEUTRAL", "htf_bias": "MIXED", "htf_structure": "UNKNOWN",
             "htf_location": "UNKNOWN", "htf_close": None, "htf_last_swing_high": None, "htf_last_swing_low": None,
             "htf_mid": None, "htf_reason": "not_enough_4h_candles",
+            "htf_bias_appstyle": "MIXED", "htf_dir_appstyle": "NEUTRAL", "htf_structure_appstyle": "UNKNOWN",
+            "htf_location_appstyle": "UNKNOWN", "htf_eq_appstyle": "NONE", "htf_swing_bias_num": 0,
+            "htf_internal_bias_num": 0, "htf_last_swing_event": None, "htf_last_internal_event": None, "htf_pd_appstyle": "UNKNOWN",
         }
 
     close = float(htf[-1]["c"])
@@ -1105,6 +1157,7 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
             structure, direction, bias = "BOS_UP", "LONG", "BULLISH"
         elif close < last_low:
             structure, direction, bias = "BOS_DOWN", "SHORT", "BEARISH"
+    app = _build_htf_appstyle(htf)
     return {
         "htf_gate_status": "PASS",
         "htf_dir": direction,
@@ -1116,6 +1169,153 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
         "htf_last_swing_low": last_low,
         "htf_mid": htf_mid,
         "htf_reason": None,
+        "htf_bias_appstyle": app.get("htf_bias_appstyle"),
+        "htf_dir_appstyle": app.get("htf_dir_appstyle"),
+        "htf_structure_appstyle": app.get("htf_structure_appstyle"),
+        "htf_location_appstyle": app.get("htf_location_appstyle"),
+        "htf_eq_appstyle": app.get("htf_eq_appstyle"),
+        "htf_swing_bias_num": app.get("htf_swing_bias_num"),
+        "htf_internal_bias_num": app.get("htf_internal_bias_num"),
+        "htf_last_swing_event": app.get("htf_last_swing_event"),
+        "htf_last_internal_event": app.get("htf_last_internal_event"),
+        "htf_pd_appstyle": app.get("htf_pd_appstyle"),
+    }
+
+
+def _build_htf_appstyle(htf: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not htf:
+        return {
+            "htf_bias_appstyle": "MIXED", "htf_dir_appstyle": "NEUTRAL", "htf_structure_appstyle": "RANGE",
+            "htf_location_appstyle": "UNKNOWN", "htf_eq_appstyle": "NONE", "htf_swing_bias_num": 0, "htf_internal_bias_num": 0,
+            "htf_last_swing_event": None, "htf_last_internal_event": None, "htf_pd_appstyle": "UNKNOWN", "htf_eq_appstyle_obj": None,
+        }
+    eq_lookback = 6
+    atr_vals = _atr_sma_tr_available(htf, 100)
+    swing_len = 20
+    internal_len = 5
+    state: Dict[str, Any] = {
+        "swingBias": 0, "internalBias": 0,
+        "swingHigh": None, "swingLow": None, "internalHigh": None, "internalLow": None,
+        "swingHighHist": [], "swingLowHist": [],
+        "lastSwingEvent": None, "lastInternalEvent": None,
+        "lastEQ": None, "eqAbsThrLast": None,
+    }
+
+    def _confirm_pivot(i: int, ln: int) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        pidx = i - ln
+        if pidx - ln < 0 or pidx + ln >= len(htf):
+            return None, None
+        p = htf[pidx]
+        ph = float(p["h"]); pl = float(p["l"])
+        left_h = max(float(htf[j]["h"]) for j in range(pidx - ln, pidx))
+        right_h = max(float(htf[j]["h"]) for j in range(pidx + 1, pidx + 1 + ln))
+        left_l = min(float(htf[j]["l"]) for j in range(pidx - ln, pidx))
+        right_l = min(float(htf[j]["l"]) for j in range(pidx + 1, pidx + 1 + ln))
+        hi = {"level": ph, "t": p.get("t"), "idx": pidx} if (ph > left_h and ph >= right_h) else None
+        lo = {"level": pl, "t": p.get("t"), "idx": pidx} if (pl < left_l and pl <= right_l) else None
+        return hi, lo
+
+    for i in range(1, len(htf)):
+        s_hi, s_lo = _confirm_pivot(i, swing_len)
+        if s_hi is not None:
+            state["swingHigh"] = s_hi
+            state["swingHighHist"].append(s_hi)
+            hist = state["swingHighHist"][-(eq_lookback + 1):-1]
+            thr = atr_vals[i] * 0.15 if atr_vals[i] is not None else None
+            state["eqAbsThrLast"] = thr
+            if thr is not None and hist:
+                for p in hist:
+                    if abs(float(s_hi["level"]) - float(p["level"])) <= thr:
+                        state["lastEQ"] = {
+                            "type": "EQH",
+                            "level": float(s_hi["level"]),
+                            "t": s_hi.get("t"),
+                            "refT": p.get("t"),
+                            "thr_abs": thr,
+                        }
+                        break
+        if s_lo is not None:
+            state["swingLow"] = s_lo
+            state["swingLowHist"].append(s_lo)
+            hist = state["swingLowHist"][-(eq_lookback + 1):-1]
+            thr = atr_vals[i] * 0.15 if atr_vals[i] is not None else None
+            state["eqAbsThrLast"] = thr
+            if thr is not None and hist:
+                for p in hist:
+                    if abs(float(s_lo["level"]) - float(p["level"])) <= thr:
+                        state["lastEQ"] = {
+                            "type": "EQL",
+                            "level": float(s_lo["level"]),
+                            "t": s_lo.get("t"),
+                            "refT": p.get("t"),
+                            "thr_abs": thr,
+                        }
+                        break
+
+        i_hi, i_lo = _confirm_pivot(i, internal_len)
+        if i_hi is not None:
+            state["internalHigh"] = i_hi
+        if i_lo is not None:
+            state["internalLow"] = i_lo
+
+        prev_close = float(htf[i - 1]["c"]); close = float(htf[i]["c"])
+        if state["swingHigh"] is not None and prev_close <= float(state["swingHigh"]["level"]) and close > float(state["swingHigh"]["level"]):
+            et = "CHOCH" if state["swingBias"] == -1 else "BOS"
+            state["swingBias"] = 1
+            state["lastSwingEvent"] = {"type": et, "dir": "LONG", "level": float(state["swingHigh"]["level"]), "t": htf[i].get("t"), "mode": "swing"}
+        elif state["swingLow"] is not None and prev_close >= float(state["swingLow"]["level"]) and close < float(state["swingLow"]["level"]):
+            et = "CHOCH" if state["swingBias"] == 1 else "BOS"
+            state["swingBias"] = -1
+            state["lastSwingEvent"] = {"type": et, "dir": "SHORT", "level": float(state["swingLow"]["level"]), "t": htf[i].get("t"), "mode": "swing"}
+
+        if state["internalHigh"] is not None and prev_close <= float(state["internalHigh"]["level"]) and close > float(state["internalHigh"]["level"]):
+            et = "CHOCH" if state["internalBias"] == -1 else "BOS"
+            state["internalBias"] = 1
+            state["lastInternalEvent"] = {"type": et, "dir": "LONG", "level": float(state["internalHigh"]["level"]), "t": htf[i].get("t"), "mode": "internal"}
+        elif state["internalLow"] is not None and prev_close >= float(state["internalLow"]["level"]) and close < float(state["internalLow"]["level"]):
+            et = "CHOCH" if state["internalBias"] == 1 else "BOS"
+            state["internalBias"] = -1
+            state["lastInternalEvent"] = {"type": et, "dir": "SHORT", "level": float(state["internalLow"]["level"]), "t": htf[i].get("t"), "mode": "internal"}
+
+    swing_high = state["swingHigh"]
+    swing_low = state["swingLow"]
+    close_now = float(htf[-1]["c"])
+    loc = "UNKNOWN"
+    pd = "EQUILIBRIUM"
+    if swing_high and swing_low and close_now is not None:
+        sh = float(swing_high["level"]); sl = float(swing_low["level"])
+        mid = (sh + sl) / 2.0
+        rng = abs(sh - sl)
+        band = 0.05 * rng
+        if close_now > (mid + band):
+            loc = "PREMIUM"; pd = "PREMIUM"
+        elif close_now < (mid - band):
+            loc = "DISCOUNT"; pd = "DISCOUNT"
+        else:
+            loc = "EQUILIBRIUM"; pd = "EQUILIBRIUM"
+
+    eq_obj = state["lastEQ"]
+    eq_state = str((eq_obj or {}).get("type") or "NONE")
+
+    dir_app = "NEUTRAL"
+    bias_app = "MIXED"
+    swing_event = state["lastSwingEvent"]
+    if str((swing_event or {}).get("dir") or "").upper() == "LONG" or int(state["swingBias"] or 0) == 1:
+        dir_app = "LONG"; bias_app = "BULLISH"
+    elif str((swing_event or {}).get("dir") or "").upper() == "SHORT" or int(state["swingBias"] or 0) == -1:
+        dir_app = "SHORT"; bias_app = "BEARISH"
+    return {
+        "htf_bias_appstyle": bias_app,
+        "htf_dir_appstyle": dir_app,
+        "htf_structure_appstyle": ((swing_event or {}).get("type") or "RANGE"),
+        "htf_location_appstyle": loc,
+        "htf_eq_appstyle": eq_state,
+        "htf_swing_bias_num": int(state["swingBias"] or 0),
+        "htf_internal_bias_num": int(state["internalBias"] or 0),
+        "htf_last_swing_event": swing_event,
+        "htf_last_internal_event": state["lastInternalEvent"],
+        "htf_pd_appstyle": pd,
+        "htf_eq_appstyle_obj": eq_obj,
     }
 
 
@@ -1906,6 +2106,12 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         result["run_once_debug"] = {
             "symbol": result.get("symbol"),
             "htf_bias": htf_gate.get("htf_bias"),
+            "htf_bias_appstyle": htf_gate.get("htf_bias_appstyle"),
+            "htf_dir_appstyle": htf_gate.get("htf_dir_appstyle"),
+            "htf_structure_appstyle": htf_gate.get("htf_structure_appstyle"),
+            "htf_location_appstyle": htf_gate.get("htf_location_appstyle"),
+            "htf_swing_bias_num": htf_gate.get("htf_swing_bias_num"),
+            "htf_internal_bias_num": htf_gate.get("htf_internal_bias_num"),
             "bullish_sweep": entry_sweep.get("bullish_sweep"),
             "bearish_sweep": entry_sweep.get("bearish_sweep"),
             "mixed_sweep_detected": entry_sweep.get("mixed_sweep_detected"),
