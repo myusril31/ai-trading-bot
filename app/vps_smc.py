@@ -1952,6 +1952,8 @@ def _classify_final_blocker(result: Dict[str, Any]) -> str:
         return "WAIT_RETEST"
     if "no_poi_retest_within_" in confirm_reason:
         return "WAIT_RETEST"
+    if "selected_sweep_missing_for_direction" in confirm_reason:
+        return "SELECTED_SWEEP_MISSING"
     if "reclaim_missing" in confirm_reason:
         return "WAIT_RECLAIM"
     if "wait_poi" in confirm_reason:
