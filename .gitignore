@@ -26,3 +26,10 @@ state/private/
 state/ml_models/*.pkl
 **/google_service_account.json
 *.service-account.json
+
+# local runtime / deploy backups
+data/
+logs/
+state/private/
+docker-compose.yml.bak.*
+FETCH_HEAD

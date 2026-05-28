@@ -1,11 +1,14 @@
 services:
   bot:
-    image: python:3.12-slim
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-trading-bot:local
     container_name: ai-trading-bot
     working_dir: /app
     volumes:
-      - ./:/app
-    command: sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+      - .:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - .env
     ports:
