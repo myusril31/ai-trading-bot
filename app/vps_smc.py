@@ -1121,37 +1121,119 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
 
 def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Dict[str, Any], entry_eq: Dict[str, Any], entry_sweep: Dict[str, Any]) -> Dict[str, Any]:
     near_liq_pct = _env_float("VPS_SMC_NEAR_LIQ_PCT", 0.35)
+    candidate_max_dist_pct = _env_float("VPS_SMC_CANDIDATE_MAX_DIST_PCT", 0.35)
+    candidate_between_near_pct = _env_float("VPS_SMC_CANDIDATE_BETWEEN_NEAR_PCT", 0.18)
     require_near = _env_bool("VPS_SMC_REQUIRE_AT_OR_NEAR_LIQ", True)
     close = float(entry[-1]["c"]) if entry else None
     last_high = entry_swing_summary.get("last_swing_high")
     last_low = entry_swing_summary.get("last_swing_low")
     eqh = entry_eq.get("eqh") or []
     eql = entry_eq.get("eql") or []
-    zones: List[Dict[str, Any]] = []
-    if last_high is not None:
-        zones.append({"type": "SWING_HIGH", "price": float(last_high)})
-    if last_low is not None:
-        zones.append({"type": "SWING_LOW", "price": float(last_low)})
-    for z in eqh:
-        if z.get("price") is not None:
-            zones.append({"type": "EQH", "price": float(z["price"])})
-    for z in eql:
-        if z.get("price") is not None:
-            zones.append({"type": "EQL", "price": float(z["price"])})
+
+    def _pick_relevant_cluster(clusters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        ranked: List[Dict[str, Any]] = []
+        for c in clusters:
+            if c.get("price") is None:
+                continue
+            price = float(c["price"])
+            touches = int(c.get("count") or c.get("touches") or 0)
+            ts = int(c.get("t") or 0)
+            dist = abs(close - price) if close is not None else float("inf")
+            ranked.append({"cluster": c, "touches": touches, "dist": dist, "t": ts})
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (-x["touches"], x["dist"], -x["t"]))
+        return ranked[0]["cluster"]
+
+    def _cluster_to_zone(cluster: Optional[Dict[str, Any]], zone_type: str) -> Optional[Dict[str, Any]]:
+        if cluster is None or cluster.get("price") is None:
+            return None
+        mid = float(cluster["price"])
+        band_pct = float(cluster.get("band_pct") or 0.15)
+        half = abs(mid) * (band_pct / 100.0)
+        if half == 0:
+            half = 1e-12
+        z_from = mid - half
+        z_to = mid + half
+        return {
+            "from": min(z_from, z_to),
+            "to": max(z_from, z_to),
+            "mid": mid,
+            "touches": int(cluster.get("count") or cluster.get("touches") or 0),
+            "type": zone_type,
+        }
+
+    bsl_zone = None
+    ssl_zone = None
+    bsl_zone = _cluster_to_zone(_pick_relevant_cluster(eqh), "BSL")
+    ssl_zone = _cluster_to_zone(_pick_relevant_cluster(eql), "SSL")
 
     nearest = None
-    if close is not None and close != 0 and zones:
-        nearest = min(zones, key=lambda z: abs(close - float(z["price"])))
     dist_pct = None
-    at_or_near = False
-    if nearest is not None and close is not None and close != 0:
-        dist_pct = abs(close - float(nearest["price"])) / close * 100.0
-        at_or_near = dist_pct <= near_liq_pct
+    dist_to_bsl_pct = None
+    dist_to_ssl_pct = None
+    liq_ctx_appstyle = "NONE"
+    if close is not None and close != 0:
+        zone_prices: List[Dict[str, Any]] = []
+        if bsl_zone is not None:
+            zone_prices.append({"type": "BSL", "price": float(bsl_zone["mid"])})
+            if float(bsl_zone["to"]) <= close <= float(bsl_zone["from"]):
+                liq_ctx_appstyle = "AT_BSL"
+            elif float(bsl_zone["from"]) <= close <= float(bsl_zone["to"]):
+                liq_ctx_appstyle = "AT_BSL"
+            dist_to_bsl_pct = abs(close - float(bsl_zone["mid"])) / close * 100.0
+        if ssl_zone is not None:
+            zone_prices.append({"type": "SSL", "price": float(ssl_zone["mid"])})
+            if float(ssl_zone["from"]) <= close <= float(ssl_zone["to"]):
+                liq_ctx_appstyle = "AT_SSL"
+            dist_to_ssl_pct = abs(close - float(ssl_zone["mid"])) / close * 100.0
+        if zone_prices:
+            nearest = min(zone_prices, key=lambda z: abs(close - float(z["price"])))
+            dist_pct = abs(close - float(nearest["price"])) / close * 100.0
+
+        if liq_ctx_appstyle == "NONE":
+            if dist_to_bsl_pct is not None and dist_to_bsl_pct <= near_liq_pct:
+                liq_ctx_appstyle = "NEAR_BSL"
+            elif dist_to_ssl_pct is not None and dist_to_ssl_pct <= near_liq_pct:
+                liq_ctx_appstyle = "NEAR_SSL"
+            elif bsl_zone is not None and ssl_zone is not None:
+                bsl_mid = float(bsl_zone["mid"])
+                ssl_mid = float(ssl_zone["mid"])
+                upper = max(bsl_mid, ssl_mid)
+                lower = min(bsl_mid, ssl_mid)
+                if lower < close < upper:
+                    liq_ctx_appstyle = "BETWEEN_BSL_SSL"
+                elif close > upper:
+                    liq_ctx_appstyle = "ABOVE_BSL"
+                elif close < lower:
+                    liq_ctx_appstyle = "BELOW_SSL"
+
+    at_or_near = liq_ctx_appstyle in ("AT_BSL", "NEAR_BSL", "AT_SSL", "NEAR_SSL")
     liq_gate_status = "PASS"
     liq_reason = None
-    if require_near and not at_or_near:
+    candidate_reason_appstyle = "pass_at_or_near"
+    if liq_ctx_appstyle == "BETWEEN_BSL_SSL":
+        if dist_pct is not None and dist_pct <= candidate_between_near_pct:
+            candidate_reason_appstyle = "pass_between_near"
+        else:
+            candidate_reason_appstyle = "block_between_far"
+            liq_gate_status = "BLOCK"
+            liq_reason = "between_bsl_ssl_too_far"
+    elif not at_or_near:
+        candidate_reason_appstyle = "block_not_at_or_near"
         liq_gate_status = "BLOCK"
-        liq_reason = "not_near_liquidity"
+        liq_reason = "not_at_or_near_bsl_ssl"
+    if dist_pct is not None and dist_pct > candidate_max_dist_pct and liq_gate_status == "PASS":
+        candidate_reason_appstyle = "block_candidate_too_far"
+        liq_gate_status = "BLOCK"
+        liq_reason = "candidate_too_far"
+    if require_near and liq_gate_status != "PASS":
+        liq_gate_status = "BLOCK"
+    elif not require_near:
+        liq_gate_status = "PASS"
+        liq_reason = None
+        candidate_reason_appstyle = "liquidity_gate_disabled"
+
     liq_ctx = {
         "last_buy_side_liq": float(last_high) if last_high is not None else None,
         "last_sell_side_liq": float(last_low) if last_low is not None else None,
@@ -1161,6 +1243,12 @@ def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Di
         "nearest_liq_price": (nearest or {}).get("price"),
         "dist_to_zone_pct": dist_pct,
         "at_or_near_liq": at_or_near,
+        "liq_ctx_appstyle": liq_ctx_appstyle,
+        "bsl_zone": bsl_zone,
+        "ssl_zone": ssl_zone,
+        "dist_to_bsl_pct": dist_to_bsl_pct,
+        "dist_to_ssl_pct": dist_to_ssl_pct,
+        "candidate_reason_appstyle": candidate_reason_appstyle,
         "sweep_tag": entry_sweep.get("sweep_tag"),
         "sweep_level": entry_sweep.get("sweep_level"),
         "sweep_extreme": entry_sweep.get("sweep_extreme"),
