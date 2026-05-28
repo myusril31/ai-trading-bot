@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 EXECUTION_BRIDGE_HANDLER = None
 
@@ -1157,7 +1157,21 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
             structure, direction, bias = "BOS_UP", "LONG", "BULLISH"
         elif close < last_low:
             structure, direction, bias = "BOS_DOWN", "SHORT", "BEARISH"
-    app = _build_htf_appstyle(htf)
+    try:
+        app = _build_htf_appstyle(htf)
+    except Exception:
+        app = {
+            "htf_bias_appstyle": "MIXED",
+            "htf_dir_appstyle": "NEUTRAL",
+            "htf_structure_appstyle": "UNKNOWN",
+            "htf_location_appstyle": "UNKNOWN",
+            "htf_eq_appstyle": "NONE",
+            "htf_swing_bias_num": 0,
+            "htf_internal_bias_num": 0,
+            "htf_last_swing_event": None,
+            "htf_last_internal_event": None,
+            "htf_pd_appstyle": "UNKNOWN",
+        }
     return {
         "htf_gate_status": "PASS",
         "htf_dir": direction,
