@@ -836,13 +836,15 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
 def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     sweep = (context or {}).get("entry_sweep") or {}
     htf_gate = (context or {}).get("htf_gate") or {}
-    htf_bias_appstyle = str(htf_gate.get("htf_bias_appstyle") or "").upper()
-    swing_bias_num = int(htf_gate.get("htf_swing_bias_num") or 0)
-    last_swing_dir = str(((htf_gate.get("htf_last_swing_event") or {}).get("dir") or "")).upper()
-    if htf_bias_appstyle in ("BULLISH", "BULL") or swing_bias_num == 1 or last_swing_dir == "LONG":
-        return {"stageb_direction": "LONG", "direction_reason": "htf_appstyle_bullish"}
-    if htf_bias_appstyle in ("BEARISH", "BEAR") or swing_bias_num == -1 or last_swing_dir == "SHORT":
-        return {"stageb_direction": "SHORT", "direction_reason": "htf_appstyle_bearish"}
+    htf_appstyle_ready = bool(htf_gate.get("htf_appstyle_ready"))
+    if htf_appstyle_ready:
+        htf_bias_appstyle = str(htf_gate.get("htf_bias_appstyle") or "").upper()
+        swing_bias_num = int(htf_gate.get("htf_swing_bias_num") or 0)
+        last_swing_dir = str(((htf_gate.get("htf_last_swing_event") or {}).get("dir") or "")).upper()
+        if htf_bias_appstyle in ("BULLISH", "BULL") or swing_bias_num == 1 or last_swing_dir == "LONG":
+            return {"stageb_direction": "LONG", "direction_reason": "htf_appstyle_bullish"}
+        if htf_bias_appstyle in ("BEARISH", "BEAR") or swing_bias_num == -1 or last_swing_dir == "SHORT":
+            return {"stageb_direction": "SHORT", "direction_reason": "htf_appstyle_bearish"}
     htf_bias = str(htf_gate.get("htf_bias") or htf_gate.get("htf_dir") or "").upper()
     if htf_bias in ("BULLISH", "BULL", "LONG"):
         return {"stageb_direction": "LONG", "direction_reason": "htf_bias_bullish"}
@@ -1121,6 +1123,7 @@ def _env_float(name: str, default: float) -> float:
 
 def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any]) -> Dict[str, Any]:
     min_candles = _env_int("VPS_SMC_HTF_MIN_CANDLES", 30)
+    appstyle_min_candles = _env_int("VPS_SMC_HTF_APPSTYLE_MIN_CANDLES", 180)
     eq_band_pct = _env_float("VPS_SMC_HTF_EQ_BAND_PCT", 0.30)
     if len(htf) < min_candles:
         return {
@@ -1130,6 +1133,7 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
             "htf_bias_appstyle": "MIXED", "htf_dir_appstyle": "NEUTRAL", "htf_structure_appstyle": "UNKNOWN",
             "htf_location_appstyle": "UNKNOWN", "htf_eq_appstyle": "NONE", "htf_swing_bias_num": 0,
             "htf_internal_bias_num": 0, "htf_last_swing_event": None, "htf_last_internal_event": None, "htf_pd_appstyle": "UNKNOWN",
+            "htf_appstyle_ready": False, "htf_appstyle_reason": "not_enough_4h_candles_for_gate",
         }
 
     close = float(htf[-1]["c"])
@@ -1157,9 +1161,17 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
             structure, direction, bias = "BOS_UP", "LONG", "BULLISH"
         elif close < last_low:
             structure, direction, bias = "BOS_DOWN", "SHORT", "BEARISH"
+    appstyle_ready = len(htf) >= appstyle_min_candles
+    appstyle_reason = "ok" if appstyle_ready else f"need_{appstyle_min_candles}_4h_candles_got_{len(htf)}"
     try:
-        app = _build_htf_appstyle(htf)
+        app = _build_htf_appstyle(htf) if appstyle_ready else {
+            "htf_bias_appstyle": "MIXED", "htf_dir_appstyle": "NEUTRAL", "htf_structure_appstyle": "RANGE",
+            "htf_location_appstyle": "UNKNOWN", "htf_eq_appstyle": "NONE", "htf_swing_bias_num": 0,
+            "htf_internal_bias_num": 0, "htf_last_swing_event": None, "htf_last_internal_event": None, "htf_pd_appstyle": "UNKNOWN",
+        }
     except Exception:
+        appstyle_ready = False
+        appstyle_reason = "appstyle_exception_fallback"
         app = {
             "htf_bias_appstyle": "MIXED",
             "htf_dir_appstyle": "NEUTRAL",
@@ -1193,6 +1205,8 @@ def build_htf_gate(htf: List[Dict[str, Any]], htf_swing_summary: Dict[str, Any])
         "htf_last_swing_event": app.get("htf_last_swing_event"),
         "htf_last_internal_event": app.get("htf_last_internal_event"),
         "htf_pd_appstyle": app.get("htf_pd_appstyle"),
+        "htf_appstyle_ready": appstyle_ready,
+        "htf_appstyle_reason": appstyle_reason,
     }
 
 
@@ -2119,6 +2133,9 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         htf_gate = result.get("htf_gate") or {}
         result["run_once_debug"] = {
             "symbol": result.get("symbol"),
+            "htf_count": result.get("htf_count"),
+            "htf_appstyle_ready": htf_gate.get("htf_appstyle_ready"),
+            "htf_appstyle_reason": htf_gate.get("htf_appstyle_reason"),
             "htf_bias": htf_gate.get("htf_bias"),
             "htf_bias_appstyle": htf_gate.get("htf_bias_appstyle"),
             "htf_dir_appstyle": htf_gate.get("htf_dir_appstyle"),
