@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timedelta, timezone
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -250,7 +252,43 @@ def _load_internal_candles(symbol: str, interval: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
     out.sort(key=lambda x: int(x.get("tBucketMs") or 0))
+    if interval == (str(os.getenv("VPS_SMC_INTERVAL_HTF", "4h")).strip() or "4h"):
+        htf_limit = max(50, min(_env_int("VPS_SMC_HTF_CANDLE_LIMIT", 220), 1000))
+        if len(out) < htf_limit:
+            fetched = _fetch_binance_closed_klines(symbol, interval, htf_limit)
+            if fetched:
+                merged: Dict[int, Dict[str, Any]] = {int(x.get("tBucketMs") or 0): x for x in out}
+                for row in fetched:
+                    merged[int(row.get("tBucketMs") or 0)] = row
+                out = sorted(merged.values(), key=lambda x: int(x.get("tBucketMs") or 0))
+        out = out[-htf_limit:]
     return out
+
+
+def _fetch_binance_closed_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+    try:
+        base = str(os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com")).strip() or "https://fapi.binance.com"
+        q = urllib.parse.urlencode({"symbol": str(symbol).upper(), "interval": interval, "limit": int(limit)})
+        url = f"{base}/fapi/v1/klines?{q}"
+        req = urllib.request.Request(url, headers={"User-Agent": "vps-smc/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        now_ms = int(time.time() * 1000)
+        out: List[Dict[str, Any]] = []
+        for k in data if isinstance(data, list) else []:
+            try:
+                ot = int(k[0]); ct = int(k[6])
+                if ct >= now_ms:
+                    continue
+                out.append({
+                    "t": ct, "tBucketMs": ot,
+                    "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+                })
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
 
 
 
