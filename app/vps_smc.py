@@ -1774,6 +1774,36 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
     if not vps_path.exists():
         notes.append("missing_vps_shadow_logs")
 
+    tolerance_pct = _env_float("VPS_SMC_COMPARE_PRICE_TOLERANCE_PCT", 0.05)
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            if value is None or str(value).strip() == "":
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def _is_price_mismatch(a: Any, b: Any) -> bool:
+        av = _to_float(a)
+        bv = _to_float(b)
+        if av is None or bv is None:
+            return False
+        denom = max(abs(av), abs(bv), 1e-12)
+        rel_diff_pct = abs(av - bv) / denom * 100.0
+        return rel_diff_pct > float(tolerance_pct)
+
+    latest_diag_by_symbol: Dict[str, Dict[str, Any]] = {}
+    diag_rows = _read_jsonl(_log_dir() / "vps_smc_gate_diagnostics.jsonl")
+    if diag_rows:
+        latest = diag_rows[-1] if isinstance(diag_rows[-1], dict) else {}
+        for d in (latest.get("diagnostics") or []):
+            if not isinstance(d, dict):
+                continue
+            sym = _normalize_symbol(d.get("symbol"))
+            if sym:
+                latest_diag_by_symbol[sym] = d
+
     app_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     for row in app_rows_raw:
         sample_type = str(row.get("sample_type") or "").strip().upper()
@@ -1790,14 +1820,7 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
         dt = _parse_iso_utc(row.get("created_at_utc") or row.get("event_at_utc") or row.get("timestamp_utc"))
         if dt is None or dt < cutoff:
             continue
-        app_by_symbol.setdefault(symbol, []).append({
-            "signal_key": row.get("signal_key") or row.get("signal_id"),
-            "direction_raw": row.get("direction") or row.get("dir"),
-            "direction": _normalize_direction(row.get("direction") or row.get("dir")),
-            "decision": decision,
-            "created_at_utc": dt.isoformat(),
-            "ts": dt.timestamp(),
-        })
+        app_by_symbol.setdefault(symbol, []).append({"signal_key": row.get("signal_key") or row.get("signal_id"), "direction_raw": row.get("direction") or row.get("dir"), "direction": _normalize_direction(row.get("direction") or row.get("dir"),), "decision": decision, "status": row.get("state") or row.get("status") or decision, "entry": row.get("entry") or row.get("entry_mid"), "sl": row.get("sl"), "tp1": row.get("tp1"), "tp2": row.get("tp2"), "tp3": row.get("tp3"), "created_at_utc": dt.isoformat(), "ts": dt.timestamp(),})
 
     vps_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     for row in vps_rows_raw:
@@ -1813,14 +1836,7 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
         dt = _parse_iso_utc(row.get("created_at_utc") or row.get("event_at_utc") or row.get("timestamp_utc"))
         if dt is None or dt < cutoff:
             continue
-        vps_by_symbol.setdefault(symbol, []).append({
-            "signal_key": row.get("signal_key"),
-            "direction": _normalize_direction(row.get("direction")),
-            "score": row.get("score"),
-            "priority": row.get("priority"),
-            "created_at_utc": dt.isoformat(),
-            "ts": dt.timestamp(),
-        })
+        vps_by_symbol.setdefault(symbol, []).append({"signal_key": row.get("signal_key"), "direction": _normalize_direction(row.get("direction")), "status": row.get("state") or row.get("status"), "entry": row.get("entry") or row.get("entry_mid"), "sl": row.get("sl"), "tp1": row.get("tp1"), "tp2": row.get("tp2"), "tp3": row.get("tp3"), "score": row.get("score"), "priority": row.get("priority"), "created_at_utc": dt.isoformat(), "ts": dt.timestamp(),})
 
     rows: List[Dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -1830,20 +1846,22 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
         app = app_items[0] if app_items else None
         vps = vps_items[0] if vps_items else None
 
-        classification = "OVERLAP_AGREE"
-        reason = "direction_match"
+        classification = "NO_SIGNAL_BOTH"
+        reason = "no_signal_both"
         if app and vps:
             if (app.get("direction") or "") != (vps.get("direction") or ""):
-                classification = "CONFLICT"
-                reason = "direction_conflict"
+                classification = "CONFLICT"; reason = "direction_mismatch"
+            elif any(_is_price_mismatch(app.get(k), vps.get(k)) for k in ("entry", "sl", "tp1", "tp2", "tp3")):
+                classification = "CONFLICT"; reason = "price_plan_mismatch"
+            else:
+                classification = "OVERLAP_AGREE"; reason = "direction_match"
         elif app and not vps:
             classification = "APP_ONLY"
-            reason = "no_vps_signal"
+            blocker = str((latest_diag_by_symbol.get(symbol) or {}).get("final_blocker") or "").strip()
+            reason = f"vps_blocker:{blocker}" if blocker else "app_only_no_vps_confirm"
         elif vps and not app:
             classification = "VPS_ONLY"
-            reason = "no_app_signal"
-        else:
-            continue
+            reason = "vps_only_no_app_signal"
 
         compare_key = "|".join([
             symbol,
@@ -1861,11 +1879,11 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
             "symbol": symbol,
             "classification": classification,
             "app_signal_key": (app or {}).get("signal_key"),
-            "app_direction": (app or {}).get("direction_raw"),
+            "app_direction": (app or {}).get("direction_raw"), "app_status": (app or {}).get("status"), "app_entry": (app or {}).get("entry"), "app_sl": (app or {}).get("sl"), "app_tp1": (app or {}).get("tp1"), "app_tp2": (app or {}).get("tp2"), "app_tp3": (app or {}).get("tp3"),
             "app_decision": (app or {}).get("decision"),
             "app_created_at_utc": (app or {}).get("created_at_utc"),
             "vps_signal_key": (vps or {}).get("signal_key"),
-            "vps_direction": (vps or {}).get("direction"),
+            "vps_direction": (vps or {}).get("direction"), "vps_status": (vps or {}).get("status"), "vps_entry": (vps or {}).get("entry"), "vps_sl": (vps or {}).get("sl"), "vps_tp1": (vps or {}).get("tp1"), "vps_tp2": (vps or {}).get("tp2"), "vps_tp3": (vps or {}).get("tp3"),
             "vps_score": (vps or {}).get("score"),
             "vps_priority": (vps or {}).get("priority"),
             "vps_created_at_utc": (vps or {}).get("created_at_utc"),
@@ -1880,6 +1898,7 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
         "app_only": len([r for r in rows if r.get("classification") == "APP_ONLY"]),
         "vps_only": len([r for r in rows if r.get("classification") == "VPS_ONLY"]),
         "conflict": len([r for r in rows if r.get("classification") == "CONFLICT"]),
+        "no_signal_both": len([r for r in rows if r.get("classification") == "NO_SIGNAL_BOTH"]),
     }
     for row in rows:
         _append_jsonl(_log_dir() / "vps_smc_compare.jsonl", row)
@@ -1902,6 +1921,85 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
     return out
 
 
+
+
+def _classify_final_blocker(result: Dict[str, Any]) -> str:
+    if str(result.get("status") or "") == "DATA_GAP":
+        return "DATA_GAP"
+    htf_gate = result.get("htf_gate") or {}
+    liq_gate_status = str(result.get("liq_gate_status") or "").upper()
+    stageb = result.get("stageb_confirmation") or {}
+    state_machine_raw = stageb.get("stageb_state_machine")
+    state_machine = str(state_machine_raw or "")
+    status = str(stageb.get("stageb_status") or "")
+    confirm_reason = str(stageb.get("stageb_confirm_reason") or "")
+    if str(htf_gate.get("htf_gate_status") or "").upper() == "BLOCK":
+        return "HTF_BLOCKED"
+    if liq_gate_status == "BLOCK" and (confirm_reason == "liq_gate_blocked" or state_machine in ("", "IDLE")):
+        return "LIQ_BLOCKED"
+    selected_direction = str(stageb.get("selected_direction") or "NONE").upper()
+    if selected_direction not in ("LONG", "SHORT"):
+        return "NO_SWEEP_DIRECTION"
+    if not stageb.get("selected_sweep_tag"):
+        return "SELECTED_SWEEP_MISSING"
+    if str(stageb.get("stageb_invalid_reason") or "") == "invalidated_beyond_sweep_extreme_buffer":
+        return "INVALIDATED_BEYOND_SWEEP"
+    if state_machine == "WAIT_DISPLACEMENT":
+        return "WAIT_DISPLACEMENT"
+    if "no_displacement_within_" in confirm_reason:
+        return "NO_DISPLACEMENT_EXPIRED"
+    if state_machine == "WAIT_RETEST":
+        return "WAIT_RETEST"
+    if "no_poi_retest_within_" in confirm_reason:
+        return "WAIT_RETEST"
+    if "reclaim_missing" in confirm_reason:
+        return "WAIT_RECLAIM"
+    if "wait_poi" in confirm_reason:
+        return "WAIT_POI"
+    if status != "CONFIRMED":
+        return "PLAN_INVALID"
+    if str(result.get("plan_status") or "") != "VALID":
+        return "PLAN_INVALID"
+    if str(result.get("signal_skip_reason") or "") == "score_below_min":
+        return "SCORE_BELOW_MIN"
+    if result.get("signal_logged"):
+        return "CONFIRMED"
+    if str(result.get("signal_skip_reason") or "") in ("duplicate","signal_log_disabled"):
+        return "CONFIRMED"
+    return "UNKNOWN"
+
+
+def _build_diagnostics(results: List[Dict[str, Any]], signal_count: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    diags=[]
+    by_final_blocker={}
+    by_liq={}
+    by_stage={}
+    by_dir={}
+    by_poi={}
+    for r in results:
+        htf=r.get("htf_gate") or {}
+        liq=r.get("liq_ctx") or {}
+        st=r.get("stageb_confirmation") or {}
+        reclaim=st.get("stageb_reclaim") or {}
+        disp=st.get("stageb_displacement") or {}
+        ret=st.get("stageb_retest") or {}
+        final_blocker=_classify_final_blocker(r)
+        d={
+            "symbol":r.get("symbol"),"status":r.get("status"),"context_status":r.get("context_status"),"htf_count":r.get("htf_count"),"entry_count":r.get("entry_count"),"stageb_count":r.get("stageb_count"),
+            "htf_gate_status":htf.get("htf_gate_status"),"htf_bias":htf.get("htf_bias"),"htf_bias_appstyle":htf.get("htf_bias_appstyle"),"htf_appstyle_ready":htf.get("htf_appstyle_ready"),"htf_dir_appstyle":htf.get("htf_dir_appstyle"),
+            "liq_gate_status":r.get("liq_gate_status"),"liq_ctx_appstyle":liq.get("liq_ctx_appstyle"),"liq_reason":r.get("liq_reason"),"dist_to_bsl_pct":liq.get("dist_to_bsl_pct"),"dist_to_ssl_pct":liq.get("dist_to_ssl_pct"),"candidate_reason_appstyle":liq.get("candidate_reason_appstyle"),
+            "selected_direction":st.get("selected_direction"),"selected_direction_reason":st.get("selected_direction_reason"),
+            "bullish_sweep":(r.get("entry_sweep") or {}).get("bullish_sweep"),"bearish_sweep":(r.get("entry_sweep") or {}).get("bearish_sweep"),"mixed_sweep_detected":(r.get("entry_sweep") or {}).get("mixed_sweep_detected"),
+            "selected_sweep_tag":st.get("selected_sweep_tag"),"selected_sweep_level":st.get("selected_sweep_level"),"selected_sweep_extreme":st.get("selected_sweep_extreme"),"selected_sweep_t":st.get("selected_sweep_t"),
+            "stageb_state_machine":st.get("stageb_state_machine"),"stageb_status":st.get("stageb_status"),"stageb_confirm_reason":st.get("stageb_confirm_reason"),"stageb_invalid_reason":st.get("stageb_invalid_reason"),
+            "reclaim_ok":bool(reclaim.get("has_reclaim")),"reclaim_reason":reclaim.get("reason"),"displacement_ok":bool(disp.get("has_displacement")),"displacement_reason":disp.get("reason"),"fvg_available":st.get("fvg_available"),"ob_available":st.get("ob_available"),"selected_poi_type":st.get("selected_poi_type"),"selected_poi_reason":st.get("selected_poi_reason"),"retest_ok":bool(ret.get("has_retest")),"retest_reason":ret.get("reason"),
+            "plan_status":r.get("plan_status"),"signal_skip_reason":r.get("signal_skip_reason"),"final_blocker":final_blocker,
+        }
+        diags.append(d)
+        for m,k in ((by_final_blocker,final_blocker),(by_liq,d.get("liq_ctx_appstyle") or "NONE"),(by_stage,d.get("stageb_state_machine") or "NONE"),(by_dir,d.get("selected_direction") or "NONE"),(by_poi,d.get("selected_poi_type") or "NONE")):
+            m[k]=m.get(k,0)+1
+    summary={"total_symbols":len(results),"ready_count":sum(1 for r in results if r.get("context_status")=="READY"),"blocked_count":sum(1 for r in results if r.get("context_status") in ("BLOCKED","DATA_GAP","HTF_DATA_GAP")),"confirmed_count":sum(1 for d in diags if d.get("final_blocker")=="CONFIRMED"),"signal_count":signal_count,"by_final_blocker":by_final_blocker,"by_liq_ctx_appstyle":by_liq,"by_stageb_state":by_stage,"by_selected_direction":by_dir,"by_selected_poi_type":by_poi}
+    return diags,summary
 def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
     requested_raw = symbols or []
     requested = [_normalize_symbol(s) for s in requested_raw if _normalize_symbol(s)]
@@ -2265,6 +2363,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 })
         signal_count += 1
 
+    diagnostics, diagnostic_summary = _build_diagnostics(results, signal_count)
     for result in results:
         entry_sweep = result.get("entry_sweep") or {}
         stageb = result.get("stageb_confirmation") or {}
@@ -2355,6 +2454,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         "error": last_error,
     }
     _append_jsonl(_log_dir() / "vps_smc_systemlog.jsonl", log_row)
+    _append_jsonl(_log_dir() / "vps_smc_gate_diagnostics.jsonl", {"created_at_utc": log_row["created_at_utc"], "mode": log_row["mode"], "symbols_evaluated": log_row["symbols_evaluated"], "summary": diagnostic_summary, "diagnostics": diagnostics})
 
     state["last_run_utc"] = log_row["created_at_utc"]
     state["last_signal_count"] = signal_count
@@ -2370,6 +2470,8 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
         "symbols_evaluated": state["last_symbols"],
         "signal_count": signal_count,
         "results": results,
+        "diagnostics": diagnostics,
+        "diagnostic_summary": diagnostic_summary,
     }
 
 
@@ -2755,3 +2857,10 @@ def vps_smc_latest_signals(symbol: str, limit: int) -> Dict[str, Any]:
         "count": len(latest),
         "signals": latest,
     }
+
+
+def vps_smc_diagnostics_latest(limit: int = 1) -> Dict[str, Any]:
+    rows = _read_jsonl(_log_dir() / "vps_smc_gate_diagnostics.jsonl")
+    lim = max(1, min(int(limit or 1), 20))
+    latest = rows[-lim:] if rows else []
+    return {"ok": True, "count": len(latest), "rows": latest}

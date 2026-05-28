@@ -5900,6 +5900,17 @@ def vps_smc_scheduler_status_endpoint(
     return vps_smc.vps_smc_scheduler_status()
 
 
+
+
+@app.get("/vps-smc/diagnostics/latest")
+def vps_smc_diagnostics_latest_endpoint(
+    limit: Optional[int] = 1,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+):
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return vps_smc.vps_smc_diagnostics_latest(limit=limit or 1)
+
 @app.post("/vps-smc/scheduler/run-once")
 def vps_smc_scheduler_run_once_endpoint(
     payload: Optional[VpsSmcSchedulerRunOncePayload] = None,
