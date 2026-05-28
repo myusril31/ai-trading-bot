@@ -806,6 +806,73 @@ def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t:
     return out
 
 
+def _semi_find_ob_before_displacement(
+    candles: List[Dict[str, Any]],
+    direction: str,
+    displacement_idx: Any,
+    lookback: int,
+    min_body_atr: float,
+) -> Dict[str, Any]:
+    out = {"has_ob": False, "ob_type": None, "ob_lo": None, "ob_hi": None, "ob_t": None, "ob_idx": None, "reason": "not_found"}
+    try:
+        d_idx = int(displacement_idx)
+    except Exception:
+        out["reason"] = "missing_displacement_idx"
+        return out
+    d = str(direction or "").upper()
+    if d not in ("LONG", "SHORT"):
+        out["reason"] = "invalid_direction"
+        return out
+    bars = candles or []
+    if d_idx <= 0 or d_idx >= len(bars):
+        out["reason"] = "invalid_displacement_idx"
+        return out
+    start = max(0, d_idx - max(1, int(lookback or 12)))
+    for i in range(d_idx - 1, start - 1, -1):
+        c = bars[i] or {}
+        try:
+            o = float(c["o"]); close = float(c["c"]); low = float(c["l"]); high = float(c["h"])
+        except Exception:
+            continue
+        directional_candle = (d == "LONG" and close < o) or (d == "SHORT" and close > o)
+        if not directional_candle:
+            continue
+        if float(min_body_atr or 0.0) > 0.0:
+            atr = calc_atr(bars[: i + 1], _env_int("VPS_SMC_DISPLACEMENT_ATR_LEN", 14))
+            if atr is None or atr <= 0:
+                continue
+            if abs(close - o) < (float(min_body_atr) * atr):
+                continue
+        out.update({
+            "has_ob": True,
+            "ob_type": ("BULL_OB" if d == "LONG" else "BEAR_OB"),
+            "ob_lo": low,
+            "ob_hi": high,
+            "ob_t": _semi_bar_t(c),
+            "ob_idx": i,
+            "reason": "ok",
+        })
+        return out
+    return out
+
+
+def _semi_select_poi(fvg: Dict[str, Any], ob: Dict[str, Any]) -> Dict[str, Any]:
+    has_fvg = bool((fvg or {}).get("has_fvg"))
+    has_ob = bool((ob or {}).get("has_ob"))
+    out = {
+        "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None,
+        "selected_poi_reason": "no_valid_poi", "fvg_available": has_fvg, "ob_available": has_ob,
+    }
+    if has_fvg:
+        lo = float(fvg.get("fvg_lo")); hi = float(fvg.get("fvg_hi"))
+        out.update({"selected_poi_type": "FVG", "selected_poi_lo": min(lo, hi), "selected_poi_hi": max(lo, hi), "selected_poi_mid": (lo + hi) / 2.0, "selected_poi_t": fvg.get("fvg_t"), "selected_poi_reason": "fvg_preferred"})
+        return out
+    if has_ob:
+        lo = float(ob.get("ob_lo")); hi = float(ob.get("ob_hi"))
+        out.update({"selected_poi_type": "OB", "selected_poi_lo": min(lo, hi), "selected_poi_hi": max(lo, hi), "selected_poi_mid": (lo + hi) / 2.0, "selected_poi_t": ob.get("ob_t"), "selected_poi_reason": "ob_fallback_no_fvg"})
+    return out
+
+
 def _semi_find_retest_rejection(
     candles: List[Dict[str, Any]],
     direction: str,
@@ -815,8 +882,8 @@ def _semi_find_retest_rejection(
 ) -> Dict[str, Any]:
     out = {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_found"}
     try:
-        zlo = min(float(poi.get("fvg_lo")), float(poi.get("fvg_hi")))
-        zhi = max(float(poi.get("fvg_lo")), float(poi.get("fvg_hi")))
+        zlo = min(float(poi.get("selected_poi_lo")), float(poi.get("selected_poi_hi")))
+        zhi = max(float(poi.get("selected_poi_lo")), float(poi.get("selected_poi_hi")))
         t0 = int(after_t)
     except Exception:
         out["reason"] = "missing_poi_or_after_t"
@@ -862,7 +929,10 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
         "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
         "stageb_displacement": {"has_displacement": False, "direction": direction, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
         "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built"},
+        "stageb_ob_poi": {"has_ob": False, "ob_type": None, "ob_lo": None, "ob_hi": None, "ob_t": None, "reason": "not_built"},
         "stageb_retest": {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_built"},
+        "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_reason": "no_valid_poi",
+        "fvg_available": False, "ob_available": False,
         "stageb_confirm_reason": None,
         "stageb_invalid_reason": None,
         "stageb_state_machine": "IDLE",
@@ -969,6 +1039,9 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
     max_disp = _env_int("VPS_SMC_SWEEP_MAX_AGE_BARS_5M", 10)
     max_retest = _env_int("VPS_SMC_RETEST_MAX_AGE_BARS_5M", 18)
     fvg_lookback = _env_int("VPS_SMC_FVG_LOOKBACK_BARS_5M", 35)
+    ob_enabled = _env_bool("VPS_SMC_OB_ENABLED", True)
+    ob_lookback = _env_int("VPS_SMC_OB_LOOKBACK", 12)
+    ob_min_body_atr = _env_float("VPS_SMC_OB_MIN_BODY_ATR", 0.0)
 
     liq_ctx = result.get("liq_ctx") or {}
 
@@ -989,6 +1062,8 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         out["stageb_reclaim"] = st.get("reclaim") or out["stageb_reclaim"]
         out["stageb_displacement"] = st.get("displacement") or out["stageb_displacement"]
         out["stageb_fvg_poi"] = st.get("poi") or out["stageb_fvg_poi"]
+        out["stageb_ob_poi"] = st.get("ob") or out["stageb_ob_poi"]
+        out.update(st.get("selected_poi") or {})
         out["stageb_retest"] = st.get("retest") or out["stageb_retest"]
         out["confirmed_t"] = confirmed_t
         out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
@@ -1071,13 +1146,22 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             return out
 
         poi = st.get("poi") if isinstance(st.get("poi"), dict) and st.get("poi", {}).get("has_fvg") else _semi_find_fvg_after(stageb_candles, direction, disp.get("displacement_t"), fvg_lookback)
+        ob = st.get("ob") if isinstance(st.get("ob"), dict) else {"has_ob": False}
+        if not ob.get("has_ob") and ob_enabled:
+            ob = _semi_find_ob_before_displacement(stageb_candles, direction, disp.get("displacement_idx"), ob_lookback, ob_min_body_atr)
+        selected_poi = _semi_select_poi(poi, ob)
         out["stageb_fvg_poi"] = poi
+        out["stageb_ob_poi"] = ob
+        out.update(selected_poi)
 
-        if not poi.get("has_fvg"):
+        if not selected_poi.get("selected_poi_type"):
             out["stageb_status"] = "WATCH"
             out["stageb_state_machine"] = "WAIT_DISPLACEMENT"
-            out["stageb_confirm_reason"] = "displacement_ok_wait_fvg_poi"
+            out["stageb_confirm_reason"] = "displacement_ok_wait_poi"
             st["displacement"] = disp
+            st["poi"] = poi
+            st["ob"] = ob
+            st["selected_poi"] = selected_poi
             st["updated_at_utc"] = _utc_now_iso()
             states[symbol] = st
             _save_semi_states(states)
@@ -1086,8 +1170,10 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         st["state"] = "WAIT_RETEST"
         st["displacement"] = disp
         st["poi"] = poi
+        st["ob"] = ob
+        st["selected_poi"] = selected_poi
         st["displacement_t"] = disp.get("displacement_t")
-        st["poi_t"] = poi.get("fvg_t")
+        st["poi_t"] = selected_poi.get("selected_poi_t")
         st["updated_at_utc"] = _utc_now_iso()
         states[symbol] = st
         _save_semi_states(states)
@@ -1098,12 +1184,15 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         reclaim = st.get("reclaim") or {}
         disp = st.get("displacement") or {}
         poi = st.get("poi") or {}
+        selected_poi = st.get("selected_poi") or {}
 
         out["stageb_reclaim"] = reclaim or out["stageb_reclaim"]
         out["stageb_displacement"] = disp or out["stageb_displacement"]
         out["stageb_fvg_poi"] = poi or out["stageb_fvg_poi"]
+        out["stageb_ob_poi"] = (st.get("ob") or out["stageb_ob_poi"])
+        out.update(selected_poi)
 
-        after_t = max(int(disp.get("displacement_t") or 0), int(poi.get("fvg_t") or 0))
+        after_t = max(int(disp.get("displacement_t") or 0), int(selected_poi.get("selected_poi_t") or 0))
         waited = _semi_bars_since(stageb_candles, after_t)
 
         if waited > max_retest:
@@ -1115,7 +1204,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             out["stageb_invalid_reason"] = f"no_poi_retest_within_{max_retest}_bars"
             return out
 
-        retest = _semi_find_retest_rejection(stageb_candles, direction, poi, after_t, max_retest)
+        retest = _semi_find_retest_rejection(stageb_candles, direction, selected_poi, after_t, max_retest)
         out["stageb_retest"] = retest
 
         if not (retest.get("has_retest") and retest.get("has_rejection_close")):
@@ -1140,7 +1229,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         out["stageb_retest"] = retest
         out["confirmed_t"] = confirmed_t
         out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
-        out["stageb_confirm_reason"] = "fvg_retest_rejection_close"
+        out["stageb_confirm_reason"] = "poi_retest_rejection_close"
         return out
 
     out["stageb_status"] = "WATCH"
@@ -1552,19 +1641,19 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     direction = str(((result.get("stageb_confirmation") or {}).get("stageb_direction") or "NONE")).upper()
     if direction not in ("LONG", "SHORT"):
         return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["invalid_direction"]}, "invalid_plan"
-    fvg = ((result.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {})
-    fvg_lo = fvg.get("fvg_lo")
-    fvg_hi = fvg.get("fvg_hi")
-    if fvg_lo is None or fvg_hi is None:
-        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["missing_fvg"]}, "invalid_plan"
-    entry_lo = min(float(fvg_lo), float(fvg_hi))
-    entry_hi = max(float(fvg_lo), float(fvg_hi))
+    stageb = (result.get("stageb_confirmation") or {})
+    poi_lo = stageb.get("selected_poi_lo")
+    poi_hi = stageb.get("selected_poi_hi")
+    if poi_lo is None or poi_hi is None:
+        return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["missing_selected_poi"]}, "invalid_plan"
+    entry_lo = min(float(poi_lo), float(poi_hi))
+    entry_hi = max(float(poi_lo), float(poi_hi))
     entry_mid = (entry_lo + entry_hi) / 2.0
     liq_ctx = result.get("liq_ctx") or {}
     htf_gate = result.get("htf_gate") or {}
     entry_sw = result.get("entry_swing_summary") or {}
     htf_sw = result.get("htf_swing_summary") or {}
-    sweep_extreme = liq_ctx.get("sweep_extreme")
+    sweep_extreme = stageb.get("selected_sweep_extreme") or liq_ctx.get("sweep_extreme")
     buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)
     buffer_mult = buffer_pct / 100.0
     if sweep_extreme is None:
@@ -1925,6 +2014,15 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "stageb_reclaim": {},
                 "stageb_displacement": {},
                 "stageb_fvg_poi": {},
+                "stageb_ob_poi": {},
+                "selected_poi_type": None,
+                "selected_poi_lo": None,
+                "selected_poi_hi": None,
+                "selected_poi_mid": None,
+                "selected_poi_t": None,
+                "selected_poi_reason": "no_valid_poi",
+                "fvg_available": False,
+                "ob_available": False,
                 "stageb_confirm_reason": None,
                 "stageb_invalid_reason": "not_built",
             }
@@ -1949,6 +2047,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                         "stageb_reclaim": {},
                         "stageb_displacement": {},
                         "stageb_fvg_poi": {},
+                        "stageb_ob_poi": {},
                         "stageb_confirm_reason": None,
                         "stageb_invalid_reason": f"stageb_error:{sexc}",
                     }
@@ -2018,6 +2117,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "stageb_reclaim": {},
             "stageb_displacement": {},
             "stageb_fvg_poi": {},
+            "stageb_ob_poi": {},
             "stageb_confirm_reason": None,
             "stageb_invalid_reason": "not_built",
         })
@@ -2192,6 +2292,18 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
             "selected_sweep_t": stageb.get("selected_sweep_t"),
             "stageb_state_machine": stageb.get("stageb_state_machine"),
             "stageb_confirm_reason": stageb.get("stageb_confirm_reason"),
+            "fvg_available": stageb.get("fvg_available"),
+            "ob_available": stageb.get("ob_available"),
+            "selected_poi_type": stageb.get("selected_poi_type"),
+            "selected_poi_reason": stageb.get("selected_poi_reason"),
+            "selected_poi_lo": stageb.get("selected_poi_lo"),
+            "selected_poi_hi": stageb.get("selected_poi_hi"),
+            "selected_poi_mid": stageb.get("selected_poi_mid"),
+            "selected_poi_t": stageb.get("selected_poi_t"),
+            "ob_type": ((stageb.get("stageb_ob_poi") or {}).get("ob_type")),
+            "ob_lo": ((stageb.get("stageb_ob_poi") or {}).get("ob_lo")),
+            "ob_hi": ((stageb.get("stageb_ob_poi") or {}).get("ob_hi")),
+            "ob_t": ((stageb.get("stageb_ob_poi") or {}).get("ob_t")),
             "plan_status": result.get("plan_status"),
             "signal_skip_reason": result.get("signal_skip_reason"),
         }
