@@ -1016,13 +1016,19 @@ def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     return {"stageb_direction": direction, "direction_reason": reason}
 
 
-def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[str, Any]], dry_run: bool = False, no_persist: Optional[bool] = None) -> Dict[str, Any]:
+def build_stageb_confirmation(
+    result: Dict[str, Any],
+    stageb_candles: List[Dict[str, Any]],
+    dry_run: bool = False,
+    no_persist: Optional[bool] = None,
+    ignore_persisted_state: bool = False,
+) -> Dict[str, Any]:
     symbol = _semi_key(result.get("symbol"))
     direction_info = derive_stageb_direction(result)
     detected_direction = direction_info["stageb_direction"]
 
-    states = _load_semi_states()
-    persist_enabled = not bool(dry_run or no_persist)
+    states = {} if ignore_persisted_state else _load_semi_states()
+    persist_enabled = not bool(dry_run or no_persist or ignore_persisted_state)
 
     def _persist_semi_states() -> None:
         if persist_enabled:
@@ -2031,13 +2037,17 @@ def _build_diagnostics(results: List[Dict[str, Any]], signal_count: int) -> Tupl
         reclaim=st.get("stageb_reclaim") or {}
         disp=st.get("stageb_displacement") or {}
         ret=st.get("stageb_retest") or {}
+        entry_sweep=r.get("entry_sweep") or {}
         final_blocker=_classify_final_blocker(r)
         d={
             "symbol":r.get("symbol"),"status":r.get("status"),"context_status":r.get("context_status"),"htf_count":r.get("htf_count"),"entry_count":r.get("entry_count"),"stageb_count":r.get("stageb_count"),
             "htf_gate_status":htf.get("htf_gate_status"),"htf_bias":htf.get("htf_bias"),"htf_bias_appstyle":htf.get("htf_bias_appstyle"),"htf_appstyle_ready":htf.get("htf_appstyle_ready"),"htf_dir_appstyle":htf.get("htf_dir_appstyle"),
             "liq_gate_status":r.get("liq_gate_status"),"liq_ctx_appstyle":liq.get("liq_ctx_appstyle"),"liq_reason":r.get("liq_reason"),"dist_to_bsl_pct":liq.get("dist_to_bsl_pct"),"dist_to_ssl_pct":liq.get("dist_to_ssl_pct"),"candidate_reason_appstyle":liq.get("candidate_reason_appstyle"),
+            "bsl_zone":liq.get("bsl_zone"),"ssl_zone":liq.get("ssl_zone"),"close_15m_used":r.get("close_15m_used"),"nearest_liq_price":liq.get("nearest_liq_price"),"nearest_liq_type":liq.get("nearest_liq_type"),
             "selected_direction":st.get("selected_direction"),"selected_direction_reason":st.get("selected_direction_reason"),
-            "bullish_sweep":(r.get("entry_sweep") or {}).get("bullish_sweep"),"bearish_sweep":(r.get("entry_sweep") or {}).get("bearish_sweep"),"mixed_sweep_detected":(r.get("entry_sweep") or {}).get("mixed_sweep_detected"),
+            "bullish_sweep":entry_sweep.get("bullish_sweep"),"bearish_sweep":entry_sweep.get("bearish_sweep"),"mixed_sweep_detected":entry_sweep.get("mixed_sweep_detected"),
+            "bullish_sweep_level":entry_sweep.get("bullish_sweep_level"),"bullish_sweep_extreme":entry_sweep.get("bullish_sweep_extreme"),"bullish_sweep_t":entry_sweep.get("bullish_sweep_t"),"bullish_sweep_tag":entry_sweep.get("bullish_sweep_tag"),
+            "bearish_sweep_level":entry_sweep.get("bearish_sweep_level"),"bearish_sweep_extreme":entry_sweep.get("bearish_sweep_extreme"),"bearish_sweep_t":entry_sweep.get("bearish_sweep_t"),"bearish_sweep_tag":entry_sweep.get("bearish_sweep_tag"),
             "selected_sweep_tag":st.get("selected_sweep_tag"),"selected_sweep_level":st.get("selected_sweep_level"),"selected_sweep_extreme":st.get("selected_sweep_extreme"),"selected_sweep_t":st.get("selected_sweep_t"),
             "stageb_state_machine":st.get("stageb_state_machine"),"stageb_status":st.get("stageb_status"),"stageb_confirm_reason":st.get("stageb_confirm_reason"),"stageb_invalid_reason":st.get("stageb_invalid_reason"),
             "reclaim_ok":bool(reclaim.get("has_reclaim")),"reclaim_reason":reclaim.get("reason"),"displacement_ok":bool(disp.get("has_displacement")),"displacement_reason":disp.get("reason"),"fvg_available":st.get("fvg_available"),"ob_available":st.get("ob_available"),"selected_poi_type":st.get("selected_poi_type"),"selected_poi_reason":st.get("selected_poi_reason"),"retest_ok":bool(ret.get("has_retest")),"retest_reason":ret.get("reason"),
@@ -2171,7 +2181,7 @@ def _evaluate_vps_smc_symbol(symbol: str, as_of_utc: Optional[datetime] = None, 
             stageb_confirmation = build_stageb_confirmation({
                 "symbol": symbol, "context_status": context_status, "liq_gate_status": liq_gate_status, "liq_ctx": liq_ctx,
                 "entry_sweep": entry_sweep, "stageb_fvg": stageb_fvg, "htf_gate": htf_gate, "structure_15m": structure_15m,
-            }, stageb, dry_run=dry_run, no_persist=dry_run)
+            }, stageb, dry_run=dry_run, no_persist=dry_run, ignore_persisted_state=dry_run)
             shadow_state = stageb_confirmation.get("stageb_status") or "INVALID"
         except Exception as exc:
             stageb_error = f"stageb:{exc}"
@@ -2190,6 +2200,7 @@ def _evaluate_vps_smc_symbol(symbol: str, as_of_utc: Optional[datetime] = None, 
         "symbol": symbol, "status": status, "primitive_status": primitive_status, "htf_count": len(htf), "entry_count": len(entry),
         "stageb_count": len(stageb), "latest_htf_close_time_ms": htf[-1]["t"] if htf else None,
         "latest_entry_close_time_ms": entry[-1]["t"] if entry else None, "latest_stageb_close_time_ms": stageb[-1]["t"] if stageb else None,
+        "close_15m_used": entry[-1]["c"] if entry else None,
         "entry_swing_summary": entry_swing_summary, "entry_eq": entry_eq, "entry_sweep": entry_sweep, "stageb_fvg": stageb_fvg,
         "htf_swing_summary": htf_swing_summary, "htf_gate": htf_gate, "liq_ctx": liq_ctx, "liq_gate_status": liq_gate_status,
         "liq_reason": liq_reason, "structure_15m": structure_15m, "structure_reason": structure_reason, "context_status": context_status,
@@ -2411,6 +2422,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "latest_htf_close_time_ms": htf[-1]["t"] if htf else None,
                 "latest_entry_close_time_ms": entry[-1]["t"] if entry else None,
                 "latest_stageb_close_time_ms": stageb[-1]["t"] if stageb else None,
+                "close_15m_used": entry[-1]["c"] if entry else None,
                 "entry_swing_summary": entry_swing_summary,
                 "entry_eq": entry_eq,
                 "entry_sweep": entry_sweep,
