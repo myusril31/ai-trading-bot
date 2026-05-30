@@ -1013,6 +1013,123 @@ def _semi_select_directional_fvg(candidates: Dict[str, Any], direction: str) -> 
     return items[-1], "ok_nearest_pre_displacement"
 
 
+def _semi_mitigation_retest_probe(
+    candles: List[Dict[str, Any]],
+    direction: str,
+    candidate: Dict[str, Any],
+    max_bars: int,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "has_retest": False,
+        "has_rejection_close": False,
+        "retest_t": None,
+        "retest_t_wib": None,
+        "retest_idx": None,
+        "retest_candle": None,
+        "reason": "not_found",
+        "scan_bars": [],
+    }
+    try:
+        zlo = min(float(candidate.get("lo")), float(candidate.get("hi")))
+        zhi = max(float(candidate.get("lo")), float(candidate.get("hi")))
+        c_idx = int(candidate.get("idx"))
+    except Exception:
+        out["reason"] = "invalid_candidate"
+        return out
+
+    d = str(direction or "").upper()
+    if d not in ("LONG", "SHORT"):
+        out["reason"] = "invalid_direction"
+        return out
+
+    zone_size = max(abs(zhi - zlo), 1e-12)
+    near_pad = max(zone_size * _env_float("VPS_SMC_FVG_MITIGATION_NEAR_ZONE_MULT", 0.75), abs((zhi + zlo) / 2.0) * 0.0001)
+    probe_lo = zlo - near_pad
+    probe_hi = zhi + near_pad
+    mid = (zlo + zhi) / 2.0
+    bars = candles or []
+    touched = False
+    for i, c in [(j, b) for j, b in enumerate(bars) if j > c_idx][: max(1, int(max_bars or 18))]:
+        try:
+            low = float(c["l"])
+            high = float(c["h"])
+            close = float(c["c"])
+            o = float(c["o"])
+            t = _semi_bar_t(c)
+        except Exception:
+            continue
+
+        overlaps = low <= probe_hi and high >= probe_lo
+        bearish_reject = d == "SHORT" and close < o and close <= mid
+        bullish_reject = d == "LONG" and close > o and close >= mid
+        rejection_ok = bool(overlaps and (bearish_reject or bullish_reject))
+        bar_debug = _semi_bar_debug(c, i)
+        bar_debug.update({
+            "candidate_lo": zlo,
+            "candidate_hi": zhi,
+            "probe_lo": probe_lo,
+            "probe_hi": probe_hi,
+            "touched_candidate_or_near_zone": overlaps,
+            "has_rejection_close": rejection_ok,
+            "result": "mitigation_retest_rejection" if rejection_ok else "touched_no_rejection_close" if overlaps else "no_touch",
+        })
+        out["scan_bars"].append(bar_debug)
+        if not overlaps:
+            continue
+        touched = True
+        if rejection_ok:
+            close_distance = 0.0 if zlo <= close <= zhi else min(abs(close - zlo), abs(close - zhi))
+            out.update({
+                "has_retest": True,
+                "has_rejection_close": True,
+                "retest_t": t,
+                "retest_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None,
+                "retest_idx": i,
+                "retest_candle": _semi_bar_debug(c, i),
+                "close_distance_to_zone": close_distance,
+                "reason": "ok",
+            })
+            return out
+
+    out["reason"] = "touched_mitigation_fvg_no_rejection_close" if touched else "waiting_mitigation_fvg_retest"
+    return out
+
+
+def _semi_select_mitigation_fvg(
+    candles: List[Dict[str, Any]],
+    candidates: Dict[str, Any],
+    direction: str,
+    max_bars: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+    d = str(direction or "").upper()
+    key = "bearish_fvg_candidates" if d == "LONG" else "bullish_fvg_candidates" if d == "SHORT" else None
+    if key is None:
+        return None, None, "invalid_direction"
+
+    anchor_idx = (candidates or {}).get("anchor_idx")
+    items = list((candidates or {}).get(key) or [])
+    if anchor_idx is not None:
+        items = [x for x in items if int(x.get("idx") or 0) >= int(anchor_idx)]
+    if not items:
+        return None, None, f"missing_mitigation_{'bearish' if d == 'LONG' else 'bullish'}_fvg"
+
+    rejected: List[Tuple[float, int, Dict[str, Any], Dict[str, Any]]] = []
+    last_reason = "waiting_mitigation_fvg_retest"
+    for candidate in items:
+        probe = _semi_mitigation_retest_probe(candles, d, candidate, max_bars)
+        last_reason = probe.get("reason") or last_reason
+        if probe.get("has_retest") and probe.get("has_rejection_close"):
+            distance = float(probe.get("close_distance_to_zone") or 0.0)
+            rejected.append((distance, -int(candidate.get("idx") or 0), candidate, probe))
+
+    if not rejected:
+        return None, None, last_reason
+
+    rejected.sort(key=lambda x: (x[0], x[1]))
+    _, _, selected, probe = rejected[0]
+    return selected, probe, "ok_mitigation_retrace_retest_rejection"
+
+
 def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t: Any, lookback: int) -> Dict[str, Any]:
     out = {
         "has_fvg": False,
@@ -1023,6 +1140,11 @@ def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t:
         "fvg_idx": None,
         "reason": "not_found",
         "selected_fvg_reason": "not_found",
+        "selected_fvg_polarity": None,
+        "selected_fvg_mode": None,
+        "selected_fvg_candidate": None,
+        "selected_fvg_retest_probe": None,
+        "fvg_rejection_reason": None,
         "bullish_fvg_candidates": [],
         "bearish_fvg_candidates": [],
     }
@@ -1046,9 +1168,25 @@ def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t:
 
     selected, reason = _semi_select_directional_fvg(candidates, direction)
     out["selected_fvg_reason"] = reason
+    mode = "DIRECTIONAL"
+    probe = None
     if not selected:
-        out["reason"] = reason
-        return out
+        mitigation, mitigation_probe, mitigation_reason = _semi_select_mitigation_fvg(
+            candles,
+            candidates,
+            direction,
+            _env_int("VPS_SMC_RETEST_MAX_AGE_BARS_5M", 18),
+        )
+        out["fvg_rejection_reason"] = mitigation_reason
+        if not mitigation:
+            out["reason"] = reason
+            out["selected_fvg_reason"] = reason
+            return out
+        selected = mitigation
+        probe = mitigation_probe
+        reason = mitigation_reason
+        mode = "MITIGATION_RETRACE"
+        out["selected_fvg_reason"] = reason
 
     out.update({
         "has_fvg": True,
@@ -1059,6 +1197,11 @@ def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t:
         "fvg_idx": selected.get("idx"),
         "fvg_t_wib": selected.get("t_wib"),
         "selected_fvg": selected,
+        "selected_fvg_polarity": selected.get("type"),
+        "selected_fvg_mode": mode,
+        "selected_fvg_candidate": selected,
+        "selected_fvg_retest_probe": probe,
+        "fvg_rejection_reason": (probe or {}).get("reason") if probe else None,
         "reason": "ok",
     })
     return out
@@ -1125,6 +1268,11 @@ def _semi_select_poi(fvg: Dict[str, Any], ob: Dict[str, Any]) -> Dict[str, Any]:
         "selected_poi_t_wib": None,
         "selected_poi_reason": "no_valid_poi",
         "selected_fvg_reason": (fvg or {}).get("selected_fvg_reason") or (fvg or {}).get("reason") or "not_checked",
+        "selected_fvg_polarity": (fvg or {}).get("selected_fvg_polarity") or (fvg or {}).get("fvg_type"),
+        "selected_fvg_mode": (fvg or {}).get("selected_fvg_mode"),
+        "selected_fvg_candidate": (fvg or {}).get("selected_fvg_candidate") or (fvg or {}).get("selected_fvg"),
+        "selected_fvg_retest_probe": (fvg or {}).get("selected_fvg_retest_probe"),
+        "fvg_rejection_reason": (fvg or {}).get("fvg_rejection_reason"),
         "selected_ob_reason": (ob or {}).get("reason") or "not_checked",
         "fvg_available": has_fvg,
         "ob_available": has_ob,
@@ -1220,7 +1368,7 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
         "stageb_direction": direction,
         "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
         "stageb_displacement": {"has_displacement": False, "direction": direction, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
-        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built", "selected_fvg_reason": "not_built", "bullish_fvg_candidates": [], "bearish_fvg_candidates": []},
+        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built", "selected_fvg_reason": "not_built", "selected_fvg_polarity": None, "selected_fvg_mode": None, "selected_fvg_candidate": None, "selected_fvg_retest_probe": None, "fvg_rejection_reason": None, "bullish_fvg_candidates": [], "bearish_fvg_candidates": []},
         "stageb_ob_poi": {"has_ob": False, "ob_type": None, "ob_lo": None, "ob_hi": None, "ob_t": None, "reason": "not_built"},
         "stageb_retest": {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_built"},
         "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_t_wib": None, "selected_poi_reason": "no_valid_poi",
@@ -1230,6 +1378,11 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
         "stageb_state_machine": "IDLE",
         "selected_sweep_t_wib": None,
         "selected_fvg_reason": "not_built",
+        "selected_fvg_polarity": None,
+        "selected_fvg_mode": None,
+        "selected_fvg_candidate": None,
+        "selected_fvg_retest_probe": None,
+        "fvg_rejection_reason": None,
         "selected_ob_reason": "not_built",
         "confirmed_t": None,
         "confirmed_t_wib": None,
@@ -2619,6 +2772,11 @@ def _stageb_sequence_debug(stageb: Dict[str, Any]) -> Dict[str, Any]:
         "bullish_fvg_candidates": fvg.get("bullish_fvg_candidates") or [],
         "bearish_fvg_candidates": fvg.get("bearish_fvg_candidates") or [],
         "selected_fvg_reason": (stageb or {}).get("selected_fvg_reason") or fvg.get("selected_fvg_reason") or fvg.get("reason"),
+        "selected_fvg_polarity": (stageb or {}).get("selected_fvg_polarity") or fvg.get("selected_fvg_polarity") or fvg.get("fvg_type"),
+        "selected_fvg_mode": (stageb or {}).get("selected_fvg_mode") or fvg.get("selected_fvg_mode"),
+        "selected_fvg_candidate": (stageb or {}).get("selected_fvg_candidate") or fvg.get("selected_fvg_candidate") or fvg.get("selected_fvg"),
+        "selected_fvg_retest_probe": (stageb or {}).get("selected_fvg_retest_probe") or fvg.get("selected_fvg_retest_probe"),
+        "fvg_rejection_reason": (stageb or {}).get("fvg_rejection_reason") or fvg.get("fvg_rejection_reason"),
         "selected_ob_reason": (stageb or {}).get("selected_ob_reason") or (((stageb or {}).get("stageb_ob_poi") or {}).get("reason")),
         "selected_poi_reason": (stageb or {}).get("selected_poi_reason"),
         "selected_poi_type": (stageb or {}).get("selected_poi_type"),
