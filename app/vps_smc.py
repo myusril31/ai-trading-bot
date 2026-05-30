@@ -1485,43 +1485,154 @@ def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Di
     eqh = entry_eq.get("eqh") or []
     eql = entry_eq.get("eql") or []
 
-    def _pick_relevant_cluster(clusters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        ranked: List[Dict[str, Any]] = []
-        for c in clusters:
-            if c.get("price") is None:
-                continue
-            price = float(c["price"])
-            touches = int(c.get("count") or c.get("touches") or 0)
-            ts = int(c.get("t") or 0)
-            dist = abs(close - price) if close is not None else float("inf")
-            ranked.append({"cluster": c, "touches": touches, "dist": dist, "t": ts})
-        if not ranked:
-            return None
-        ranked.sort(key=lambda x: (-x["touches"], x["dist"], -x["t"]))
-        return ranked[0]["cluster"]
+    def _candidate_distance_pct(candidate: Dict[str, Any]) -> float:
+        if close is None or close == 0 or candidate.get("price") is None:
+            return float("inf")
+        return abs(close - float(candidate["price"])) / abs(close) * 100.0
 
-    def _cluster_to_zone(cluster: Optional[Dict[str, Any]], zone_type: str) -> Optional[Dict[str, Any]]:
-        if cluster is None or cluster.get("price") is None:
+    def _candidate_t(candidate: Dict[str, Any]) -> int:
+        try:
+            return int(candidate.get("t") or 0)
+        except Exception:
+            return 0
+
+    def _candidate_to_debug(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(candidate)
+        out["dist_pct"] = _candidate_distance_pct(candidate) if close is not None else None
+        return out
+
+    def _cluster_candidate(cluster: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+        if cluster.get("price") is None:
             return None
-        mid = float(cluster["price"])
-        band_pct = float(cluster.get("band_pct") or 0.15)
+        return {
+            "source": source,
+            "price": float(cluster["price"]),
+            "touches": int(cluster.get("count") or cluster.get("touches") or 0),
+            "t": _candidate_t(cluster),
+            "band_pct": float(cluster.get("band_pct") or 0.15),
+        }
+
+    def _level_candidate(price: Any, source: str, touches: int = 1, t: Any = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        if price is None:
+            return None
+        candidate = {
+            "source": source,
+            "price": float(price),
+            "touches": int(touches),
+            "t": _candidate_t({"t": t}),
+            "band_pct": 0.15,
+        }
+        if extra:
+            candidate.update(extra)
+        return candidate
+
+    def _active_sweep_candidate(side: str) -> Optional[Dict[str, Any]]:
+        if side == "BSL" and bool(entry_sweep.get("bearish_sweep")):
+            return _level_candidate(
+                entry_sweep.get("bearish_sweep_level"),
+                "ACTIVE_BEARISH_SWEEP",
+                touches=3,
+                t=entry_sweep.get("bearish_sweep_t"),
+                extra={
+                    "sweep_extreme": entry_sweep.get("bearish_sweep_extreme"),
+                    "sweep_tag": entry_sweep.get("bearish_sweep_tag") or "SWEEP_HIGH",
+                },
+            )
+        if side == "SSL" and bool(entry_sweep.get("bullish_sweep")):
+            return _level_candidate(
+                entry_sweep.get("bullish_sweep_level"),
+                "ACTIVE_BULLISH_SWEEP",
+                touches=3,
+                t=entry_sweep.get("bullish_sweep_t"),
+                extra={
+                    "sweep_extreme": entry_sweep.get("bullish_sweep_extreme"),
+                    "sweep_tag": entry_sweep.get("bullish_sweep_tag") or "SWEEP_LOW",
+                },
+            )
+        return None
+
+    def _zone_from_candidate(candidate: Optional[Dict[str, Any]], zone_type: str) -> Optional[Dict[str, Any]]:
+        if candidate is None or candidate.get("price") is None:
+            return None
+        mid = float(candidate["price"])
+        band_pct = float(candidate.get("band_pct") or 0.15)
         half = abs(mid) * (band_pct / 100.0)
         if half == 0:
             half = 1e-12
         z_from = mid - half
         z_to = mid + half
-        return {
+        zone = {
             "from": min(z_from, z_to),
             "to": max(z_from, z_to),
             "mid": mid,
-            "touches": int(cluster.get("count") or cluster.get("touches") or 0),
+            "touches": int(candidate.get("touches") or 0),
             "type": zone_type,
+            "source": candidate.get("source"),
         }
+        if candidate.get("sweep_extreme") is not None:
+            zone["sweep_extreme"] = float(candidate["sweep_extreme"])
+        if candidate.get("sweep_tag") is not None:
+            zone["sweep_tag"] = candidate.get("sweep_tag")
+        return zone
 
-    bsl_zone = None
-    ssl_zone = None
-    bsl_zone = _cluster_to_zone(_pick_relevant_cluster(eqh), "BSL")
-    ssl_zone = _cluster_to_zone(_pick_relevant_cluster(eql), "SSL")
+    def _candidate_is_close(candidate: Dict[str, Any]) -> bool:
+        if close is None or close == 0 or candidate.get("price") is None:
+            return False
+        zone = _zone_from_candidate(candidate, "TMP")
+        if zone is not None and float(zone["from"]) <= close <= float(zone["to"]):
+            return True
+        return _candidate_distance_pct(candidate) <= near_liq_pct
+
+    def _build_candidates(clusters: List[Dict[str, Any]], side: str) -> List[Dict[str, Any]]:
+        source = "EQH_CLUSTER" if side == "BSL" else "EQL_CLUSTER"
+        candidates: List[Dict[str, Any]] = []
+        for cluster in clusters:
+            candidate = _cluster_candidate(cluster, source)
+            if candidate is not None:
+                candidates.append(candidate)
+        active = _active_sweep_candidate(side)
+        if active is not None:
+            candidates.append(active)
+        if side == "BSL":
+            fallback = _level_candidate(last_high, "LAST_SWING_HIGH", touches=1, t=entry_swing_summary.get("last_swing_high_t"))
+        else:
+            fallback = _level_candidate(last_low, "LAST_SWING_LOW", touches=1, t=entry_swing_summary.get("last_swing_low_t"))
+        if fallback is not None:
+            candidates.append(fallback)
+        return candidates
+
+    def _pick_relevant_candidate(candidates: List[Dict[str, Any]], active_source: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        if not candidates:
+            return None, "no_candidates"
+        active = [c for c in candidates if c.get("source") == active_source]
+        active_near = [c for c in active if _candidate_is_close(c)]
+        if active_near:
+            active_near.sort(key=lambda c: (_candidate_distance_pct(c), -_candidate_t(c)))
+            return active_near[0], "active_sweep_close_preferred"
+
+        ranked = list(candidates)
+        ranked.sort(
+            key=lambda c: (
+                0 if _candidate_is_close(c) else 1,
+                _candidate_distance_pct(c),
+                -int(c.get("touches") or 0),
+                -_candidate_t(c),
+            )
+        )
+        selected = ranked[0]
+        if _candidate_is_close(selected):
+            return selected, "nearest_close_candidate"
+        if str(selected.get("source") or "").endswith("CLUSTER"):
+            return selected, "nearest_cluster_candidate"
+        return selected, "fallback_last_swing"
+
+    bsl_candidates_raw = _build_candidates(eqh, "BSL")
+    ssl_candidates_raw = _build_candidates(eql, "SSL")
+    selected_bsl, selected_bsl_reason = _pick_relevant_candidate(bsl_candidates_raw, "ACTIVE_BEARISH_SWEEP")
+    selected_ssl, selected_ssl_reason = _pick_relevant_candidate(ssl_candidates_raw, "ACTIVE_BULLISH_SWEEP")
+
+    bsl_zone = _zone_from_candidate(selected_bsl, "BSL")
+    ssl_zone = _zone_from_candidate(selected_ssl, "SSL")
 
     nearest = None
     dist_pct = None
@@ -1532,9 +1643,7 @@ def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Di
         zone_prices: List[Dict[str, Any]] = []
         if bsl_zone is not None:
             zone_prices.append({"type": "BSL", "price": float(bsl_zone["mid"])})
-            if float(bsl_zone["to"]) <= close <= float(bsl_zone["from"]):
-                liq_ctx_appstyle = "AT_BSL"
-            elif float(bsl_zone["from"]) <= close <= float(bsl_zone["to"]):
+            if float(bsl_zone["from"]) <= close <= float(bsl_zone["to"]):
                 liq_ctx_appstyle = "AT_BSL"
             dist_to_bsl_pct = abs(close - float(bsl_zone["mid"])) / close * 100.0
         if ssl_zone is not None:
@@ -1594,6 +1703,10 @@ def build_liquidity_context(entry: List[Dict[str, Any]], entry_swing_summary: Di
         "last_sell_side_liq": float(last_low) if last_low is not None else None,
         "eqh_count": len(eqh),
         "eql_count": len(eql),
+        "bsl_candidates": [_candidate_to_debug(c) for c in bsl_candidates_raw],
+        "ssl_candidates": [_candidate_to_debug(c) for c in ssl_candidates_raw],
+        "selected_bsl_reason": selected_bsl_reason,
+        "selected_ssl_reason": selected_ssl_reason,
         "nearest_liq_type": (nearest or {}).get("type"),
         "nearest_liq_price": (nearest or {}).get("price"),
         "dist_to_zone_pct": dist_pct,
