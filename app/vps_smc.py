@@ -181,6 +181,46 @@ def _parse_iso_utc(raw: Any) -> Optional[datetime]:
         return None
 
 
+WIB_TZ = timezone(timedelta(hours=7))
+
+
+def _parse_wib_time(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if not txt:
+        return None
+    cleaned = txt.replace("WIB", "").strip()
+    candidates = [cleaned]
+    if "T" not in cleaned and len(cleaned) == 16:
+        candidates.append(cleaned + ":00")
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=WIB_TZ)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            dt = datetime.strptime(cleaned, fmt).replace(tzinfo=WIB_TZ)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _parse_apps_signal_time(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("created_at_utc", "event_at_utc", "timestamp_utc"):
+        dt = _parse_iso_utc(row.get(key))
+        if dt is not None:
+            return dt
+    for key in ("signal_time_wib", "confirmed_ts_wib", "run_ts_wib"):
+        dt = _parse_wib_time(row.get(key))
+        if dt is not None:
+            return dt
+    return None
 
 
 def _bucket_ms_to_wib_text(bucket_ms: Any) -> Optional[str]:
@@ -976,12 +1016,24 @@ def derive_stageb_direction(context: Dict[str, Any]) -> Dict[str, Any]:
     return {"stageb_direction": direction, "direction_reason": reason}
 
 
-def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_stageb_confirmation(
+    result: Dict[str, Any],
+    stageb_candles: List[Dict[str, Any]],
+    dry_run: bool = False,
+    no_persist: Optional[bool] = None,
+    ignore_persisted_state: bool = False,
+) -> Dict[str, Any]:
     symbol = _semi_key(result.get("symbol"))
     direction_info = derive_stageb_direction(result)
     detected_direction = direction_info["stageb_direction"]
 
-    states = _load_semi_states()
+    states = {} if ignore_persisted_state else _load_semi_states()
+    persist_enabled = not bool(dry_run or no_persist or ignore_persisted_state)
+
+    def _persist_semi_states() -> None:
+        if persist_enabled:
+            _save_semi_states(states)
+
     st = states.get(symbol) if isinstance(states.get(symbol), dict) else {}
 
     active_state = str(st.get("state") or "IDLE").upper()
@@ -1028,7 +1080,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
 
     if _semi_invalidated(direction, stageb_candles, st.get("sweep_extreme") or (result.get("liq_ctx") or {}).get("sweep_extreme")):
         states.pop(symbol, None)
-        _save_semi_states(states)
+        _persist_semi_states()
         out["stageb_status"] = "INVALID"
         out["stageb_state_machine"] = "INVALID"
         out["stageb_invalid_reason"] = "invalidated_beyond_sweep_extreme_buffer"
@@ -1050,7 +1102,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         confirmed_t = st.get("confirmed_t")
         if confirmed_t is not None and _semi_bars_since(stageb_candles, confirmed_t) > max_retest:
             states.pop(symbol, None)
-            _save_semi_states(states)
+            _persist_semi_states()
             out["stageb_status"] = "EXPIRED"
             out["stageb_state_machine"] = "EXPIRED"
             out["stageb_confirm_reason"] = "confirmed_ttl_expired"
@@ -1114,7 +1166,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             "updated_at_utc": _utc_now_iso(),
         }
         states[symbol] = st
-        _save_semi_states(states)
+        _persist_semi_states()
         active_state = "WAIT_DISPLACEMENT"
 
     # WAIT_DISPLACEMENT: wait max 10 bars after reclaim.
@@ -1126,7 +1178,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         waited = _semi_bars_since(stageb_candles, reclaim_t)
         if waited > max_disp:
             states.pop(symbol, None)
-            _save_semi_states(states)
+            _persist_semi_states()
             out["stageb_status"] = "EXPIRED"
             out["stageb_state_machine"] = "EXPIRED"
             out["stageb_confirm_reason"] = f"no_displacement_within_{max_disp}_bars"
@@ -1142,7 +1194,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             out["stageb_confirm_reason"] = f"wait_displacement_{waited}/{max_disp}"
             st["updated_at_utc"] = _utc_now_iso()
             states[symbol] = st
-            _save_semi_states(states)
+            _persist_semi_states()
             return out
 
         poi = st.get("poi") if isinstance(st.get("poi"), dict) and st.get("poi", {}).get("has_fvg") else _semi_find_fvg_after(stageb_candles, direction, disp.get("displacement_t"), fvg_lookback)
@@ -1164,7 +1216,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             st["selected_poi"] = selected_poi
             st["updated_at_utc"] = _utc_now_iso()
             states[symbol] = st
-            _save_semi_states(states)
+            _persist_semi_states()
             return out
 
         st["state"] = "WAIT_RETEST"
@@ -1176,7 +1228,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         st["poi_t"] = selected_poi.get("selected_poi_t")
         st["updated_at_utc"] = _utc_now_iso()
         states[symbol] = st
-        _save_semi_states(states)
+        _persist_semi_states()
         active_state = "WAIT_RETEST"
 
     # WAIT_RETEST: wait max 18 bars after displacement/POI, then require retest + rejection close.
@@ -1197,7 +1249,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
 
         if waited > max_retest:
             states.pop(symbol, None)
-            _save_semi_states(states)
+            _persist_semi_states()
             out["stageb_status"] = "EXPIRED"
             out["stageb_state_machine"] = "EXPIRED"
             out["stageb_confirm_reason"] = f"no_poi_retest_within_{max_retest}_bars"
@@ -1213,7 +1265,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
             out["stageb_confirm_reason"] = f"wait_retest_rejection:{retest.get('reason')}:{waited}/{max_retest}"
             st["updated_at_utc"] = _utc_now_iso()
             states[symbol] = st
-            _save_semi_states(states)
+            _persist_semi_states()
             return out
 
         confirmed_t = retest.get("retest_t") or after_t
@@ -1222,7 +1274,7 @@ def build_stageb_confirmation(result: Dict[str, Any], stageb_candles: List[Dict[
         st["confirmed_t"] = confirmed_t
         st["updated_at_utc"] = _utc_now_iso()
         states[symbol] = st
-        _save_semi_states(states)
+        _persist_semi_states()
 
         out["stageb_status"] = "CONFIRMED"
         out["stageb_state_machine"] = "CONFIRMED"
@@ -1925,12 +1977,12 @@ def vps_smc_compare(lookback_minutes: Optional[int] = 180, symbols: Optional[Lis
         if sample_type and sample_type != "FORWARD_SHADOW_PAPER":
             continue
         decision = str(row.get("execution_decision") or row.get("decision") or "").strip().upper()
-        if decision not in ("ACCEPT", "REJECT"):
+        if decision not in ("ACCEPT", "REJECT", "BACKUP_ONLY"):
             continue
         symbol = _normalize_symbol(row.get("symbol") or row.get("pair"))
         if not symbol or symbol not in target_set:
             continue
-        dt = _parse_iso_utc(row.get("created_at_utc") or row.get("event_at_utc") or row.get("timestamp_utc"))
+        dt = _parse_apps_signal_time(row)
         if dt is None or dt < cutoff:
             continue
         app_by_symbol.setdefault(symbol, []).append({"signal_key": row.get("signal_key") or row.get("signal_id"), "direction_raw": row.get("direction") or row.get("dir"), "direction": _normalize_direction(row.get("direction") or row.get("dir"),), "decision": decision, "status": row.get("state") or row.get("status") or decision, "entry": row.get("entry") or row.get("entry_mid"), "sl": row.get("sl"), "tp1": row.get("tp1"), "tp2": row.get("tp2"), "tp3": row.get("tp3"), "created_at_utc": dt.isoformat(), "ts": dt.timestamp(),})
@@ -2098,13 +2150,17 @@ def _build_diagnostics(results: List[Dict[str, Any]], signal_count: int) -> Tupl
         reclaim=st.get("stageb_reclaim") or {}
         disp=st.get("stageb_displacement") or {}
         ret=st.get("stageb_retest") or {}
+        entry_sweep=r.get("entry_sweep") or {}
         final_blocker=_classify_final_blocker(r)
         d={
             "symbol":r.get("symbol"),"status":r.get("status"),"context_status":r.get("context_status"),"htf_count":r.get("htf_count"),"entry_count":r.get("entry_count"),"stageb_count":r.get("stageb_count"),
             "htf_gate_status":htf.get("htf_gate_status"),"htf_bias":htf.get("htf_bias"),"htf_bias_appstyle":htf.get("htf_bias_appstyle"),"htf_appstyle_ready":htf.get("htf_appstyle_ready"),"htf_dir_appstyle":htf.get("htf_dir_appstyle"),
             "liq_gate_status":r.get("liq_gate_status"),"liq_ctx_appstyle":liq.get("liq_ctx_appstyle"),"liq_reason":r.get("liq_reason"),"dist_to_bsl_pct":liq.get("dist_to_bsl_pct"),"dist_to_ssl_pct":liq.get("dist_to_ssl_pct"),"candidate_reason_appstyle":liq.get("candidate_reason_appstyle"),
+            "bsl_zone":liq.get("bsl_zone"),"ssl_zone":liq.get("ssl_zone"),"close_15m_used":r.get("close_15m_used"),"nearest_liq_price":liq.get("nearest_liq_price"),"nearest_liq_type":liq.get("nearest_liq_type"),
             "selected_direction":st.get("selected_direction"),"selected_direction_reason":st.get("selected_direction_reason"),
-            "bullish_sweep":(r.get("entry_sweep") or {}).get("bullish_sweep"),"bearish_sweep":(r.get("entry_sweep") or {}).get("bearish_sweep"),"mixed_sweep_detected":(r.get("entry_sweep") or {}).get("mixed_sweep_detected"),
+            "bullish_sweep":entry_sweep.get("bullish_sweep"),"bearish_sweep":entry_sweep.get("bearish_sweep"),"mixed_sweep_detected":entry_sweep.get("mixed_sweep_detected"),
+            "bullish_sweep_level":entry_sweep.get("bullish_sweep_level"),"bullish_sweep_extreme":entry_sweep.get("bullish_sweep_extreme"),"bullish_sweep_t":entry_sweep.get("bullish_sweep_t"),"bullish_sweep_tag":entry_sweep.get("bullish_sweep_tag"),
+            "bearish_sweep_level":entry_sweep.get("bearish_sweep_level"),"bearish_sweep_extreme":entry_sweep.get("bearish_sweep_extreme"),"bearish_sweep_t":entry_sweep.get("bearish_sweep_t"),"bearish_sweep_tag":entry_sweep.get("bearish_sweep_tag"),
             "selected_sweep_tag":st.get("selected_sweep_tag"),"selected_sweep_level":st.get("selected_sweep_level"),"selected_sweep_extreme":st.get("selected_sweep_extreme"),"selected_sweep_t":st.get("selected_sweep_t"),
             "stageb_state_machine":st.get("stageb_state_machine"),"stageb_status":st.get("stageb_status"),"stageb_confirm_reason":st.get("stageb_confirm_reason"),"stageb_invalid_reason":st.get("stageb_invalid_reason"),
             "reclaim_ok":bool(reclaim.get("has_reclaim")),"reclaim_reason":reclaim.get("reason"),"displacement_ok":bool(disp.get("has_displacement")),"displacement_reason":disp.get("reason"),"fvg_available":st.get("fvg_available"),"ob_available":st.get("ob_available"),"selected_poi_type":st.get("selected_poi_type"),"selected_poi_reason":st.get("selected_poi_reason"),"retest_ok":bool(ret.get("has_retest")),"retest_reason":ret.get("reason"),
@@ -2113,8 +2169,201 @@ def _build_diagnostics(results: List[Dict[str, Any]], signal_count: int) -> Tupl
         diags.append(d)
         for m,k in ((by_final_blocker,final_blocker),(by_liq,d.get("liq_ctx_appstyle") or "NONE"),(by_stage,d.get("stageb_state_machine") or "NONE"),(by_dir,d.get("selected_direction") or "NONE"),(by_poi,d.get("selected_poi_type") or "NONE")):
             m[k]=m.get(k,0)+1
-    summary={"total_symbols":len(results),"ready_count":sum(1 for r in results if r.get("context_status")=="READY"),"blocked_count":sum(1 for r in results if r.get("context_status") in ("BLOCKED","DATA_GAP","HTF_DATA_GAP")),"confirmed_count":sum(1 for d in diags if d.get("final_blocker")=="CONFIRMED"),"signal_count":signal_count,"by_final_blocker":by_final_blocker,"by_liq_ctx_appstyle":by_liq,"by_stageb_state":by_stage,"by_selected_direction":by_dir,"by_selected_poi_type":by_poi}
+    by_plan={}
+    by_context={}
+    by_stage_status={}
+    by_stage_reason={}
+    for d in diags:
+        for m,k in (
+            (by_plan,d.get("plan_status") or "NONE"),
+            (by_context,d.get("context_status") or "NONE"),
+            (by_stage_status,d.get("stageb_status") or "NONE"),
+            (by_stage_reason,d.get("stageb_invalid_reason") or d.get("stageb_confirm_reason") or "NONE"),
+        ):
+            m[k]=m.get(k,0)+1
+    summary={"total_symbols":len(results),"ready_count":sum(1 for r in results if r.get("context_status")=="READY"),"blocked_count":sum(1 for r in results if r.get("context_status") in ("BLOCKED","DATA_GAP","HTF_DATA_GAP")),"confirmed_count":sum(1 for d in diags if d.get("final_blocker")=="CONFIRMED"),"signal_count":signal_count,"by_final_blocker":by_final_blocker,"by_liq_ctx_appstyle":by_liq,"by_stageb_state":by_stage,"by_selected_direction":by_dir,"by_selected_poi_type":by_poi,"by_plan_status":by_plan,"by_context_status":by_context,"by_stageb_status":by_stage_status,"by_stageb_reason":by_stage_reason}
     return diags,summary
+
+
+
+def _filter_candles_at(candles: List[Dict[str, Any]], as_of_ms: Optional[int]) -> List[Dict[str, Any]]:
+    if as_of_ms is None:
+        return list(candles)
+    out: List[Dict[str, Any]] = []
+    for candle in candles:
+        try:
+            if int(candle.get("t") or candle.get("close_time_ms") or 0) <= as_of_ms:
+                out.append(candle)
+        except Exception:
+            continue
+    return out
+
+
+def _empty_entry_sweep() -> Dict[str, Any]:
+    return {
+        "bullish_sweep": False, "bearish_sweep": False, "sweep_level": None, "sweep_extreme": None, "sweep_t": None, "sweep_tag": None,
+        "bullish_sweep_level": None, "bullish_sweep_extreme": None, "bullish_sweep_t": None, "bullish_sweep_tag": None,
+        "bearish_sweep_level": None, "bearish_sweep_extreme": None, "bearish_sweep_t": None, "bearish_sweep_tag": None,
+        "mixed_sweep_detected": False, "selected_direction": "NONE", "selected_direction_reason": "no_sweep_direction",
+        "selected_sweep_level": None, "selected_sweep_extreme": None, "selected_sweep_t": None, "selected_sweep_tag": None,
+    }
+
+
+def _initial_stageb_confirmation() -> Dict[str, Any]:
+    return {
+        "stageb_status": "INVALID", "stageb_direction": "NONE", "stageb_reclaim": {}, "stageb_displacement": {},
+        "stageb_fvg_poi": {}, "stageb_ob_poi": {}, "selected_poi_type": None, "selected_poi_lo": None,
+        "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_reason": "no_valid_poi",
+        "fvg_available": False, "ob_available": False, "stageb_confirm_reason": None, "stageb_invalid_reason": "not_built",
+    }
+
+
+def _evaluate_vps_smc_symbol(symbol: str, as_of_utc: Optional[datetime] = None, dry_run: bool = False) -> Dict[str, Any]:
+    symbol = _normalize_symbol(symbol)
+    intervals = _intervals()
+    as_of_ms = int(as_of_utc.timestamp() * 1000) if as_of_utc is not None else None
+    htf = _filter_candles_at(_load_internal_candles(symbol, intervals["htf"]), as_of_ms)
+    entry = _filter_candles_at(_load_internal_candles(symbol, intervals["entry"]), as_of_ms)
+    stageb = _filter_candles_at(_load_internal_candles(symbol, intervals["stageb"]), as_of_ms)
+
+    status = "READY"
+    reason = None
+    if len(htf) < 1:
+        status = "DATA_GAP"; reason = f"missing_{intervals['htf']}_candles"
+    elif len(entry) < 1:
+        status = "DATA_GAP"; reason = f"missing_{intervals['entry']}_candles"
+    elif len(stageb) < 1:
+        status = "DATA_GAP"; reason = f"missing_{intervals['stageb']}_candles"
+
+    primitive_status = "SKIPPED_DATA_GAP"
+    entry_swing_summary: Dict[str, Any] = {}
+    entry_eq: Dict[str, Any] = {"eqh": [], "eql": []}
+    entry_sweep: Dict[str, Any] = _empty_entry_sweep()
+    stageb_fvg: Dict[str, Any] = {"bullish_fvg": None, "bearish_fvg": None, "count_bullish": 0, "count_bearish": 0}
+    htf_swing_summary: Dict[str, Any] = {}
+    primitive_error: Optional[str] = None
+    if status == "READY":
+        try:
+            entry_pivots = detect_pivots(entry)
+            entry_swing_summary = build_swing_summary(entry)
+            entry_eq = detect_equal_high_low(entry, entry_pivots)
+            entry_sweep = detect_sweep(entry, entry_swing_summary, _env_int("VPS_SMC_SWEEP_LOOKBACK_BARS_5M", 20))
+            stageb_fvg = detect_fvg(stageb, _env_int("VPS_SMC_FVG_LOOKBACK_BARS_5M", 35))
+            htf_swing_summary = build_swing_summary(htf)
+            primitive_status = "READY"
+        except Exception as exc:
+            primitive_status = "ERROR"
+            primitive_error = f"primitive:{exc}"
+
+    htf_gate = {"htf_gate_status": "HTF_DATA_GAP", "htf_reason": "not_enough_4h_candles"}
+    liq_ctx: Dict[str, Any] = {}
+    liq_gate_status = "BLOCK"
+    liq_reason = "context_not_built"
+    structure_15m = "UNKNOWN"
+    structure_reason = "context_not_built"
+    context_status = "DATA_GAP" if status == "DATA_GAP" else "ERROR"
+    context_error: Optional[str] = None
+    if primitive_status == "READY":
+        try:
+            htf_gate = build_htf_gate(htf, htf_swing_summary)
+            liq_out = build_liquidity_context(entry, entry_swing_summary, entry_eq, entry_sweep)
+            liq_ctx = liq_out["liq_ctx"]
+            liq_gate_status = liq_out["liq_gate_status"]
+            liq_reason = liq_out["liq_reason"]
+            s15 = build_structure_15m(entry)
+            structure_15m = s15["structure_15m"]
+            structure_reason = s15["structure_reason"]
+            htf_gate_status = htf_gate.get("htf_gate_status")
+            if htf_gate_status == "HTF_DATA_GAP":
+                context_status = "HTF_DATA_GAP"
+            elif htf_gate_status == "PASS" and liq_gate_status == "PASS":
+                context_status = "READY"
+            elif htf_gate_status == "BLOCK" or liq_gate_status == "BLOCK":
+                context_status = "BLOCKED"
+            else:
+                context_status = "ERROR"
+        except Exception as exc:
+            context_status = "ERROR"
+            context_error = f"context:{exc}"
+
+    stageb_confirmation = _initial_stageb_confirmation()
+    shadow_state = "INVALID"
+    stageb_error: Optional[str] = None
+    if _env_bool("VPS_SMC_STAGEB_ENABLED", True):
+        try:
+            stageb_confirmation = build_stageb_confirmation({
+                "symbol": symbol, "context_status": context_status, "liq_gate_status": liq_gate_status, "liq_ctx": liq_ctx,
+                "entry_sweep": entry_sweep, "stageb_fvg": stageb_fvg, "htf_gate": htf_gate, "structure_15m": structure_15m,
+            }, stageb, dry_run=dry_run, no_persist=dry_run, ignore_persisted_state=dry_run)
+            shadow_state = stageb_confirmation.get("stageb_status") or "INVALID"
+        except Exception as exc:
+            stageb_error = f"stageb:{exc}"
+            stageb_confirmation = _initial_stageb_confirmation()
+            stageb_confirmation["stageb_invalid_reason"] = stageb_error
+            shadow_state = "INVALID"
+
+    entry_sweep["selected_direction"] = (stageb_confirmation.get("selected_direction") or "NONE")
+    entry_sweep["selected_direction_reason"] = (stageb_confirmation.get("selected_direction_reason") or "no_sweep_direction")
+    entry_sweep["selected_sweep_tag"] = stageb_confirmation.get("selected_sweep_tag")
+    entry_sweep["selected_sweep_level"] = stageb_confirmation.get("selected_sweep_level")
+    entry_sweep["selected_sweep_extreme"] = stageb_confirmation.get("selected_sweep_extreme")
+    entry_sweep["selected_sweep_t"] = stageb_confirmation.get("selected_sweep_t")
+
+    result: Dict[str, Any] = {
+        "symbol": symbol, "status": status, "primitive_status": primitive_status, "htf_count": len(htf), "entry_count": len(entry),
+        "stageb_count": len(stageb), "latest_htf_close_time_ms": htf[-1]["t"] if htf else None,
+        "latest_entry_close_time_ms": entry[-1]["t"] if entry else None, "latest_stageb_close_time_ms": stageb[-1]["t"] if stageb else None,
+        "close_15m_used": entry[-1]["c"] if entry else None,
+        "entry_swing_summary": entry_swing_summary, "entry_eq": entry_eq, "entry_sweep": entry_sweep, "stageb_fvg": stageb_fvg,
+        "htf_swing_summary": htf_swing_summary, "htf_gate": htf_gate, "liq_ctx": liq_ctx, "liq_gate_status": liq_gate_status,
+        "liq_reason": liq_reason, "structure_15m": structure_15m, "structure_reason": structure_reason, "context_status": context_status,
+        "stageb_confirmation": stageb_confirmation, "shadow_state": shadow_state, "reason": reason,
+    }
+    errors = [e for e in (primitive_error, context_error, stageb_error) if e]
+    if errors:
+        result["debug_errors"] = errors
+    return result
+
+
+def vps_smc_debug_replay(symbol: str, as_of_wib: Optional[str] = None, as_of_utc: Optional[str] = None) -> Dict[str, Any]:
+    parsed_utc = _parse_iso_utc(as_of_utc) if as_of_utc else _parse_wib_time(as_of_wib)
+    if parsed_utc is None:
+        return {"ok": False, "mode": "DEBUG_REPLAY", "error": "invalid_replay_time", "symbol": _normalize_symbol(symbol), "as_of_wib": as_of_wib, "as_of_utc": as_of_utc}
+
+    state_path = _semi_state_file()
+    before = state_path.read_bytes() if state_path.exists() else None
+    symbol_norm = _normalize_symbol(symbol)
+    try:
+        fake_result = _evaluate_vps_smc_symbol(symbol_norm, parsed_utc, dry_run=True)
+    finally:
+        if before is None:
+            try:
+                state_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_bytes(before)
+
+    plan_status, plan, score_detail, skip_reason = _build_plan_and_score(fake_result)
+    fake_result["plan_status"] = plan_status
+    fake_result["plan"] = plan
+    fake_result["score_detail"] = score_detail
+    fake_result["signal_skip_reason"] = skip_reason if plan_status != "VALID" else None
+    diagnostics, diagnostic_summary = _build_diagnostics([fake_result], 1 if plan_status == "VALID" else 0)
+    stageb = fake_result.get("stageb_confirmation") or {}
+    return {
+        "ok": True, "mode": "DEBUG_REPLAY", "read_only": True, "symbol": symbol_norm,
+        "as_of_utc": parsed_utc.isoformat(), "as_of_wib": parsed_utc.astimezone(WIB_TZ).strftime("%Y-%m-%d %H:%M:%S WIB"),
+        "plan_status": plan_status, "plan": plan, "entry": (plan or {}).get("entry_mid"), "sl": (plan or {}).get("sl"),
+        "tp1": (plan or {}).get("tp1"), "tp2": (plan or {}).get("tp2"), "tp3": (plan or {}).get("tp3"), "rr": (plan or {}).get("rr_tp2"),
+        "score_detail": score_detail, "skip_reason": fake_result.get("signal_skip_reason"),
+        "stageb_status": stageb.get("stageb_status"), "stageb_state_machine": stageb.get("stageb_state_machine"),
+        "stageb_confirm_reason": stageb.get("stageb_confirm_reason"), "stageb_invalid_reason": stageb.get("stageb_invalid_reason"),
+        "result": fake_result, "diagnostics": diagnostics, "diagnostic_summary": diagnostic_summary,
+    }
+
+
 def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
     requested_raw = symbols or []
     requested = [_normalize_symbol(s) for s in requested_raw if _normalize_symbol(s)]
@@ -2286,6 +2535,7 @@ def vps_smc_run_once(symbols: Optional[List[str]]) -> Dict[str, Any]:
                 "latest_htf_close_time_ms": htf[-1]["t"] if htf else None,
                 "latest_entry_close_time_ms": entry[-1]["t"] if entry else None,
                 "latest_stageb_close_time_ms": stageb[-1]["t"] if stageb else None,
+                "close_15m_used": entry[-1]["c"] if entry else None,
                 "entry_swing_summary": entry_swing_summary,
                 "entry_eq": entry_eq,
                 "entry_sweep": entry_sweep,

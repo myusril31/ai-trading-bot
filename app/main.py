@@ -169,6 +169,15 @@ class VpsSmcComparePayload(BaseModel):
     run_vps_first: Optional[bool] = False
 
 
+class VpsSmcDebugReplayPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    symbol: str
+    as_of_wib: Optional[str] = None
+    as_of_utc: Optional[str] = None
+    replay_at_wib: Optional[str] = None
+    replay_at_utc: Optional[str] = None
+
+
 class VpsSmcMirrorPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     target: Optional[str] = "ALL"
@@ -5877,6 +5886,20 @@ def vps_smc_compare_endpoint(
         lookback_minutes=req.lookback_minutes,
         symbols=req.symbols,
         run_vps_first=bool(req.run_vps_first),
+    )
+
+
+@app.post("/vps-smc/debug/replay")
+def vps_smc_debug_replay_endpoint(
+    payload: VpsSmcDebugReplayPayload,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    return vps_smc.vps_smc_debug_replay(
+        symbol=payload.symbol,
+        as_of_wib=payload.as_of_wib or payload.replay_at_wib,
+        as_of_utc=payload.as_of_utc or payload.replay_at_utc,
     )
 
 
