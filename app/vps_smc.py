@@ -673,14 +673,19 @@ def _semi_last_close(candles: List[Dict[str, Any]]) -> Optional[float]:
         return None
 
 
-def _semi_bar_debug(c: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+def _semi_bar_debug(c: Dict[str, Any], idx: Optional[int] = None) -> Dict[str, Any]:
+    t = _semi_bar_t(c)
+    out = {
         "o": c.get("o"),
         "h": c.get("h"),
         "l": c.get("l"),
         "c": c.get("c"),
-        "t": _semi_bar_t(c),
+        "t": t,
+        "t_wib": _bucket_ms_to_wib_text(t) if t is not None else None,
     }
+    if idx is not None:
+        out["idx"] = idx
+    return out
 
 
 def _semi_invalidation_debug_defaults() -> Dict[str, Any]:
@@ -776,7 +781,7 @@ def _semi_find_reclaim_after(
     sweep_t: Any,
     max_bars: int,
 ) -> Dict[str, Any]:
-    out = {"has_reclaim": False, "reclaim_level": reclaim_level, "reclaim_t": None, "reclaim_idx": None, "reason": "not_found", "mode": None}
+    out = {"has_reclaim": False, "reclaim_level": reclaim_level, "reclaim_t": None, "reclaim_t_wib": None, "reclaim_idx": None, "reclaim_candle": None, "reason": "not_found", "mode": None}
     try:
         level = float(reclaim_level)
         st = int(sweep_t)
@@ -799,10 +804,10 @@ def _semi_find_reclaim_after(
             continue
 
         if d == "LONG" and low < level and close > level:
-            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "STRICT"})
+            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None, "reclaim_idx": i, "reclaim_candle": _semi_bar_debug(c, i), "reason": "ok", "mode": "STRICT"})
             return out
         if d == "SHORT" and high > level and close < level:
-            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "STRICT"})
+            out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None, "reclaim_idx": i, "reclaim_candle": _semi_bar_debug(c, i), "reason": "ok", "mode": "STRICT"})
             return out
 
     # Relax mode: allow close back through level without requiring wick cross on that exact 5m candle.
@@ -814,10 +819,10 @@ def _semi_find_reclaim_after(
             except Exception:
                 continue
             if d == "LONG" and close > level:
-                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "RELAX"})
+                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None, "reclaim_idx": i, "reclaim_candle": _semi_bar_debug(c, i), "reason": "ok", "mode": "RELAX"})
                 return out
             if d == "SHORT" and close < level:
-                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_idx": i, "reason": "ok", "mode": "RELAX"})
+                out.update({"has_reclaim": True, "reclaim_t": t, "reclaim_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None, "reclaim_idx": i, "reclaim_candle": _semi_bar_debug(c, i), "reason": "ok", "mode": "RELAX"})
                 return out
 
     return out
@@ -833,7 +838,9 @@ def _semi_find_displacement_after(
         "has_displacement": False,
         "direction": direction,
         "displacement_t": None,
+        "displacement_t_wib": None,
         "displacement_idx": None,
+        "displacement_candle": None,
         "body_pct": None,
         "range": None,
         "atr": None,
@@ -875,7 +882,9 @@ def _semi_find_displacement_after(
                 out.update({
                     "has_displacement": True,
                     "displacement_t": _semi_bar_t(c),
+                    "displacement_t_wib": _bucket_ms_to_wib_text(_semi_bar_t(c)) if _semi_bar_t(c) is not None else None,
                     "displacement_idx": i,
+                    "displacement_candle": _semi_bar_debug(c, i),
                     "body_pct": body_pct,
                     "range": crange,
                     "atr": atr,
@@ -888,39 +897,171 @@ def _semi_find_displacement_after(
     return out
 
 
-def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t: Any, lookback: int) -> Dict[str, Any]:
-    out = {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "fvg_idx": None, "reason": "not_found"}
-    try:
-        t0 = int(after_t)
-    except Exception:
-        out["reason"] = "missing_after_t"
-        return out
+def _semi_fvg_candidate_debug(bars: List[Dict[str, Any]], i: int, fvg_type: str, lo: float, hi: float, anchor_idx: Optional[int]) -> Dict[str, Any]:
+    c0 = bars[i - 2]
+    c1 = bars[i - 1]
+    c2 = bars[i]
+    t2 = _semi_bar_t(c2)
+    relation = None
+    if anchor_idx is not None:
+        if i < anchor_idx:
+            relation = "BEFORE_DISPLACEMENT"
+        elif i == anchor_idx:
+            relation = "AT_DISPLACEMENT"
+        else:
+            relation = "AFTER_DISPLACEMENT"
+    return {
+        "type": fvg_type,
+        "lo": min(float(lo), float(hi)),
+        "hi": max(float(lo), float(hi)),
+        "mid": (float(lo) + float(hi)) / 2.0,
+        "t": t2,
+        "t_wib": _bucket_ms_to_wib_text(t2) if t2 is not None else None,
+        "idx": i,
+        "relation_to_displacement": relation,
+        "gap_size": abs(float(hi) - float(lo)),
+        "c0": _semi_bar_debug(c0, i - 2),
+        "c1": _semi_bar_debug(c1, i - 1),
+        "c2": _semi_bar_debug(c2, i),
+    }
 
-    d = str(direction or "").upper()
+
+def _semi_collect_fvg_candidates(candles: List[Dict[str, Any]], after_t: Any, lookback: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "bullish_fvg_candidates": [],
+        "bearish_fvg_candidates": [],
+        "anchor_t": None,
+        "anchor_t_wib": None,
+        "anchor_idx": None,
+        "scan_start_idx": None,
+        "scan_end_idx": None,
+        "reason": "ok",
+    }
     bars = candles or []
     if len(bars) < 3:
         out["reason"] = "not_enough_candles"
         return out
 
-    start = max(2, len(bars) - max(3, int(lookback or 35)))
-    for i in range(len(bars) - 1, start - 1, -1):
-        c0 = bars[i - 2]
-        c2 = bars[i]
-        t2 = _semi_bar_t(c2) or 0
-        if t2 < t0:
-            continue
+    anchor_idx: Optional[int] = None
+    anchor_t: Optional[int] = None
+    try:
+        t0 = int(after_t)
+        anchor_t = t0
+        for i, c in enumerate(bars):
+            if (_semi_bar_t(c) or 0) >= t0:
+                anchor_idx = i
+                break
+    except Exception:
+        t0 = None
+
+    # Apps-style Stage-B FVG belongs to the displacement sequence, not merely
+    # the most recent global lookback window.  Scan from the displacement
+    # anchor with a small pre-window so a gap formed by/around the displacement
+    # candle is not missed when VPS selected the next displacement candle.
+    pre_bars = max(0, _env_int("VPS_SMC_FVG_PRE_DISPLACEMENT_BARS_5M", 2))
+    lb = max(3, int(lookback or 35))
+    if anchor_idx is None:
+        scan_start = max(2, len(bars) - lb)
+        scan_end = len(bars) - 1
+    else:
+        scan_start = max(2, anchor_idx - pre_bars)
+        scan_end = min(len(bars) - 1, anchor_idx + lb)
+
+    out.update({
+        "anchor_t": anchor_t,
+        "anchor_t_wib": _bucket_ms_to_wib_text(anchor_t) if anchor_t is not None else None,
+        "anchor_idx": anchor_idx,
+        "scan_start_idx": scan_start,
+        "scan_end_idx": scan_end,
+    })
+
+    for i in range(scan_start, scan_end + 1):
         try:
-            if d == "LONG" and float(c0["h"]) < float(c2["l"]):
-                out.update({"has_fvg": True, "fvg_type": "BULLISH", "fvg_lo": float(c0["h"]), "fvg_hi": float(c2["l"]), "fvg_t": t2, "fvg_idx": i, "reason": "ok"})
-                return out
-            if d == "SHORT" and float(c0["l"]) > float(c2["h"]):
-                out.update({"has_fvg": True, "fvg_type": "BEARISH", "fvg_lo": float(c2["h"]), "fvg_hi": float(c0["l"]), "fvg_t": t2, "fvg_idx": i, "reason": "ok"})
-                return out
+            c0 = bars[i - 2]
+            c2 = bars[i]
+            c0_h = float(c0["h"])
+            c0_l = float(c0["l"])
+            c2_h = float(c2["h"])
+            c2_l = float(c2["l"])
         except Exception:
             continue
-
+        if c0_h < c2_l:
+            out["bullish_fvg_candidates"].append(_semi_fvg_candidate_debug(bars, i, "BULLISH", c0_h, c2_l, anchor_idx))
+        if c0_l > c2_h:
+            out["bearish_fvg_candidates"].append(_semi_fvg_candidate_debug(bars, i, "BEARISH", c2_h, c0_l, anchor_idx))
     return out
 
+
+def _semi_select_directional_fvg(candidates: Dict[str, Any], direction: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    d = str(direction or "").upper()
+    key = "bullish_fvg_candidates" if d == "LONG" else "bearish_fvg_candidates" if d == "SHORT" else None
+    if key is None:
+        return None, "invalid_direction"
+    items = list((candidates or {}).get(key) or [])
+    if not items:
+        return None, f"missing_{'bullish' if d == 'LONG' else 'bearish'}_fvg"
+
+    anchor_idx = (candidates or {}).get("anchor_idx")
+    if anchor_idx is None:
+        return items[-1], "ok_latest_in_lookback"
+
+    at_or_after = [x for x in items if int(x.get("idx") or 0) >= int(anchor_idx)]
+    if at_or_after:
+        return at_or_after[0], "ok_first_at_or_after_displacement"
+    # If the VPS displacement candle is one/two bars later than Apps, use the
+    # nearest pre-displacement gap rather than falling back to OB.
+    return items[-1], "ok_nearest_pre_displacement"
+
+
+def _semi_find_fvg_after(candles: List[Dict[str, Any]], direction: str, after_t: Any, lookback: int) -> Dict[str, Any]:
+    out = {
+        "has_fvg": False,
+        "fvg_type": None,
+        "fvg_lo": None,
+        "fvg_hi": None,
+        "fvg_t": None,
+        "fvg_idx": None,
+        "reason": "not_found",
+        "selected_fvg_reason": "not_found",
+        "bullish_fvg_candidates": [],
+        "bearish_fvg_candidates": [],
+    }
+    try:
+        int(after_t)
+    except Exception:
+        out["reason"] = "missing_after_t"
+        out["selected_fvg_reason"] = "missing_after_t"
+        return out
+
+    candidates = _semi_collect_fvg_candidates(candles, after_t, lookback)
+    out.update({
+        "bullish_fvg_candidates": candidates.get("bullish_fvg_candidates") or [],
+        "bearish_fvg_candidates": candidates.get("bearish_fvg_candidates") or [],
+        "fvg_scan": {k: candidates.get(k) for k in ("anchor_t", "anchor_t_wib", "anchor_idx", "scan_start_idx", "scan_end_idx", "reason")},
+    })
+    if candidates.get("reason") != "ok":
+        out["reason"] = candidates.get("reason") or "not_found"
+        out["selected_fvg_reason"] = out["reason"]
+        return out
+
+    selected, reason = _semi_select_directional_fvg(candidates, direction)
+    out["selected_fvg_reason"] = reason
+    if not selected:
+        out["reason"] = reason
+        return out
+
+    out.update({
+        "has_fvg": True,
+        "fvg_type": selected.get("type"),
+        "fvg_lo": selected.get("lo"),
+        "fvg_hi": selected.get("hi"),
+        "fvg_t": selected.get("t"),
+        "fvg_idx": selected.get("idx"),
+        "fvg_t_wib": selected.get("t_wib"),
+        "selected_fvg": selected,
+        "reason": "ok",
+    })
+    return out
 
 def _semi_find_ob_before_displacement(
     candles: List[Dict[str, Any]],
@@ -976,18 +1117,44 @@ def _semi_select_poi(fvg: Dict[str, Any], ob: Dict[str, Any]) -> Dict[str, Any]:
     has_fvg = bool((fvg or {}).get("has_fvg"))
     has_ob = bool((ob or {}).get("has_ob"))
     out = {
-        "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None,
-        "selected_poi_reason": "no_valid_poi", "fvg_available": has_fvg, "ob_available": has_ob,
+        "selected_poi_type": None,
+        "selected_poi_lo": None,
+        "selected_poi_hi": None,
+        "selected_poi_mid": None,
+        "selected_poi_t": None,
+        "selected_poi_t_wib": None,
+        "selected_poi_reason": "no_valid_poi",
+        "selected_fvg_reason": (fvg or {}).get("selected_fvg_reason") or (fvg or {}).get("reason") or "not_checked",
+        "selected_ob_reason": (ob or {}).get("reason") or "not_checked",
+        "fvg_available": has_fvg,
+        "ob_available": has_ob,
     }
     if has_fvg:
         lo = float(fvg.get("fvg_lo")); hi = float(fvg.get("fvg_hi"))
-        out.update({"selected_poi_type": "FVG", "selected_poi_lo": min(lo, hi), "selected_poi_hi": max(lo, hi), "selected_poi_mid": (lo + hi) / 2.0, "selected_poi_t": fvg.get("fvg_t"), "selected_poi_reason": "fvg_preferred"})
+        t = fvg.get("fvg_t")
+        out.update({
+            "selected_poi_type": "FVG",
+            "selected_poi_lo": min(lo, hi),
+            "selected_poi_hi": max(lo, hi),
+            "selected_poi_mid": (lo + hi) / 2.0,
+            "selected_poi_t": t,
+            "selected_poi_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None,
+            "selected_poi_reason": "fvg_preferred",
+        })
         return out
     if has_ob:
         lo = float(ob.get("ob_lo")); hi = float(ob.get("ob_hi"))
-        out.update({"selected_poi_type": "OB", "selected_poi_lo": min(lo, hi), "selected_poi_hi": max(lo, hi), "selected_poi_mid": (lo + hi) / 2.0, "selected_poi_t": ob.get("ob_t"), "selected_poi_reason": "ob_fallback_no_fvg"})
+        t = ob.get("ob_t")
+        out.update({
+            "selected_poi_type": "OB",
+            "selected_poi_lo": min(lo, hi),
+            "selected_poi_hi": max(lo, hi),
+            "selected_poi_mid": (lo + hi) / 2.0,
+            "selected_poi_t": t,
+            "selected_poi_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None,
+            "selected_poi_reason": "ob_fallback_no_fvg",
+        })
     return out
-
 
 def _semi_find_retest_rejection(
     candles: List[Dict[str, Any]],
@@ -996,7 +1163,7 @@ def _semi_find_retest_rejection(
     after_t: Any,
     max_bars: int,
 ) -> Dict[str, Any]:
-    out = {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_found"}
+    out = {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_t_wib": None, "retest_idx": None, "retest_candle": None, "reason": "not_found", "scan_bars": []}
     try:
         zlo = min(float(poi.get("selected_poi_lo")), float(poi.get("selected_poi_hi")))
         zhi = max(float(poi.get("selected_poi_lo")), float(poi.get("selected_poi_hi")))
@@ -1022,13 +1189,23 @@ def _semi_find_retest_rejection(
             continue
 
         overlaps = low <= zhi and high >= zlo
+        rejection_ok = bool(overlaps and ((d == "LONG" and close > zhi and close > o) or (d == "SHORT" and close < zlo and close < o)))
+        bar_debug = _semi_bar_debug(c, i)
+        bar_debug.update({
+            "poi_lo": zlo,
+            "poi_hi": zhi,
+            "touched_poi": overlaps,
+            "has_rejection_close": rejection_ok,
+            "result": "retest_rejection" if rejection_ok else "touched_no_rejection_close" if overlaps else "no_touch",
+        })
+        out["scan_bars"].append(bar_debug)
+
         if not overlaps:
             continue
 
         touched = True
-        rejection_ok = (d == "LONG" and close > zhi and close > o) or (d == "SHORT" and close < zlo and close < o)
         if rejection_ok:
-            out.update({"has_retest": True, "has_rejection_close": True, "retest_t": t, "retest_idx": i, "reason": "ok"})
+            out.update({"has_retest": True, "has_rejection_close": True, "retest_t": t, "retest_t_wib": _bucket_ms_to_wib_text(t) if t is not None else None, "retest_idx": i, "retest_candle": _semi_bar_debug(c, i), "reason": "ok"})
             return out
 
     if touched:
@@ -1037,21 +1214,23 @@ def _semi_find_retest_rejection(
         out["reason"] = "waiting_poi_retest"
     return out
 
-
 def _semi_stageb_base(direction: str) -> Dict[str, Any]:
     return {
         "stageb_status": "INVALID",
         "stageb_direction": direction,
         "stageb_reclaim": {"has_reclaim": False, "reclaim_level": None, "reclaim_t": None, "reclaim_idx": None, "reason": "not_built"},
         "stageb_displacement": {"has_displacement": False, "direction": direction, "displacement_t": None, "displacement_idx": None, "body_pct": None, "range": None, "atr": None, "reason": "not_built"},
-        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built"},
+        "stageb_fvg_poi": {"has_fvg": False, "fvg_type": None, "fvg_lo": None, "fvg_hi": None, "fvg_t": None, "reason": "not_built", "selected_fvg_reason": "not_built", "bullish_fvg_candidates": [], "bearish_fvg_candidates": []},
         "stageb_ob_poi": {"has_ob": False, "ob_type": None, "ob_lo": None, "ob_hi": None, "ob_t": None, "reason": "not_built"},
         "stageb_retest": {"has_retest": False, "has_rejection_close": False, "retest_t": None, "retest_idx": None, "reason": "not_built"},
-        "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_reason": "no_valid_poi",
+        "selected_poi_type": None, "selected_poi_lo": None, "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_t_wib": None, "selected_poi_reason": "no_valid_poi",
         "fvg_available": False, "ob_available": False,
         "stageb_confirm_reason": None,
         "stageb_invalid_reason": None,
         "stageb_state_machine": "IDLE",
+        "selected_sweep_t_wib": None,
+        "selected_fvg_reason": "not_built",
+        "selected_ob_reason": "not_built",
         "confirmed_t": None,
         "confirmed_t_wib": None,
         **_semi_invalidation_debug_defaults(),
@@ -1137,6 +1316,7 @@ def build_stageb_confirmation(
         out["selected_sweep_level"] = entry_sweep.get("bearish_sweep_level")
         out["selected_sweep_extreme"] = entry_sweep.get("bearish_sweep_extreme")
         out["selected_sweep_t"] = entry_sweep.get("bearish_sweep_t")
+    out["selected_sweep_t_wib"] = _bucket_ms_to_wib_text(out.get("selected_sweep_t")) if out.get("selected_sweep_t") is not None else None
 
     if context_status in ("DATA_GAP", "HTF_DATA_GAP", "ERROR"):
         out["stageb_invalid_reason"] = "context_not_ready"
@@ -1161,6 +1341,7 @@ def build_stageb_confirmation(
         out["selected_sweep_t"] = st.get("sweep_t")
         out["selected_sweep_level"] = st.get("sweep_level")
         out["selected_sweep_extreme"] = st.get("sweep_extreme")
+        out["selected_sweep_t_wib"] = _bucket_ms_to_wib_text(out.get("selected_sweep_t")) if out.get("selected_sweep_t") is not None else None
     invalidation = _semi_invalidated(direction, stageb_candles, invalidation_extreme, invalidation_start_t)
     out.update({k: v for k, v in invalidation.items() if k != "invalidated"})
     if invalidation.get("invalidated"):
@@ -1323,10 +1504,22 @@ def build_stageb_confirmation(
         poi = st.get("poi") or {}
         selected_poi = st.get("selected_poi") or {}
 
+        ob = st.get("ob") or out["stageb_ob_poi"]
+        # If an earlier build fell back to OB, re-scan the displacement sequence
+        # for an Apps-style FVG and prefer it before testing retest/rejection.
+        if disp.get("has_displacement") and selected_poi.get("selected_poi_type") != "FVG":
+            refreshed_poi = _semi_find_fvg_after(stageb_candles, direction, disp.get("displacement_t"), fvg_lookback)
+            if refreshed_poi.get("has_fvg"):
+                poi = refreshed_poi
+                selected_poi = _semi_select_poi(poi, ob)
+                st["poi"] = poi
+                st["selected_poi"] = selected_poi
+                st["poi_t"] = selected_poi.get("selected_poi_t")
+
         out["stageb_reclaim"] = reclaim or out["stageb_reclaim"]
         out["stageb_displacement"] = disp or out["stageb_displacement"]
         out["stageb_fvg_poi"] = poi or out["stageb_fvg_poi"]
-        out["stageb_ob_poi"] = (st.get("ob") or out["stageb_ob_poi"])
+        out["stageb_ob_poi"] = ob
         out.update(selected_poi)
 
         after_t = max(int(disp.get("displacement_t") or 0), int(selected_poi.get("selected_poi_t") or 0))
@@ -2298,7 +2491,8 @@ def _initial_stageb_confirmation() -> Dict[str, Any]:
     return {
         "stageb_status": "INVALID", "stageb_direction": "NONE", "stageb_reclaim": {}, "stageb_displacement": {},
         "stageb_fvg_poi": {}, "stageb_ob_poi": {}, "selected_poi_type": None, "selected_poi_lo": None,
-        "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_reason": "no_valid_poi",
+        "selected_poi_hi": None, "selected_poi_mid": None, "selected_poi_t": None, "selected_poi_t_wib": None, "selected_poi_reason": "no_valid_poi",
+        "selected_fvg_reason": "not_built", "selected_ob_reason": "not_built",
         "fvg_available": False, "ob_available": False, "stageb_confirm_reason": None, "stageb_invalid_reason": "not_built",
     }
 
@@ -2410,6 +2604,32 @@ def _evaluate_vps_smc_symbol(symbol: str, as_of_utc: Optional[datetime] = None, 
     return result
 
 
+
+def _stageb_sequence_debug(stageb: Dict[str, Any]) -> Dict[str, Any]:
+    fvg = (stageb or {}).get("stageb_fvg_poi") or {}
+    return {
+        "selected_sweep_t": (stageb or {}).get("selected_sweep_t"),
+        "selected_sweep_t_wib": (stageb or {}).get("selected_sweep_t_wib"),
+        "selected_sweep_level": (stageb or {}).get("selected_sweep_level"),
+        "selected_sweep_extreme": (stageb or {}).get("selected_sweep_extreme"),
+        "reclaim": (stageb or {}).get("stageb_reclaim"),
+        "reclaim_candle": ((stageb or {}).get("stageb_reclaim") or {}).get("reclaim_candle"),
+        "displacement": (stageb or {}).get("stageb_displacement"),
+        "displacement_candle": ((stageb or {}).get("stageb_displacement") or {}).get("displacement_candle"),
+        "bullish_fvg_candidates": fvg.get("bullish_fvg_candidates") or [],
+        "bearish_fvg_candidates": fvg.get("bearish_fvg_candidates") or [],
+        "selected_fvg_reason": (stageb or {}).get("selected_fvg_reason") or fvg.get("selected_fvg_reason") or fvg.get("reason"),
+        "selected_ob_reason": (stageb or {}).get("selected_ob_reason") or (((stageb or {}).get("stageb_ob_poi") or {}).get("reason")),
+        "selected_poi_reason": (stageb or {}).get("selected_poi_reason"),
+        "selected_poi_type": (stageb or {}).get("selected_poi_type"),
+        "selected_poi_lo": (stageb or {}).get("selected_poi_lo"),
+        "selected_poi_hi": (stageb or {}).get("selected_poi_hi"),
+        "selected_poi_t": (stageb or {}).get("selected_poi_t"),
+        "selected_poi_t_wib": (stageb or {}).get("selected_poi_t_wib"),
+        "retest": (stageb or {}).get("stageb_retest"),
+        "retest_scan_bars": (((stageb or {}).get("stageb_retest") or {}).get("scan_bars") or []),
+    }
+
 def vps_smc_debug_replay(symbol: str, as_of_wib: Optional[str] = None, as_of_utc: Optional[str] = None) -> Dict[str, Any]:
     parsed_utc = _parse_iso_utc(as_of_utc) if as_of_utc else _parse_wib_time(as_of_wib)
     if parsed_utc is None:
@@ -2446,6 +2666,7 @@ def vps_smc_debug_replay(symbol: str, as_of_wib: Optional[str] = None, as_of_utc
         "score_detail": score_detail, "skip_reason": fake_result.get("signal_skip_reason"),
         "stageb_status": stageb.get("stageb_status"), "stageb_state_machine": stageb.get("stageb_state_machine"),
         "stageb_confirm_reason": stageb.get("stageb_confirm_reason"), "stageb_invalid_reason": stageb.get("stageb_invalid_reason"),
+        "stageb_sequence_debug": _stageb_sequence_debug(stageb),
         **invalidation_debug,
         "result": fake_result, "diagnostics": diagnostics, "diagnostic_summary": diagnostic_summary,
     }
