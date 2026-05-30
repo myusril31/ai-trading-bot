@@ -673,24 +673,100 @@ def _semi_last_close(candles: List[Dict[str, Any]]) -> Optional[float]:
         return None
 
 
-def _semi_invalidated(direction: str, candles: List[Dict[str, Any]], sweep_extreme: Any) -> bool:
-    last_close = _semi_last_close(candles)
-    if last_close is None or sweep_extreme is None:
-        return False
+def _semi_bar_debug(c: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "o": c.get("o"),
+        "h": c.get("h"),
+        "l": c.get("l"),
+        "c": c.get("c"),
+        "t": _semi_bar_t(c),
+    }
+
+
+def _semi_invalidation_debug_defaults() -> Dict[str, Any]:
+    return {
+        "invalidation_checked_from_t": None,
+        "invalidation_checked_from_wib": None,
+        "invalidation_threshold": None,
+        "invalidation_hit_t": None,
+        "invalidation_hit_wib": None,
+        "invalidation_hit_price": None,
+        "invalidation_hit_bar": None,
+        "invalidation_rule": None,
+        "invalidation_buffer_pct": None,
+    }
+
+
+def _semi_invalidated(direction: str, candles: List[Dict[str, Any]], sweep_extreme: Any, checked_from_t: Any = None) -> Dict[str, Any]:
+    debug = _semi_invalidation_debug_defaults()
+    if sweep_extreme is None:
+        debug["invalidation_rule"] = "missing_sweep_extreme"
+        return {"invalidated": False, **debug}
     try:
         ext = float(sweep_extreme)
     except Exception:
-        return False
+        debug["invalidation_rule"] = "invalid_sweep_extreme"
+        return {"invalidated": False, **debug}
 
-    # Same idea as Apps Script invalid beyond sweep + buffer.
-    buf = (_env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)) / 100.0
+    try:
+        start_t = int(checked_from_t)
+    except Exception:
+        start_t = None
+    if start_t is None:
+        debug["invalidation_rule"] = "missing_selected_sweep_t"
+        return {"invalidated": False, **debug}
+
+    # Same idea as Apps Script invalid beyond sweep + buffer.  The window is
+    # intentionally anchored to the selected sweep (or caller-provided start)
+    # so older candles cannot invalidate a newly selected Stage-B sequence.
+    buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)
+    buf = buffer_pct / 100.0
     d = str(direction or "").upper()
 
+    debug["invalidation_checked_from_t"] = start_t
+    debug["invalidation_checked_from_wib"] = _bucket_ms_to_wib_text(start_t) if start_t is not None else None
+    debug["invalidation_buffer_pct"] = buffer_pct
+
     if d == "LONG":
-        return last_close < ext * (1 - buf)
-    if d == "SHORT":
-        return last_close > ext * (1 + buf)
-    return False
+        threshold = ext * (1 - buf)
+        debug["invalidation_threshold"] = threshold
+        debug["invalidation_rule"] = "LONG: post_selected_sweep_low_or_close < sweep_extreme * (1 - buffer)"
+    elif d == "SHORT":
+        threshold = ext * (1 + buf)
+        debug["invalidation_threshold"] = threshold
+        debug["invalidation_rule"] = "SHORT: post_selected_sweep_high_or_close > sweep_extreme * (1 + buffer)"
+    else:
+        debug["invalidation_rule"] = "unsupported_direction"
+        return {"invalidated": False, **debug}
+
+    for c in candles or []:
+        t = _semi_bar_t(c)
+        if start_t is not None and (t is None or t < start_t):
+            continue
+        try:
+            high = float(c["h"])
+            low = float(c["l"])
+            close = float(c["c"])
+        except Exception:
+            continue
+
+        hit = False
+        hit_price = None
+        if d == "SHORT" and (high > threshold or close > threshold):
+            hit = True
+            hit_price = max(high, close)
+        elif d == "LONG" and (low < threshold or close < threshold):
+            hit = True
+            hit_price = min(low, close)
+
+        if hit:
+            debug["invalidation_hit_t"] = t
+            debug["invalidation_hit_wib"] = _bucket_ms_to_wib_text(t) if t is not None else None
+            debug["invalidation_hit_price"] = hit_price
+            debug["invalidation_hit_bar"] = _semi_bar_debug(c)
+            return {"invalidated": True, **debug}
+
+    return {"invalidated": False, **debug}
 
 
 def _semi_find_reclaim_after(
@@ -978,6 +1054,7 @@ def _semi_stageb_base(direction: str) -> Dict[str, Any]:
         "stageb_state_machine": "IDLE",
         "confirmed_t": None,
         "confirmed_t_wib": None,
+        **_semi_invalidation_debug_defaults(),
     }
 
 
@@ -1078,7 +1155,15 @@ def build_stageb_confirmation(
         out["stageb_confirm_reason"] = "liq_gate_blocked"
         return out
 
-    if _semi_invalidated(direction, stageb_candles, st.get("sweep_extreme") or (result.get("liq_ctx") or {}).get("sweep_extreme")):
+    invalidation_start_t = st.get("sweep_t") or out.get("selected_sweep_t")
+    invalidation_extreme = st.get("sweep_extreme") or out.get("selected_sweep_extreme") or (result.get("liq_ctx") or {}).get("sweep_extreme")
+    if st.get("sweep_t") and not out.get("selected_sweep_t"):
+        out["selected_sweep_t"] = st.get("sweep_t")
+        out["selected_sweep_level"] = st.get("sweep_level")
+        out["selected_sweep_extreme"] = st.get("sweep_extreme")
+    invalidation = _semi_invalidated(direction, stageb_candles, invalidation_extreme, invalidation_start_t)
+    out.update({k: v for k, v in invalidation.items() if k != "invalidated"})
+    if invalidation.get("invalidated"):
         states.pop(symbol, None)
         _persist_semi_states()
         out["stageb_status"] = "INVALID"
@@ -2352,6 +2437,7 @@ def vps_smc_debug_replay(symbol: str, as_of_wib: Optional[str] = None, as_of_utc
     fake_result["signal_skip_reason"] = skip_reason if plan_status != "VALID" else None
     diagnostics, diagnostic_summary = _build_diagnostics([fake_result], 1 if plan_status == "VALID" else 0)
     stageb = fake_result.get("stageb_confirmation") or {}
+    invalidation_debug = {k: stageb.get(k) for k in _semi_invalidation_debug_defaults().keys()}
     return {
         "ok": True, "mode": "DEBUG_REPLAY", "read_only": True, "symbol": symbol_norm,
         "as_of_utc": parsed_utc.isoformat(), "as_of_wib": parsed_utc.astimezone(WIB_TZ).strftime("%Y-%m-%d %H:%M:%S WIB"),
@@ -2360,6 +2446,7 @@ def vps_smc_debug_replay(symbol: str, as_of_wib: Optional[str] = None, as_of_utc
         "score_detail": score_detail, "skip_reason": fake_result.get("signal_skip_reason"),
         "stageb_status": stageb.get("stageb_status"), "stageb_state_machine": stageb.get("stageb_state_machine"),
         "stageb_confirm_reason": stageb.get("stageb_confirm_reason"), "stageb_invalid_reason": stageb.get("stageb_invalid_reason"),
+        **invalidation_debug,
         "result": fake_result, "diagnostics": diagnostics, "diagnostic_summary": diagnostic_summary,
     }
 
