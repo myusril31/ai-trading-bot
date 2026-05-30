@@ -1687,7 +1687,33 @@ def build_stageb_confirmation(
             out["stageb_invalid_reason"] = f"no_poi_retest_within_{max_retest}_bars"
             return out
 
-        retest = _semi_find_retest_rejection(stageb_candles, direction, selected_poi, after_t, max_retest)
+        # Apps-style mitigation FVGs already run a stricter near-zone retest probe
+        # during POI selection; use only that probe for this mitigation path and
+        # leave the generic POI retest unchanged for directional FVG/OB setups.
+        mitigation_probe = None
+        if (
+            selected_poi.get("selected_poi_type") == "FVG"
+            and selected_poi.get("selected_fvg_mode") == "MITIGATION_RETRACE"
+        ):
+            probe = selected_poi.get("selected_fvg_retest_probe") or (poi or {}).get(
+                "selected_fvg_retest_probe"
+            )
+            if (
+                isinstance(probe, dict)
+                and probe.get("has_retest")
+                and probe.get("has_rejection_close")
+            ):
+                mitigation_probe = dict(probe)
+                mitigation_probe.setdefault("reason", "ok")
+                mitigation_probe["source"] = "selected_fvg_retest_probe"
+
+        retest = mitigation_probe or _semi_find_retest_rejection(
+            stageb_candles,
+            direction,
+            selected_poi,
+            after_t,
+            max_retest,
+        )
         out["stageb_retest"] = retest
 
         if not (retest.get("has_retest") and retest.get("has_rejection_close")):
@@ -1712,7 +1738,11 @@ def build_stageb_confirmation(
         out["stageb_retest"] = retest
         out["confirmed_t"] = confirmed_t
         out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
-        out["stageb_confirm_reason"] = "poi_retest_rejection_close"
+        out["stageb_confirm_reason"] = (
+            "mitigation_fvg_retest_rejection_close"
+            if mitigation_probe
+            else "poi_retest_rejection_close"
+        )
         return out
 
     out["stageb_status"] = "WATCH"
