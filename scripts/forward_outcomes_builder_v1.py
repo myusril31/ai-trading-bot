@@ -271,6 +271,18 @@ def latest_unique_signals(rows):
 
     return list(by_key.values())
 
+
+def assume_filled_on_signal(row):
+    dec = str(row.get("execution_decision") or "").upper().strip()
+    source_mode = str(row.get("source_mode") or "").upper().strip()
+
+    # ACCEPT means the engine accepted/executed the plan path.
+    # For these, requiring a future candle to re-touch entry can create fake NO_FILL.
+    if dec in ("ACCEPT", "LIVE_ORDER_PLACED"):
+        return True
+
+    return False
+
 def outcome_result(row):
     k = signal_key(row)
     sym = symbol_of(row)
@@ -388,11 +400,17 @@ def outcome_result(row):
             "exclude_label_reason": "no_candles_after_signal",
         }
 
+    fill_policy = "ASSUME_FILLED_ON_SIGNAL" if assume_filled_on_signal(row) else "TOUCH_ENTRY_REQUIRED"
+
     fill_t = None
-    for c in future:
-        if c["l"] <= entry <= c["h"]:
-            fill_t = c["t"]
-            break
+
+    if fill_policy == "ASSUME_FILLED_ON_SIGNAL":
+        fill_t = future[0]["t"] if future else None
+    else:
+        for c in future:
+            if c["l"] <= entry <= c["h"]:
+                fill_t = c["t"]
+                break
 
     if fill_t is None:
         closed_window = last_candle_ms >= end_ms
@@ -411,6 +429,7 @@ def outcome_result(row):
             "hit_sl": False,
             "first_hit": None,
             "fill_t_wib": None,
+            "fill_policy": fill_policy,
             "same_candle_conflict": False,
             "same_candle_policy": "CONSERVATIVE_SL",
             "include_ml_label": False,
@@ -527,6 +546,7 @@ def outcome_result(row):
         "hit_sl": bool(hit_sl),
         "first_hit": first_hit,
         "fill_t_wib": ms_to_wib(fill_t),
+        "fill_policy": fill_policy,
         "same_candle_conflict": same_candle_conflict,
         "same_candle_policy": "CONSERVATIVE_SL",
         "include_ml_label": include_ml_label,
