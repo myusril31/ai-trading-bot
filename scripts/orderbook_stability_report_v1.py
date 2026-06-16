@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import subprocess
 import csv, json, math
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -342,5 +343,20 @@ def main():
             f"{str(r['worst_slip_50_p95'] if r['worst_slip_50_p95'] is not None else 'NA'):>8}"
         )
 
+def run_orderbook_shadow_guard_report():
+    # ORDERBOOK_SHADOW_GUARD_CHAIN_V1
+    # REPORT_ONLY chain. Does not block live orders or modify live gates.
+    script = ROOT / "scripts" / "orderbook_shadow_guard_v1.py"
+
+    if not script.exists():
+        print("orderbook_shadow_guard_script: missing:", script)
+        return
+
+    print("")
+    print("=== CHAIN ORDERBOOK SHADOW GUARD V1 ===")
+    res = subprocess.run(["/usr/bin/python3", str(script)], check=False)
+    print("orderbook_shadow_guard_report_rc:", res.returncode)
+
 if __name__ == "__main__":
     main()
+    run_orderbook_shadow_guard_report()
