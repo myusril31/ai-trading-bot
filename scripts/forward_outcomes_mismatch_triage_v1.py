@@ -87,34 +87,87 @@ def label_win(r):
         return False
     return None
 
-def triage_bucket(old, new):
-    os = status(old)
-    ns = status(new)
+def canonical_label(r):
+    if not r:
+        return ""
 
+    s = status(r)
+    t = target(r)
+    rr = label_r(r)
+
+    if s in CLOSED:
+        return s
+
+    # Old builder commonly used outcome_status=RESOLVED and put actual outcome in label_target.
+    if s == "RESOLVED" and t in CLOSED:
+        return t
+
+    if t in CLOSED:
+        return t
+
+    # Fallback: infer from R only when explicit target is absent.
+    if s == "RESOLVED" and rr is not None:
+        if rr < 0:
+            return "SL"
+        if rr >= 2.5:
+            return "TP3"
+        if rr >= 1.5:
+            return "TP2"
+        if rr >= 1.0:
+            return "TP1"
+
+    return s
+
+def is_closed_label(r):
+    return canonical_label(r) in CLOSED
+
+def is_pending_like(r):
+    s = status(r)
+    c = canonical_label(r)
+    return s in ("PENDING", "OPEN", "OPEN_END", "") or c in ("PENDING", "OPEN", "OPEN_END", "")
+
+def is_non_label(r):
+    c = canonical_label(r)
+    return c in NON_LABEL or c == ""
+
+def label_tuple(r):
+    return (
+        canonical_label(r),
+        label_win(r),
+        label_r(r),
+    )
+
+def triage_bucket(old, new):
     if old is None and new is not None:
         return "NEW_ONLY"
 
     if old is not None and new is None:
         return "OLD_ONLY"
 
-    if os == ns and target(old) == target(new) and label_r(old) == label_r(new) and label_win(old) == label_win(new):
+    old_tuple = label_tuple(old)
+    new_tuple = label_tuple(new)
+
+    old_closed = is_closed_label(old)
+    new_closed = is_closed_label(new)
+
+    if old_tuple == new_tuple:
         return "MATCH"
 
-    if os in ("PENDING", "OPEN", "OPEN_END", "") and ns in CLOSED:
+    if is_pending_like(old) and new_closed:
         return "OLD_PENDING_NEW_CLOSED"
 
-    if os in ("PENDING", "OPEN", "OPEN_END", "") and ns in NON_LABEL:
+    if is_pending_like(old) and is_non_label(new):
         return "OLD_PENDING_NEW_NON_LABEL"
 
-    if os in CLOSED and ns in CLOSED:
-        if os != ns or target(old) != target(new) or label_r(old) != label_r(new):
+    if old_closed and new_closed:
+        if old_tuple != new_tuple:
             return "CLOSED_LABEL_CONFLICT"
-        return "CLOSED_LABEL_MATCH_WEAK"
+        return "MATCH"
 
-    if os in CLOSED and ns in NON_LABEL:
+    if old_closed and is_non_label(new):
         return "OLD_CLOSED_NEW_NON_LABEL"
 
-    if os in NON_LABEL and ns in CLOSED:
+    if is_non_label(old) and new_closed:
         return "OLD_NON_LABEL_NEW_CLOSED"
 
     return "OTHER_MISMATCH"
