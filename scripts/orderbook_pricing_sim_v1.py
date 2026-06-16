@@ -10,6 +10,11 @@ UTC = timezone.utc
 OUT_JSON = ROOT / "reports" / "orderbook_pricing_sim_v1.json"
 OUT_CSV = ROOT / "reports" / "orderbook_pricing_sim_v1.csv"
 
+# Append-only historical snapshots for P11.1.
+# This is REPORT_ONLY storage. It does not modify execution, orders, entries, exits, or live guards.
+OUT_SNAP_JSONL = ROOT / "logs" / "orderbook_pricing_snapshots_v1.jsonl"
+OUT_SNAP_CSV = ROOT / "logs" / "orderbook_pricing_snapshots_v1.csv"
+
 DEFAULT_ALLOWLIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","PAXGUSDT","HYPEUSDT","XRPUSDT","ZECUSDT",
     "UNIUSDT","ADAUSDT","BCHUSDT","LINKUSDT","SUIUSDT","LTCUSDT","AVAXUSDT",
@@ -259,6 +264,39 @@ def main():
             f"sell_fill_ok_{key}",
         ]
 
+    snap_cols = [
+        "created_at_utc",
+        "created_at_wib",
+        *base_cols,
+        *sim_cols,
+        "event_time",
+        "transaction_time",
+        "error",
+    ]
+
+    OUT_SNAP_JSONL.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot_rows = []
+    for r in rows:
+        rr = {
+            "created_at_utc": now.isoformat(),
+            "created_at_wib": now.astimezone(WIB).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            **r,
+        }
+        snapshot_rows.append(rr)
+
+    with OUT_SNAP_JSONL.open("a", encoding="utf-8") as f:
+        for rr in snapshot_rows:
+            f.write(json.dumps(rr, ensure_ascii=False, sort_keys=True) + "\n")
+
+    snap_csv_exists = OUT_SNAP_CSV.exists() and OUT_SNAP_CSV.stat().st_size > 0
+    with OUT_SNAP_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=snap_cols)
+        if not snap_csv_exists:
+            w.writeheader()
+        for rr in snapshot_rows:
+            w.writerow({c: rr.get(c) for c in snap_cols})
+
     cols = base_cols + sim_cols + ["error"]
 
     with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
@@ -270,6 +308,8 @@ def main():
     print("=== ORDERBOOK PRICING SIM V1 | REPORT_ONLY ===")
     print("out_json:", OUT_JSON)
     print("out_csv :", OUT_CSV)
+    print("snap_jsonl:", OUT_SNAP_JSONL)
+    print("snap_csv :", OUT_SNAP_CSV)
     print("status_counts:", counts)
     print("")
     print(f"{'SYM':<10} {'STAT':<7} {'SPRD':>8} {'D10B':>10} {'D10A':>10} {'B25':>8} {'S25':>8}")
