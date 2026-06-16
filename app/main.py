@@ -8100,6 +8100,167 @@ def operator_candle_health_telegram(request: Request, symbol: str = "", interval
 
 
 
+
+
+# =========================
+# Operator Candle Auto-Heal
+# =========================
+
+def market_candle_health_auto_heal(
+    symbols: Optional[List[str]] = None,
+    intervals: Optional[List[str]] = None,
+    limit: int = 800,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    before = market_candle_health(symbols=symbols, intervals=intervals)
+    bad_rows = [r for r in (before.get("rows") or []) if not r.get("ok")]
+
+    heal_symbols = sorted({str(r.get("symbol") or "").upper() for r in bad_rows if r.get("symbol")})
+    heal_intervals = sorted({str(r.get("interval") or "") for r in bad_rows if r.get("interval")})
+
+    if not bad_rows:
+        return {
+            "ok": True,
+            "action": "NOOP",
+            "reason": "candle_health_ok",
+            "before": before,
+            "bootstrap": None,
+            "after": before,
+            "timestamp_utc": utc_now_iso(),
+            "timestamp_wib": wib_now_iso(),
+        }
+
+    plan = {
+        "symbols": heal_symbols,
+        "intervals": heal_intervals,
+        "bad_count": len(bad_rows),
+        "bad_rows": bad_rows,
+        "limit": int(limit or 800),
+    }
+
+    if dry_run:
+        return {
+            "ok": False,
+            "action": "DRY_RUN",
+            "reason": "stale_or_missing_detected",
+            "plan": plan,
+            "before": before,
+            "bootstrap": None,
+            "after": before,
+            "timestamp_utc": utc_now_iso(),
+            "timestamp_wib": wib_now_iso(),
+        }
+
+    bootstrap = market_rest_bootstrap(heal_symbols, heal_intervals, limit=int(limit or 800))
+    after = market_candle_health(symbols=symbols, intervals=intervals)
+    repaired = bool(after.get("ok"))
+
+    return {
+        "ok": repaired,
+        "action": "BOOTSTRAP",
+        "reason": "auto_heal_completed" if repaired else "auto_heal_incomplete",
+        "plan": plan,
+        "before": before,
+        "bootstrap": bootstrap,
+        "after": after,
+        "timestamp_utc": utc_now_iso(),
+        "timestamp_wib": wib_now_iso(),
+    }
+
+
+def format_market_candle_auto_heal_message(res: Dict[str, Any]) -> str:
+    action = res.get("action")
+    before = res.get("before") or {}
+    after = res.get("after") or {}
+    plan = res.get("plan") or {}
+
+    lines = [
+        "🛠️ CANDLE AUTO-HEAL",
+        f"Action: {action}",
+        f"Result: {'OK' if res.get('ok') else 'WARN'}",
+        f"Time: {res.get('timestamp_wib')}",
+        "",
+        "Before:",
+        f"- status={before.get('status')}",
+        f"- coverage={before.get('coverage_pct')}%",
+        f"- stale={before.get('stale_count')}",
+        f"- missing={before.get('missing_count')}",
+        "",
+        "Plan:",
+        f"- symbols={','.join(plan.get('symbols') or []) or '-'}",
+        f"- intervals={','.join(plan.get('intervals') or []) or '-'}",
+        f"- bad_count={plan.get('bad_count', 0)}",
+        "",
+        "After:",
+        f"- status={after.get('status')}",
+        f"- coverage={after.get('coverage_pct')}%",
+        f"- stale={after.get('stale_count')}",
+        f"- missing={after.get('missing_count')}",
+    ]
+
+    bootstrap = res.get("bootstrap")
+    if isinstance(bootstrap, dict):
+        lines.extend([
+            "",
+            "Bootstrap:",
+            f"- ok={bootstrap.get('ok')}",
+            f"- rows_ingested={bootstrap.get('rows_ingested')}",
+            f"- failures={len(bootstrap.get('failures') or [])}",
+        ])
+
+    return "\n".join(lines)
+
+
+@app.post("/operator/candle-health/auto-heal")
+def operator_candle_health_auto_heal(
+    request: Request,
+    symbol: str = "",
+    intervals: str = "5m,15m,4h",
+    limit: int = 800,
+    dry_run: bool = False,
+):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    res = market_candle_health_auto_heal(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+        limit=limit,
+        dry_run=dry_run,
+    )
+    return res
+
+
+@app.post("/operator/candle-health/auto-heal/telegram")
+def operator_candle_health_auto_heal_telegram(
+    request: Request,
+    symbol: str = "",
+    intervals: str = "5m,15m,4h",
+    limit: int = 800,
+    dry_run: bool = False,
+):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    res = market_candle_health_auto_heal(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+        limit=limit,
+        dry_run=dry_run,
+    )
+    msg = format_market_candle_auto_heal_message(res)
+    telegram = send_telegram_message(msg)
+
+    return {
+        "ok": bool(res.get("ok")) and bool(telegram.get("ok")),
+        "auto_heal": res,
+        "telegram": telegram,
+    }
+
+
+
 @app.api_route("/operator/status", methods=["GET", "POST"])
 def operator_status(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
     if not v010_auth_ok(request):
