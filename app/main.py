@@ -7882,6 +7882,224 @@ def paper_performance_daily(date_wib: str, x_signal_secret: Optional[str] = Head
 
 
 
+
+
+# =========================
+# Operator Candle Health
+# =========================
+
+def _market_interval_ms(interval: str) -> Optional[int]:
+    m = {
+        "1m": 60_000,
+        "5m": 5 * 60_000,
+        "15m": 15 * 60_000,
+        "4h": 4 * 60 * 60_000,
+    }
+    return m.get(str(interval or "").strip())
+
+
+def _parse_csv_list(raw: Any) -> List[str]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return []
+    return [x.strip() for x in txt.replace(";", ",").split(",") if x.strip()]
+
+
+def market_candle_health(symbols: Optional[List[str]] = None, intervals: Optional[List[str]] = None) -> Dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+
+    clean_symbols = [
+        v010_normalize_symbol(s)
+        for s in (symbols or market_allowlist_symbols())
+        if v010_normalize_symbol(s)
+    ]
+
+    clean_intervals = [
+        str(x).strip()
+        for x in (intervals or ["5m", "15m", "4h"])
+        if str(x).strip() in {"1m", "5m", "15m", "4h"}
+    ] or ["5m", "15m", "4h"]
+
+    grace_mult = max(0.0, env_float("CANDLE_HEALTH_GRACE_MULT", 0.20))
+    min_grace_sec = max(0, env_int("CANDLE_HEALTH_MIN_GRACE_SEC", 120))
+
+    rows: List[Dict[str, Any]] = []
+    missing_count = 0
+    stale_count = 0
+    invalid_count = 0
+
+    for symbol in clean_symbols:
+        for interval in clean_intervals:
+            expected_ms = _market_interval_ms(interval)
+            if not expected_ms:
+                invalid_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "INVALID_INTERVAL",
+                    "reason": "unsupported_interval",
+                    "count": 0,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": None,
+                })
+                continue
+
+            candles = market_load_candles(symbol, interval)
+            closed = [r for r in candles if bool(r.get("is_closed", True))]
+            count = len(closed)
+
+            if not closed:
+                missing_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "MISSING",
+                    "reason": "no_closed_candles",
+                    "count": 0,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": round((expected_ms + max(min_grace_sec * 1000, int(expected_ms * grace_mult))) / 60000.0, 2),
+                })
+                continue
+
+            last = closed[-1]
+            try:
+                last_close_ms = int(last.get("close_time_ms") or last.get("t") or 0)
+            except Exception:
+                last_close_ms = 0
+
+            if last_close_ms <= 0:
+                missing_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "MISSING",
+                    "reason": "invalid_last_close_time",
+                    "count": count,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": round((expected_ms + max(min_grace_sec * 1000, int(expected_ms * grace_mult))) / 60000.0, 2),
+                })
+                continue
+
+            grace_ms = max(min_grace_sec * 1000, int(expected_ms * grace_mult))
+            max_age_ms = expected_ms + grace_ms
+            age_ms = max(0, now_ms - last_close_ms)
+            stale = age_ms > max_age_ms
+
+            if stale:
+                stale_count += 1
+
+            last_close_wib = datetime.fromtimestamp(last_close_ms / 1000.0, timezone.utc).astimezone(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+            rows.append({
+                "symbol": symbol,
+                "interval": interval,
+                "ok": not stale,
+                "status": "OK" if not stale else "STALE",
+                "reason": "ok" if not stale else "stale_candle",
+                "count": count,
+                "last_close_time_ms": last_close_ms,
+                "last_close_wib": last_close_wib,
+                "age_min": round(age_ms / 60000.0, 2),
+                "max_age_min": round(max_age_ms / 60000.0, 2),
+            })
+
+    total = len(rows)
+    ok_count = sum(1 for r in rows if r.get("ok"))
+    bad_count = total - ok_count
+    coverage_pct = round((ok_count / total) * 100.0, 2) if total else 0.0
+    status = "OK" if bad_count == 0 else "WARN"
+
+    return {
+        "ok": bad_count == 0,
+        "status": status,
+        "coverage_pct": coverage_pct,
+        "total_checks": total,
+        "ok_count": ok_count,
+        "bad_count": bad_count,
+        "missing_count": missing_count,
+        "stale_count": stale_count,
+        "invalid_count": invalid_count,
+        "symbols": clean_symbols,
+        "intervals": clean_intervals,
+        "rows": rows,
+        "timestamp_utc": utc_now_iso(),
+        "timestamp_wib": wib_now_iso(),
+    }
+
+
+def format_market_candle_health_message(h: Dict[str, Any]) -> str:
+    rows = h.get("rows") or []
+    bad = [r for r in rows if not r.get("ok")]
+
+    lines = [
+        "🕯️ CANDLE HEALTH",
+        f"Status: {h.get('status')}",
+        f"Time: {h.get('timestamp_wib')}",
+        f"Coverage: {h.get('coverage_pct')}%",
+        f"OK: {h.get('ok_count')}/{h.get('total_checks')}",
+        f"Missing: {h.get('missing_count')}",
+        f"Stale: {h.get('stale_count')}",
+        "",
+        "Bad rows:",
+    ]
+
+    if not bad:
+        lines.append("- none")
+    else:
+        for r in bad[:25]:
+            lines.append(
+                f"- {r.get('symbol')} {r.get('interval')} | {r.get('status')} | age={r.get('age_min')}m | max={r.get('max_age_min')}m | last={r.get('last_close_wib')}"
+            )
+
+    if len(bad) > 25:
+        lines.append(f"- ...and {len(bad) - 25} more")
+
+    return "\n".join(lines)
+
+
+@app.api_route("/operator/candle-health", methods=["GET", "POST"])
+def operator_candle_health(request: Request, symbol: str = "", intervals: str = "5m,15m,4h"):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    health = market_candle_health(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+    )
+    return health
+
+
+@app.post("/operator/candle-health/telegram")
+def operator_candle_health_telegram(request: Request, symbol: str = "", intervals: str = "5m,15m,4h"):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    health = market_candle_health(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+    )
+    msg = format_market_candle_health_message(health)
+    telegram = send_telegram_message(msg)
+
+    return {
+        "ok": bool(health.get("ok")) and bool(telegram.get("ok")),
+        "health": health,
+        "telegram": telegram,
+    }
+
+
+
 @app.api_route("/operator/status", methods=["GET", "POST"])
 def operator_status(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
     if not v010_auth_ok(request):
