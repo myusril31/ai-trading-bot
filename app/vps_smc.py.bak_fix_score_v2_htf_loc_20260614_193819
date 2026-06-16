@@ -2357,28 +2357,6 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     components = {}
     score_v2_reasons = ["score_v2_shadow_freqtrade_adopt"]
 
-    # === SCORE_V2_SAFE_LOCALS_20260614 ===
-    # Shadow score must never break scanner. Missing internals become neutral/default.
-    _score_v2_htf_gate = str(locals().get("htf_gate") or "")
-    _score_v2_htf_bias = str(locals().get("htf_bias") or "")
-    _score_v2_direction = str(locals().get("direction") or "")
-    _score_v2_liq_decision = str(
-        locals().get("liq_decision")
-        or locals().get("liquidity_decision")
-        or locals().get("liq_status")
-        or locals().get("liq_gate")
-        or ""
-    )
-    _score_v2_reclaim_ok = bool(locals().get("reclaim_ok", False))
-    _score_v2_displacement_ok = bool(locals().get("displacement_ok", False))
-    _score_v2_fvg_ok = bool(locals().get("fvg_ok", False))
-    _score_v2_rr_tp2 = locals().get("rr_tp2", 0)
-    _score_v2_structure_ctx = locals().get("structure_ctx") or {}
-    _score_v2_entry_mid = locals().get("entry_mid", None)
-    _score_v2_entry_hi = locals().get("entry_hi", None)
-    _score_v2_entry_lo = locals().get("entry_lo", None)
-    _score_v2_risk = locals().get("risk", None)
-
     def _add_comp(name, value, reason):
         try:
             value = float(value)
@@ -2388,57 +2366,49 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
         score_v2_reasons.append(f"{reason}:{value:+.1f}")
 
     # --- HTF component, max-ish 20 ---
-    if _score_v2_htf_gate == "PASS":
+    if htf_gate == "PASS":
         _add_comp("htf", 10, "htf_pass")
     else:
         _add_comp("penalty", -12, "htf_not_pass")
 
     try:
-        if str(_score_v2_htf_bias).lower() == str(_score_v2_direction).lower():
+        if str(htf_bias).lower() == str(direction).lower():
             _add_comp("htf", 8, "htf_bias_align")
-        elif str(_score_v2_htf_bias).lower() in ("long", "short"):
+        elif str(htf_bias).lower() in ("long", "short"):
             _add_comp("penalty", -10, "htf_bias_conflict")
     except Exception:
         pass
 
-    # === SCORE_V2_FIX_HTF_LOC_NAMEERROR_20260614 ===
-    _score_v2_htf_loc = str(
-        locals().get("htf_loc")
-        or locals().get("htf_location")
-        or locals().get("htf_loc_tag")
-        or ""
-    )
-
-    if _score_v2_htf_loc == "MIXED_RANGE":
+    if htf_loc == "MIXED_RANGE":
         _add_comp("htf", 3, "htf_mixed_range")
 
     # --- Liquidity component, max-ish 15 ---
-    if _score_v2_liq_decision == "PASS":
+    if liq_decision == "PASS":
         _add_comp("liquidity", 12, "liq_pass")
-    elif _score_v2_liq_decision == "BLOCK":
+    elif liq_decision == "BLOCK":
         _add_comp("penalty", -12, "liq_block")
     else:
         _add_comp("liquidity", 4, "liq_neutral")
 
     # --- Trigger component, max-ish 25 ---
-    if _score_v2_reclaim_ok:
+    if reclaim_ok:
         _add_comp("trigger", 7, "reclaim_ok")
     else:
         _add_comp("penalty", -4, "reclaim_missing")
 
-    if _score_v2_displacement_ok:
+    if displacement_ok:
         _add_comp("trigger", 7, "displacement_ok")
     else:
         _add_comp("penalty", -3, "displacement_missing")
 
-    if _score_v2_fvg_ok:
+    if fvg_ok:
         _add_comp("trigger", 8, "fvg_ok")
     else:
         _add_comp("penalty", -5, "fvg_missing")
 
     # --- RR component, max-ish 15 ---
     try:
-        rr2 = float(_score_v2_rr_tp2)
+        rr2 = float(rr_tp2)
     except Exception:
         rr2 = 0.0
 
@@ -2455,8 +2425,8 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
 
     # --- Structure component, max-ish 10 ---
     try:
-        structure_bias = str((_score_v2_structure_ctx or {}).get("bias") or "").lower()
-        if structure_bias == str(_score_v2_direction).lower():
+        structure_bias = str((structure_ctx or {}).get("bias") or "").lower()
+        if structure_bias == str(direction).lower():
             _add_comp("structure", 8, "structure_align")
         elif structure_bias in ("long", "short"):
             _add_comp("penalty", -8, "structure_conflict")
@@ -2465,9 +2435,9 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
 
     # --- Quality component, max-ish 10 ---
     try:
-        entry_mid_safe = float(_score_v2_entry_mid)
-        zone_width_pct = abs(float(_score_v2_entry_hi) - float(_score_v2_entry_lo)) / entry_mid_safe * 100.0 if entry_mid_safe else 999.0
-        sl_dist_pct = abs(float(_score_v2_risk)) / entry_mid_safe * 100.0 if entry_mid_safe else 999.0
+        entry_mid_safe = float(entry_mid)
+        zone_width_pct = abs(float(entry_hi) - float(entry_lo)) / entry_mid_safe * 100.0 if entry_mid_safe else 999.0
+        sl_dist_pct = abs(float(risk)) / entry_mid_safe * 100.0 if entry_mid_safe else 999.0
 
         if zone_width_pct <= 0.20:
             _add_comp("quality", 5, "tight_entry_zone")
