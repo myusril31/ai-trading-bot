@@ -251,7 +251,7 @@ def main():
 
     with OUT_SNAP_JSONL.open("a", encoding="utf-8") as f:
         for rr in snap_rows:
-            f.write(json.dumps(rr, ensure_ascii=False, sort_keys=True) + "\\n")
+            f.write(json.dumps(rr, ensure_ascii=False, sort_keys=True) + "\n")
 
     snap_csv_exists = OUT_SNAP_CSV.exists() and OUT_SNAP_CSV.stat().st_size > 0
     with OUT_SNAP_CSV.open("a", newline="", encoding="utf-8") as f:
