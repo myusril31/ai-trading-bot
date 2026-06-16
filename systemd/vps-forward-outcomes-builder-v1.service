@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Trading 2026 Forward Outcomes Builder V1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-trading-vps-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=FORWARD_OUTCOME_MAX_SIGNALS=500
+Environment=FORWARD_OUTCOME_WINDOW_HOURS=24
+ExecStart=/usr/bin/python3 scripts/forward_outcomes_builder_v1.py
+Nice=10
+IOSchedulingClass=best-effort
