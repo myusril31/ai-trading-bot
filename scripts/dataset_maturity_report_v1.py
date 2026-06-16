@@ -35,7 +35,7 @@ COMPONENTS = [
     },
     {
         "name": "forward_outcomes",
-        "path": ROOT / "logs" / "forward_outcomes.jsonl",
+        "path": ROOT / "logs" / "forward_outcomes_v1.jsonl",
         "kind": "jsonl",
         "min_rows": 50,
         "min_symbols": 8,
