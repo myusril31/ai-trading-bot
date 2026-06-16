@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import subprocess
 import json, csv, os, time, urllib.request, urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -324,5 +325,20 @@ def main():
             f"{fmt(r.get('depth10_ask_usdt'),1):>10} {fmt(b25):>8} {fmt(s25):>8}"
         )
 
+def run_orderbook_stability_report():
+    # ORDERBOOK_STABILITY_CHAIN_V1
+    # REPORT_ONLY chain. Does not modify execution, live gates, pair allowlist, or order routing.
+    script = ROOT / "scripts" / "orderbook_stability_report_v1.py"
+
+    if not script.exists():
+        print("orderbook_stability_script: missing:", script)
+        return
+
+    print("")
+    print("=== CHAIN ORDERBOOK STABILITY REPORT V1 ===")
+    res = subprocess.run(["/usr/bin/python3", str(script)], check=False)
+    print("orderbook_stability_report_rc:", res.returncode)
+
 if __name__ == "__main__":
     main()
+    run_orderbook_stability_report()
