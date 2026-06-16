@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, csv, math
+import json, csv, math, subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -260,5 +260,17 @@ def main():
             f"{r['outcome_count']:>4} {wr:>7} {exp:>7} {r['ml_rows']:>3} {pwin:>7}"
         )
 
+def run_calibration_report():
+    calib = ROOT / "scripts" / "pair_policy_calibration_v1.py"
+
+    if not calib.exists():
+        print("calibration_script: missing:", calib)
+        return
+
+    print("")
+    print("=== CHAIN PAIR POLICY CALIBRATION V1 ===")
+    subprocess.run(["/usr/bin/python3", str(calib)], check=True)
+
 if __name__ == "__main__":
     main()
+    run_calibration_report()
