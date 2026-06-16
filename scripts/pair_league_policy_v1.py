@@ -11,6 +11,11 @@ IN_FILE = ROOT / "reports" / "pair_league_v1.json"
 OUT_JSON = ROOT / "reports" / "pair_league_policy_v1.json"
 OUT_CSV = ROOT / "reports" / "pair_league_policy_v1.csv"
 
+# Append-only historical snapshots for P12.1.
+# REPORT_ONLY storage. Does not modify allowlist, scanner, execution, or live gates.
+OUT_SNAP_JSONL = ROOT / "logs" / "pair_league_policy_snapshots_v1.jsonl"
+OUT_SNAP_CSV = ROOT / "logs" / "pair_league_policy_snapshots_v1.csv"
+
 POLICY_VERSION = "pair_league_policy_v1_1_20260614"
 MODE = "REPORT_ONLY"
 
@@ -197,6 +202,41 @@ def main():
         "avg_score_v2_recalc","ml_rows","avg_ml_p_win","ml_pass_count","fs_feature_sanity_ok",
     ]
 
+    snap_cols = [
+        "created_at_wib",
+        "policy_version",
+        "source_created_at_wib",
+        *cols,
+        "reasons",
+    ]
+
+    OUT_SNAP_JSONL.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot_rows = []
+    for r in policies:
+        rr = {
+            "created_at_wib": report.get("created_at_wib"),
+            "policy_version": POLICY_VERSION,
+            "source_created_at_wib": report.get("source_created_at_wib"),
+            **r,
+        }
+        snapshot_rows.append(rr)
+
+    with OUT_SNAP_JSONL.open("a", encoding="utf-8") as f:
+        for rr in snapshot_rows:
+            f.write(json.dumps(rr, ensure_ascii=False, sort_keys=True) + "\n")
+
+    snap_csv_exists = OUT_SNAP_CSV.exists() and OUT_SNAP_CSV.stat().st_size > 0
+    with OUT_SNAP_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=snap_cols)
+        if not snap_csv_exists:
+            w.writeheader()
+        for rr in snapshot_rows:
+            row = {c: rr.get(c) for c in snap_cols}
+            if isinstance(row.get("reasons"), (list, dict)):
+                row["reasons"] = json.dumps(row["reasons"], ensure_ascii=False)
+            w.writerow(row)
+
     with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -206,6 +246,8 @@ def main():
     print(f"=== PAIR LEAGUE POLICY V1 | {MODE} ===")
     print("out_json:", OUT_JSON)
     print("out_csv :", OUT_CSV)
+    print("snap_jsonl:", OUT_SNAP_JSONL)
+    print("snap_csv :", OUT_SNAP_CSV)
     print("")
     print(f"{'SYM':<10} {'STATUS':<12} {'LGS':>6} {'WGT':>5} {'ACTION':<28} {'OUT':>4} {'WR':>7} {'EXP':>7} {'ML':>3} {'PWIN':>7}")
     for r in policies:

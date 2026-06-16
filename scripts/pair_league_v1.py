@@ -19,6 +19,11 @@ FEATURE_LATEST = ROOT / "state" / "features" / "latest_freqai_features_v1.json"
 OUT_JSON = ROOT / "reports" / "pair_league_v1.json"
 OUT_CSV = ROOT / "reports" / "pair_league_v1.csv"
 
+# Append-only historical snapshots for P12.1.
+# REPORT_ONLY storage. Does not modify allowlist, scanner, execution, or live gates.
+OUT_SNAP_JSONL = ROOT / "logs" / "pair_league_snapshots_v1.jsonl"
+OUT_SNAP_CSV = ROOT / "logs" / "pair_league_snapshots_v1.csv"
+
 FALLBACK_ALLOWLIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","PAXGUSDT","HYPEUSDT","XRPUSDT","ZECUSDT",
     "UNIUSDT","ADAUSDT","BCHUSDT","LINKUSDT","SUIUSDT","LTCUSDT","AVAXUSDT",
@@ -291,6 +296,32 @@ def main():
         "fs_cross_rank_ret_15m_4","fs_feature_sanity_ok",
     ]
 
+    snap_cols = ["created_at_wib", "report_version", "window_days", *cols]
+
+    OUT_SNAP_JSONL.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot_rows = []
+    for r in rows:
+        rr = {
+            "created_at_wib": report.get("created_at_wib"),
+            "report_version": report.get("report_version"),
+            "window_days": DAYS,
+            **r,
+        }
+        snapshot_rows.append(rr)
+
+    with OUT_SNAP_JSONL.open("a", encoding="utf-8") as f:
+        for rr in snapshot_rows:
+            f.write(json.dumps(rr, ensure_ascii=False, sort_keys=True) + "\n")
+
+    snap_csv_exists = OUT_SNAP_CSV.exists() and OUT_SNAP_CSV.stat().st_size > 0
+    with OUT_SNAP_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=snap_cols)
+        if not snap_csv_exists:
+            w.writeheader()
+        for rr in snapshot_rows:
+            w.writerow({c: rr.get(c) for c in snap_cols})
+
     with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -300,6 +331,8 @@ def main():
     print(f"=== PAIR LEAGUE V1 | last {DAYS}d | REPORT_ONLY ===")
     print("out_json:", OUT_JSON)
     print("out_csv :", OUT_CSV)
+    print("snap_jsonl:", OUT_SNAP_JSONL)
+    print("snap_csv :", OUT_SNAP_CSV)
     print("")
     print(f"{'SYM':<10} {'STATUS':<12} {'LGS':>6} {'SIG':>4} {'JOIN':>4} {'AVG_V2':>7} {'A':>3} {'B':>3} {'ML':>3} {'PWIN':>7} {'OUT':>4}")
     for r in rows:
