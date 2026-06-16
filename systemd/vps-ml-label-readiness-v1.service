@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Trading 2026 ML Label Readiness Report V1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-trading-vps-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 scripts/ml_label_readiness_report_v1.py
+Nice=10
+IOSchedulingClass=best-effort

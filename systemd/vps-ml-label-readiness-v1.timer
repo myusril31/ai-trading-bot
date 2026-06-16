@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AI Trading 2026 ML Label Readiness Report V1 every 15 minutes
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=15min
+RandomizedDelaySec=30
+Persistent=true
+Unit=vps-ml-label-readiness-v1.service
+
+[Install]
+WantedBy=timers.target
