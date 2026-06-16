@@ -16,7 +16,17 @@ SIGNAL_FILES = [
 
 FEATURE_FILE = ROOT / "logs" / "freqai_feature_store_v1.jsonl"
 ML_PRED_FILE = ROOT / "logs" / "ml_predictions.jsonl"
-OUTCOME_FILE = ROOT / "logs" / "forward_outcomes.jsonl"
+def env_path(name, default_path):
+    raw = os.getenv(name)
+    if not raw:
+        return default_path
+    pp = Path(raw)
+    return pp if pp.is_absolute() else ROOT / pp
+
+OUTCOME_FILE = env_path("FORWARD_OUTCOMES_PATH", ROOT / "logs" / "forward_outcomes_v1.jsonl")
+OUTCOME_FALLBACK_FILE = ROOT / "logs" / "forward_outcomes.jsonl"
+OUTCOME_STRICT_LABELS = str(os.getenv("FORWARD_OUTCOME_STRICT_LABELS", "1")).lower() not in ("0", "false", "no", "off")
+OUTCOME_LOAD_META = {}
 RECALC_SCORE_FILE = ROOT / "logs" / "score_v2_recalc_shadow_v1.jsonl"  # SCORE_V2_RECALC_JOIN_SUPPORT_20260614
 
 OUT_FILE = ROOT / "logs" / "ml_dataset_v3_feature_join.jsonl"
@@ -157,6 +167,50 @@ def num(x):
         pass
     return None
 
+def outcome_allowed_for_ml(r):
+    if not OUTCOME_STRICT_LABELS:
+        return True
+
+    status = str(r.get("outcome_status") or "").upper().strip()
+
+    if r.get("include_ml_label") is not True:
+        return False
+
+    if status not in ("TP1", "TP2", "TP3", "SL"):
+        return False
+
+    if num(r.get("label_R")) is None:
+        return False
+
+    return True
+
+def load_outcome_rows():
+    global OUTCOME_LOAD_META
+
+    rows = read_jsonl(OUTCOME_FILE)
+    source_path = OUTCOME_FILE
+    fallback_used = False
+
+    if not rows and OUTCOME_FILE != OUTCOME_FALLBACK_FILE:
+        rows = read_jsonl(OUTCOME_FALLBACK_FILE)
+        source_path = OUTCOME_FALLBACK_FILE
+        fallback_used = True
+
+    raw_count = len(rows)
+
+    if OUTCOME_STRICT_LABELS:
+        rows = [r for r in rows if outcome_allowed_for_ml(r)]
+
+    OUTCOME_LOAD_META = {
+        "outcome_source_path": str(source_path),
+        "outcome_fallback_used": fallback_used,
+        "outcome_strict_labels": OUTCOME_STRICT_LABELS,
+        "outcome_raw_rows": raw_count,
+        "outcome_rows_after_gate": len(rows),
+    }
+
+    return rows
+
 def score_detail_of(r):
     p = payload_of(r)
     sd = r.get("score_detail") or p.get("score_detail")
@@ -244,7 +298,7 @@ def main():
     signals = latest_by_key(signal_rows)
 
     ml_preds = latest_by_key(read_jsonl(ML_PRED_FILE))
-    outcomes = latest_by_key(read_jsonl(OUTCOME_FILE))
+    outcomes = latest_by_key(load_outcome_rows())
     score_recalc_map = latest_by_key(read_jsonl(RECALC_SCORE_FILE))
 
     features = read_jsonl(FEATURE_FILE)
