@@ -1166,7 +1166,12 @@ def live_apply_range_plan_rebase(plan: Dict[str, Any], entry_fill_res: dict) -> 
             return out
 
         risk_dist = abs(old_sl - plan_entry)
-        reward_dist = abs(plan_entry - old_tp1)
+        rr_target_r = Decimal(str(os.getenv("RR_TARGET_R", "1.2")))
+        actual_risk_dist = abs(actual_entry - old_sl)
+        reward_dist = actual_risk_dist * rr_target_r if actual_risk_dist > 0 else abs(plan_entry - old_tp1)
+        out["post_fill_rr_rebase_applied"] = True
+        out["post_fill_rr_target_r"] = str(rr_target_r)
+        out["post_fill_actual_risk_dist"] = str(actual_risk_dist)
 
         if risk_dist <= 0 or reward_dist <= 0:
             out["range_plan_error"] = "bad_risk_reward_distance"
@@ -1191,7 +1196,7 @@ def live_apply_range_plan_rebase(plan: Dict[str, Any], entry_fill_res: dict) -> 
             if final_sl >= max_valid_sl:
                 final_sl = max_valid_sl
 
-            final_tp1 = rebase_tp1 if preserve_rr else old_tp1
+            final_tp1 = rebase_tp1
             min_valid_tp1 = ref_price * (Decimal("1") + tp_min_profit)
             if final_tp1 <= min_valid_tp1:
                 final_tp1 = min_valid_tp1
@@ -1208,7 +1213,7 @@ def live_apply_range_plan_rebase(plan: Dict[str, Any], entry_fill_res: dict) -> 
             if final_sl <= min_valid_sl:
                 final_sl = min_valid_sl
 
-            final_tp1 = rebase_tp1 if preserve_rr else old_tp1
+            final_tp1 = rebase_tp1
             max_valid_tp1 = ref_price * (Decimal("1") - tp_min_profit)
             if final_tp1 >= max_valid_tp1:
                 final_tp1 = max_valid_tp1
