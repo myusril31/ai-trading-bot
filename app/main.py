@@ -3298,6 +3298,167 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
     return True, "execution_plan_valid"
 
 
+
+def apply_rr_single_target_rewrite(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RR Single Target Rewrite V1
+
+    Immediate live behavior:
+    - rewrite TP plan to a single full target at RR_TARGET_R
+    - preserve raw TP fields for audit
+    - keep tp1/tp2/tp3 schema compatible
+    - force tp2/tp3 qty to 0 when qty fields exist
+    """
+    enabled = env_bool("RR_TARGET_REWRITE_ENABLED", True)
+    target_r = env_float("RR_TARGET_R", 1.2)
+    mode = str(os.getenv("RR_TARGET_MODE", "SINGLE_FULL")).strip().upper() or "SINGLE_FULL"
+
+    base = {
+        "rr_target_rewrite_enabled": enabled,
+        "rr_target_mode": mode,
+        "rr_target_r": target_r,
+        "rr_rewrite_applied": False,
+        "rr_rewrite_reason": "",
+        "rr_old_tp1_r": None,
+        "rr_old_tp2_r": None,
+        "rr_old_tp3_r": None,
+        "rr_new_tp_r": None,
+        "rr_single_target_price": None,
+    }
+
+    if not enabled:
+        base["rr_rewrite_reason"] = "rr_target_rewrite_disabled"
+        plan.update(base)
+        return {**base, "ok": True}
+
+    entry = to_float_or_none(plan.get("entry_mid") or plan.get("entry") or plan.get("entry_price"))
+    sl = to_float_or_none(plan.get("sl") or plan.get("stop_loss") or plan.get("invalid"))
+    old_tp1 = to_float_or_none(plan.get("tp1"))
+    old_tp2 = to_float_or_none(plan.get("tp2"))
+    old_tp3 = to_float_or_none(plan.get("tp3"))
+
+    direction_raw = str(plan.get("direction") or plan.get("dir") or "").strip().upper()
+    try:
+        d2 = str(direction_of(plan) or "").strip().upper()
+        if d2:
+            direction_raw = d2
+    except Exception:
+        pass
+
+    is_long = direction_raw in ("LONG", "BUY")
+    is_short = direction_raw in ("SHORT", "SELL")
+
+    if entry is None or sl is None or entry <= 0 or sl <= 0:
+        base["rr_rewrite_reason"] = "missing_entry_or_sl"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_missing_entry_or_sl"}
+
+    if not is_long and not is_short:
+        base["rr_rewrite_reason"] = f"invalid_direction:{direction_raw or 'EMPTY'}"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_invalid_direction"}
+
+    if target_r <= 0:
+        base["rr_rewrite_reason"] = f"invalid_target_r:{target_r}"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_invalid_target_r"}
+
+    if is_long:
+        risk = entry - sl
+        if risk <= 0:
+            base["rr_rewrite_reason"] = "invalid_long_risk"
+            plan.update(base)
+            return {**base, "ok": False, "reason": "rr_invalid_long_risk"}
+
+        def rr(tp):
+            return ((tp - entry) / risk) if tp is not None else None
+
+        target = entry + (risk * target_r)
+
+    else:
+        risk = sl - entry
+        if risk <= 0:
+            base["rr_rewrite_reason"] = "invalid_short_risk"
+            plan.update(base)
+            return {**base, "ok": False, "reason": "rr_invalid_short_risk"}
+
+        def rr(tp):
+            return ((entry - tp) / risk) if tp is not None else None
+
+        target = entry - (risk * target_r)
+
+    # Preserve raw targets once.
+    if plan.get("raw_tp1") is None:
+        plan["raw_tp1"] = old_tp1
+    if plan.get("raw_tp2") is None:
+        plan["raw_tp2"] = old_tp2
+    if plan.get("raw_tp3") is None:
+        plan["raw_tp3"] = old_tp3
+
+    old_rr1 = rr(old_tp1)
+    old_rr2 = rr(old_tp2)
+    old_rr3 = rr(old_tp3)
+
+    # Keep schema compatible. Execution qty will make it a single target.
+    plan["tp1"] = target
+    plan["tp2"] = target
+    plan["tp3"] = target
+
+    # Force single full target if quantities are already known.
+    q1 = to_float_or_none(plan.get("tp1_qty"))
+    q2 = to_float_or_none(plan.get("tp2_qty"))
+    q3 = to_float_or_none(plan.get("tp3_qty"))
+    q_total = None
+
+    known_qs = [x for x in [q1, q2, q3] if x is not None and x > 0]
+    if known_qs:
+        q_total = sum(known_qs)
+    else:
+        q_total = (
+            to_float_or_none(plan.get("quantity"))
+            or to_float_or_none(plan.get("qty"))
+            or to_float_or_none(plan.get("order_qty"))
+            or to_float_or_none(plan.get("position_qty"))
+        )
+
+    if q_total is not None and q_total > 0:
+        plan["tp1_qty"] = q_total
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+    else:
+        # Still block partials when downstream respects zero qty.
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+
+    plan["rr_target_rewrite_enabled"] = True
+    plan["rr_target_mode"] = mode
+    plan["rr_target_r"] = target_r
+    plan["rr_rewrite_applied"] = True
+    plan["rr_rewrite_reason"] = "single_full_target_1r_rewrite"
+    plan["rr_single_target_price"] = target
+    plan["rr_old_tp1_r"] = round(old_rr1, 6) if old_rr1 is not None else None
+    plan["rr_old_tp2_r"] = round(old_rr2, 6) if old_rr2 is not None else None
+    plan["rr_old_tp3_r"] = round(old_rr3, 6) if old_rr3 is not None else None
+    plan["rr_new_tp_r"] = target_r
+    plan["rr_tp1"] = target_r
+    plan["rr_tp2"] = target_r
+    plan["rr_tp3"] = target_r
+    plan["tp_single_full_exit"] = True
+    plan["tp_normalize_reason"] = "rr_single_target_rewrite"
+
+    out = {
+        **base,
+        "ok": True,
+        "rr_rewrite_applied": True,
+        "rr_rewrite_reason": "single_full_target_1r_rewrite",
+        "rr_old_tp1_r": plan["rr_old_tp1_r"],
+        "rr_old_tp2_r": plan["rr_old_tp2_r"],
+        "rr_old_tp3_r": plan["rr_old_tp3_r"],
+        "rr_new_tp_r": target_r,
+        "rr_single_target_price": target,
+    }
+    return out
+
 def normalize_tp_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     direction = str(payload.get("direction") or payload.get("dir") or "").strip().upper()
     if direction in ("BUY",):
@@ -5015,6 +5176,26 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
         p["plan_sanity_ok"] = bool(normalize_res.get("ok"))
         p["plan_sanity_reason"] = normalize_res.get("reason")
         p["plan_invalid"] = bool(normalize_res.get("plan_invalid"))
+
+        rr_rewrite_res = apply_rr_single_target_rewrite(p)
+        p["rr_rewrite_ok"] = bool(rr_rewrite_res.get("ok"))
+        p["rr_rewrite_reason"] = rr_rewrite_res.get("rr_rewrite_reason") or rr_rewrite_res.get("reason")
+        p["rr_target_mode"] = rr_rewrite_res.get("rr_target_mode") or p.get("rr_target_mode")
+        p["rr_target_r"] = rr_rewrite_res.get("rr_target_r") or p.get("rr_target_r")
+        p["rr_single_target_price"] = rr_rewrite_res.get("rr_single_target_price") or p.get("rr_single_target_price")
+
+        if bool(rr_rewrite_res.get("rr_rewrite_applied")):
+            normalize_res = normalize_tp_plan(p)
+            p["plan_sanity_ok"] = bool(normalize_res.get("ok"))
+            p["plan_sanity_reason"] = normalize_res.get("reason")
+            p["plan_invalid"] = bool(normalize_res.get("plan_invalid"))
+
+        if not bool(rr_rewrite_res.get("ok")):
+            normalize_res = {"ok": False, "reason": rr_rewrite_res.get("reason") or rr_rewrite_res.get("rr_rewrite_reason") or "rr_rewrite_failed", "plan_invalid": True}
+            p["plan_sanity_ok"] = False
+            p["plan_sanity_reason"] = normalize_res.get("reason")
+            p["plan_invalid"] = True
+
         if not bool(normalize_res.get("ok")):
             decision = {"decision": "REJECT", "reason": normalize_res.get("reason"), "gate": "plan_sanity_gate"}
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
