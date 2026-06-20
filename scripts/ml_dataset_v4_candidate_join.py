@@ -13,7 +13,16 @@ FEATURE_FILE = ROOT / "logs" / "freqai_feature_store_v1.jsonl"
 OUT_FILE = ROOT / "logs" / "ml_dataset_v4_candidate_join.jsonl"
 OUT_JSON = ROOT / "reports" / "ml_dataset_v4_candidate_join_report.json"
 
+OUT_CURRENT14_FILE = ROOT / "logs" / "ml_dataset_v4_current14_candidate_join.jsonl"
+OUT_CURRENT14_JSON = ROOT / "reports" / "ml_dataset_v4_current14_candidate_join_report.json"
+
 VERSION = "ml_dataset_v4_candidate_join_20260620"
+
+# === V4_CURRENT14_EXPORT_20260620 ===
+CURRENT14_ALLOWLIST = {
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT", "HYPEUSDT", "XRPUSDT", "ZECUSDT",
+    "UNIUSDT", "ADAUSDT", "BCHUSDT", "LINKUSDT", "SUIUSDT", "LTCUSDT", "AVAXUSDT",
+}
 
 SAFE_PREFIXES = (
     "ml_", "fs_", "score_", "htf_", "liq_", "sweep_", "fvg_",
@@ -304,6 +313,22 @@ def main():
 
     write_jsonl(OUT_FILE, rows)
 
+    current14_rows = [
+        r for r in rows
+        if str(r.get("symbol") or "").upper().strip() in CURRENT14_ALLOWLIST
+    ]
+    write_jsonl(OUT_CURRENT14_FILE, current14_rows)
+
+    current14_trainable = [r for r in current14_rows if r.get("trainable_label")]
+    current14_wins = sum(1 for r in current14_trainable if is_positive_label_win(r.get("label_win")))
+    current14_losses = len(current14_trainable) - current14_wins
+
+    out_of_universe_rows = [
+        r for r in rows
+        if str(r.get("symbol") or "").upper().strip() not in CURRENT14_ALLOWLIST
+    ]
+    out_of_universe_trainable = [r for r in out_of_universe_rows if r.get("trainable_label")]
+
     report = {
         "ok": True,
         "dataset_version": VERSION,
@@ -320,10 +345,38 @@ def main():
         "not_trainable_rows": label_counts["not_trainable"],
         "denied_label_like_keys_top": denied_counter.most_common(30),
         "out_file": str(OUT_FILE),
+        "out_current14_file": str(OUT_CURRENT14_FILE),
+        "current14": {
+            "rows": len(current14_rows),
+            "trainable_label_rows": len(current14_trainable),
+            "wins": current14_wins,
+            "losses": current14_losses,
+            "symbols": sorted({str(r.get("symbol") or "").upper().strip() for r in current14_rows}),
+        },
+        "out_of_universe": {
+            "rows": len(out_of_universe_rows),
+            "trainable_label_rows": len(out_of_universe_trainable),
+            "symbols": sorted({str(r.get("symbol") or "").upper().strip() for r in out_of_universe_rows}),
+        },
         "note": "REPORT_ONLY candidate join. Does not replace v3 dataset, live ML, or execution.",
     }
 
+    current14_report = {
+        "ok": True,
+        "dataset_version": VERSION + "_current14",
+        "source_dataset_version": VERSION,
+        "rows": len(current14_rows),
+        "trainable_label_rows": len(current14_trainable),
+        "wins": current14_wins,
+        "losses": current14_losses,
+        "feature_source_counts": dict(Counter(r.get("feature_source") for r in current14_rows)),
+        "symbols": sorted({str(r.get("symbol") or "").upper().strip() for r in current14_rows}),
+        "out_file": str(OUT_CURRENT14_FILE),
+        "note": "Current 14-pair candidate export only. REPORT_ONLY.",
+    }
+
     OUT_JSON.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    OUT_CURRENT14_JSON.write_text(json.dumps(current14_report, indent=2, ensure_ascii=False))
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
