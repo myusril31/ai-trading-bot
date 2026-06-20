@@ -813,6 +813,76 @@ def live_fetch_open_orders(symbol: str) -> dict:
 
 
 def live_try_set_margin_and_leverage(plan: Dict[str, Any]) -> dict:
+    # === ML_HARD_GATE_PRE_LIVE_20260620 ===
+    # Hard-block live execution BEFORE margin/leverage, entry_build, and live_place_order.
+    if env_bool("ML_PREDICTION_ENABLED", True) and env_bool("ML_GATE_ENABLED", False) and ml_gate_mode() == "HARD_GATE":
+        try:
+            score_res = score_ml_prediction_internal(signal_key_of(p), p)
+        except Exception as e:
+            score_res = {
+                "ok": False,
+                "ml_decision": "REJECT_BY_ML_GATE" if not env_bool("ML_GATE_FAIL_OPEN", False) else "ML_GATE_ERROR_FAIL_OPEN",
+                "reason": "ml_gate_exception_fail_closed" if not env_bool("ML_GATE_FAIL_OPEN", False) else "ml_gate_exception_fail_open",
+                "error": f"{type(e).__name__}: {e}",
+                "ml_gate_mode": ml_gate_mode(),
+                "model_version": os.getenv("ML_GATE_MODEL", "unknown"),
+            }
+
+        raw_ml_decision = str(score_res.get("ml_decision") or score_res.get("decision") or "").strip().upper()
+        ml_reason = score_res.get("reason") or score_res.get("decision") or "ml_hard_gate"
+        ml_prob = (
+            score_res.get("probability_win")
+            if score_res.get("probability_win") is not None
+            else score_res.get("p_win")
+            if score_res.get("p_win") is not None
+            else score_res.get("p_win_adj")
+        )
+
+        ml_fields = {
+            "ml_gate_mode": score_res.get("ml_gate_mode") or ml_gate_mode(),
+            "ml_gate_decision": score_res.get("ml_decision") or score_res.get("decision"),
+            "ml_gate_reason": ml_reason,
+            "ml_probability_win": ml_prob,
+            "ml_prob": ml_prob,
+            "ml_score": score_res.get("ml_score"),
+            "ml_confidence": score_res.get("confidence") or score_res.get("ml_confidence"),
+            "ml_model_version": score_res.get("model_version"),
+        }
+
+        for k, v in ml_fields.items():
+            p[k] = v
+            plan[k] = v
+            base_event[k] = v
+
+        hard_reject_decisions = {
+            "REJECT_BY_ML_GATE",
+            "ML_BLOCK_LOW_PWIN",
+            "ML_BLOCK_LOW_CONFIDENCE",
+            "ML_MODEL_ERROR_FAIL_CLOSED",
+            "ML_GATE_ERROR_FAIL_CLOSED",
+        }
+
+        if raw_ml_decision in hard_reject_decisions:
+            event = dict(base_event)
+            event.update({
+                "action": "LIVE_SMALL_CAPITAL_ML_GATE",
+                "decision": "REJECT",
+                "reason": ml_reason,
+                "gate": "ml_gate",
+                "plan": plan,
+                "ml_score_result": score_res,
+            })
+            append_jsonl(EXECUTION_EVENTS_LOG, event)
+            return {
+                "ok": False,
+                "decision": "REJECT",
+                "reason": ml_reason,
+                "gate": "ml_gate",
+                "plan": plan,
+                "ml_score_result": score_res,
+                **ml_fields,
+            }
+
     symbol = str(plan.get("symbol") or "").upper()
     lev = int(plan.get("leverage") or env_int("DEFAULT_LEVERAGE", 2))
     margin_type = str(os.getenv("MARGIN_TYPE") or plan.get("margin_type") or "ISOLATED").upper()
