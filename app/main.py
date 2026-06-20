@@ -1386,6 +1386,161 @@ def live_plan_entry_price(plan: Dict[str, Any]) -> str:
     return str(v or "")
 
 
+
+# === ORDERBOOK_EXISTING_SHADOW_BRIDGE_20260620 ===
+def live_read_latest_orderbook_shadow_guard(symbol: str) -> dict:
+    """
+    Read latest REPORT_ONLY orderbook shadow guard result for a symbol.
+    Source: logs/orderbook_shadow_guard_snapshots_v1.jsonl
+    This does not fetch Binance. It bridges existing orderbook chain into live execution.
+    """
+    import json
+    from datetime import datetime, timedelta
+
+    symbol = str(symbol or "").upper().replace("BINANCE:", "").replace(".P", "").strip()
+    path = LOG_DIR / "orderbook_shadow_guard_snapshots_v1.jsonl"
+
+    if not path.exists():
+        return {
+            "ok": False,
+            "reason": "orderbook_shadow_guard_log_missing",
+            "symbol": symbol,
+            "path": str(path),
+        }
+
+    latest = None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if str(row.get("symbol") or "").upper().strip() == symbol:
+                    latest = row
+
+        if not latest:
+            return {
+                "ok": False,
+                "reason": "orderbook_shadow_guard_symbol_missing",
+                "symbol": symbol,
+                "path": str(path),
+            }
+
+        created_at_wib = str(latest.get("created_at_wib") or "").replace(" WIB", "").strip()
+        age_min = None
+        if created_at_wib:
+            try:
+                ts = datetime.strptime(created_at_wib, "%Y-%m-%d %H:%M:%S")
+                now_wib = datetime.utcnow() + timedelta(hours=7)
+                age_min = (now_wib - ts).total_seconds() / 60.0
+            except Exception:
+                age_min = None
+
+        max_age_min = env_float("ORDERBOOK_BRIDGE_MAX_AGE_MIN", 30)
+        stale = bool(age_min is not None and age_min > max_age_min)
+
+        return {
+            "ok": not stale,
+            "reason": "orderbook_shadow_guard_stale" if stale else "orderbook_shadow_guard_ok",
+            "symbol": symbol,
+            "age_min": age_min,
+            "max_age_min": max_age_min,
+            "row": latest,
+            "path": str(path),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "orderbook_shadow_guard_read_exception",
+            "error": f"{type(e).__name__}: {e}",
+            "symbol": symbol,
+            "path": str(path),
+        }
+
+
+def live_orderbook_existing_bridge_guard(symbol: str, plan: Dict[str, Any]) -> dict:
+    """
+    Bridge existing orderbook shadow guard into live execution.
+    Default is SHADOW, so it logs would-block but does not block order.
+    LIVE_BLOCK can be enabled later after validation.
+    """
+    if not env_bool("ORDERBOOK_BRIDGE_ENABLED", True):
+        return {
+            "ok": True,
+            "enabled": False,
+            "mode": "DISABLED",
+            "decision": "ORDERBOOK_BRIDGE_DISABLED",
+            "reason": "orderbook_bridge_disabled",
+        }
+
+    mode = str(os.getenv("ORDERBOOK_BRIDGE_MODE", "SHADOW")).strip().upper()
+    res = live_read_latest_orderbook_shadow_guard(symbol)
+
+    row = res.get("row") or {}
+    guard_state = str(row.get("guard_state") or "UNKNOWN").upper()
+    severity = str(row.get("severity") or "UNKNOWN").upper()
+    shadow_action = str(row.get("shadow_action") or "UNKNOWN").upper()
+    would_block = bool(row.get("would_block_if_live")) or guard_state == "WOULD_BLOCK_IF_LIVE" or "BLOCK" in severity
+
+    if not bool(res.get("ok")):
+        decision = "ORDERBOOK_BRIDGE_REJECT" if mode == "LIVE_BLOCK" else "ORDERBOOK_BRIDGE_SHADOW_DATA_BAD"
+        return {
+            "ok": mode != "LIVE_BLOCK",
+            "enabled": True,
+            "mode": mode,
+            "decision": decision,
+            "reason": res.get("reason"),
+            "symbol": symbol,
+            "source_ok": False,
+            "source_age_min": res.get("age_min"),
+            "guard_state": guard_state,
+            "severity": severity,
+            "shadow_action": shadow_action,
+            "would_block_if_live": would_block,
+            "row": row,
+        }
+
+    if would_block and mode == "LIVE_BLOCK":
+        decision = "ORDERBOOK_REJECT"
+        ok = False
+    elif would_block:
+        decision = "ORDERBOOK_SHADOW_WOULD_BLOCK"
+        ok = True
+    else:
+        decision = "ORDERBOOK_ALLOW"
+        ok = True
+
+    return {
+        "ok": ok,
+        "enabled": True,
+        "mode": mode,
+        "decision": decision,
+        "reason": "|".join(row.get("hard_reasons") or row.get("soft_reasons") or []) or row.get("shadow_action") or "orderbook_bridge_ok",
+        "symbol": symbol,
+        "source_ok": True,
+        "source_age_min": res.get("age_min"),
+        "guard_state": guard_state,
+        "severity": severity,
+        "shadow_action": shadow_action,
+        "would_block_if_live": would_block,
+        "grade24": row.get("grade24"),
+        "grade7": row.get("grade7"),
+        "latest_pricing_status": row.get("latest_pricing_status"),
+        "ok_share24": row.get("ok_share24"),
+        "sample24": row.get("sample24"),
+        "spread_bps_p95": row.get("spread_bps_p95"),
+        "worst_slip_50_p95": row.get("worst_slip_50_p95"),
+        "min_depth10_p10": row.get("min_depth10_p10"),
+        "latest_spread_bps": row.get("latest_spread_bps"),
+        "latest_depth10_bid_usdt": row.get("latest_depth10_bid_usdt"),
+        "latest_depth10_ask_usdt": row.get("latest_depth10_ask_usdt"),
+        "hard_reasons": row.get("hard_reasons"),
+        "soft_reasons": row.get("soft_reasons"),
+        "created_at_wib": row.get("created_at_wib"),
+    }
+
+
 def live_build_entry_order_params(symbol: str, entry_side: str, qty: str, signal_key: str, plan: Dict[str, Any]) -> dict:
     """
     Entry order builder.
@@ -1539,6 +1694,54 @@ def handle_live_small_capital_execution(p: Dict[str, Any], safety: Dict[str, Any
     entry_side = str(plan.get("entry_side") or "").upper()
     exit_side = str(plan.get("exit_side") or "").upper()
     qty = str(plan.get("quantity") or "").strip()
+
+    orderbook_bridge = live_orderbook_existing_bridge_guard(symbol, plan)
+
+    orderbook_bridge_fields = {
+        "orderbook_bridge_enabled": orderbook_bridge.get("enabled"),
+        "orderbook_bridge_mode": orderbook_bridge.get("mode"),
+        "orderbook_bridge_decision": orderbook_bridge.get("decision"),
+        "orderbook_bridge_reason": orderbook_bridge.get("reason"),
+        "orderbook_guard_state": orderbook_bridge.get("guard_state"),
+        "orderbook_severity": orderbook_bridge.get("severity"),
+        "orderbook_shadow_action": orderbook_bridge.get("shadow_action"),
+        "orderbook_would_block_if_live": orderbook_bridge.get("would_block_if_live"),
+        "orderbook_grade24": orderbook_bridge.get("grade24"),
+        "orderbook_grade7": orderbook_bridge.get("grade7"),
+        "orderbook_ok_share24": orderbook_bridge.get("ok_share24"),
+        "orderbook_sample24": orderbook_bridge.get("sample24"),
+        "orderbook_spread_bps_p95": orderbook_bridge.get("spread_bps_p95"),
+        "orderbook_worst_slip_50_p95": orderbook_bridge.get("worst_slip_50_p95"),
+        "orderbook_min_depth10_p10": orderbook_bridge.get("min_depth10_p10"),
+        "orderbook_latest_spread_bps": orderbook_bridge.get("latest_spread_bps"),
+        "orderbook_latest_depth10_bid_usdt": orderbook_bridge.get("latest_depth10_bid_usdt"),
+        "orderbook_latest_depth10_ask_usdt": orderbook_bridge.get("latest_depth10_ask_usdt"),
+        "orderbook_source_age_min": orderbook_bridge.get("source_age_min"),
+        "orderbook_source_created_at_wib": orderbook_bridge.get("created_at_wib"),
+    }
+
+    plan.update(orderbook_bridge_fields)
+    base_event.update(orderbook_bridge_fields)
+
+    if not bool(orderbook_bridge.get("ok")):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_ORDERBOOK_BRIDGE",
+            "decision": "REJECT",
+            "reason": orderbook_bridge.get("reason") or "orderbook_bridge_reject",
+            "gate": "orderbook_bridge_gate",
+            "plan": plan,
+            "orderbook_bridge": orderbook_bridge,
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {
+            "ok": False,
+            "decision": "REJECT",
+            "reason": orderbook_bridge.get("reason") or "orderbook_bridge_reject",
+            "gate": "orderbook_bridge_gate",
+            "plan": plan,
+            "orderbook_bridge": orderbook_bridge,
+        }
 
     setup_res = live_try_set_margin_and_leverage(plan)
 
