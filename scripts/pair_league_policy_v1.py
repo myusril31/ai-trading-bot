@@ -169,6 +169,98 @@ def build_policy(row):
         "reasons": reasons,
     }
 
+
+# === PAIR_LEAGUE_ORDERBOOK_OVERLAY_20260620 ===
+def load_orderbook_shadow_guard_latest_by_symbol():
+    """
+    Load latest orderbook shadow/live-block recommendation by symbol.
+    Source priority:
+    1. reports/orderbook_shadow_guard_v1.json
+    2. logs/orderbook_shadow_guard_snapshots_v1.jsonl
+    """
+    import json
+
+    out = {}
+
+    report_path = ROOT / "reports" / "orderbook_shadow_guard_v1.json"
+    if report_path.exists():
+        try:
+            data = json.loads(report_path.read_text(errors="ignore"))
+            rows = data.get("rows") or data.get("results") or data.get("items") or []
+            if isinstance(rows, list):
+                for r in rows:
+                    sym = str(r.get("symbol") or "").upper().strip()
+                    if sym:
+                        out[sym] = r
+        except Exception:
+            pass
+
+    snap_path = ROOT / "logs" / "orderbook_shadow_guard_snapshots_v1.jsonl"
+    if snap_path.exists():
+        try:
+            with snap_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    sym = str(r.get("symbol") or "").upper().strip()
+                    if sym:
+                        out[sym] = r
+        except Exception:
+            pass
+
+    return out
+
+
+def apply_orderbook_overlay_to_pair_policy(policies):
+    """
+    Conservative overlay:
+    If orderbook says WOULD_BLOCK_IF_LIVE, pair remains scanned but live-priority is capped.
+    This does not remove pair from allowlist.
+    """
+    ob = load_orderbook_shadow_guard_latest_by_symbol()
+
+    for r in policies:
+        sym = str(r.get("symbol") or "").upper().strip()
+        g = ob.get(sym) or {}
+
+        guard_state = str(g.get("guard_state") or "").upper()
+        severity = str(g.get("severity") or "").upper()
+        would_block = bool(g.get("would_block_if_live")) or guard_state == "WOULD_BLOCK_IF_LIVE" or "BLOCK" in severity
+
+        r["orderbook_guard_state"] = guard_state or None
+        r["orderbook_severity"] = severity or None
+        r["orderbook_would_block_if_live"] = would_block
+        r["orderbook_latest_spread_bps"] = g.get("latest_spread_bps")
+        r["orderbook_spread_bps_p95"] = g.get("spread_bps_p95")
+        r["orderbook_worst_slip_50_p95"] = g.get("worst_slip_50_p95")
+        r["orderbook_min_depth10_p10"] = g.get("min_depth10_p10")
+
+        if would_block:
+            old_action = r.get("policy_action")
+            old_weight = r.get("policy_weight")
+            old_status = r.get("league_status")
+
+            try:
+                old_weight_f = float(old_weight)
+            except Exception:
+                old_weight_f = 1.0
+
+            r["pre_orderbook_policy_action"] = old_action
+            r["pre_orderbook_policy_weight"] = old_weight
+            r["pre_orderbook_league_status"] = old_status
+
+            r["league_status"] = "LIQUIDITY_BLOCK"
+            r["policy_weight"] = round(min(old_weight_f, 0.20), 4)
+            r["policy_action"] = "ORDERBOOK_BLOCK_SCAN_ONLY"
+            r["orderbook_overlay_applied"] = True
+        else:
+            r["orderbook_overlay_applied"] = False
+
+    return policies
+
+
 def main():
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +271,7 @@ def main():
     rows = league.get("rows") or []
 
     policies = [build_policy(r) for r in rows]
+    policies = apply_orderbook_overlay_to_pair_policy(policies)
     policies.sort(key=lambda r: (-r["policy_weight"], -float(r.get("league_score") or 0), r["symbol"]))
 
     now = datetime.now(UTC).astimezone(WIB)
@@ -197,7 +290,7 @@ def main():
     OUT_JSON.write_text(json.dumps(report, ensure_ascii=False, indent=2))
 
     cols = [
-        "symbol","mode","league_status","league_score","policy_weight","policy_action",
+        "symbol","mode","league_status","league_score","policy_weight","policy_action","orderbook_overlay_applied","orderbook_guard_state","orderbook_severity","orderbook_would_block_if_live","pre_orderbook_policy_action","pre_orderbook_policy_weight",
         "signal_count","joined_feature_rows","outcome_count","win_rate","expectancy_R",
         "avg_score_v2_recalc","ml_rows","avg_ml_p_win","ml_pass_count","fs_feature_sanity_ok",
     ]
