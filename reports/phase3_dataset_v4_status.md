@@ -73,3 +73,14 @@ V4_CANDIDATE_READY_WITH_WARNINGS
 3. Increase minimum feature count per row.
 4. Keep accumulating live/recent labels.
 5. Run challenger only in shadow/report mode.
+
+## Git Commits
+
+- 00bcb5d phase3: document dataset v4 maturity status
+- d27cade phase3: add dataset v4 maturity reports
+- 56a1b1d phase3: snapshot dataset v4 current14
+
+## Phase 3 Build Dataset v4
+
+Status: DONE for report-only and challenger shadow.
+Next: outcome_labeler_v1.
