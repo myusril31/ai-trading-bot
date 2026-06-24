@@ -125,3 +125,35 @@ Status: ML_LABEL_READY_REPORT_ONLY_INFERRED
 - Use: report-only and challenger shadow research
 - Promotion ready: false
 - Reason: inferred cleanup labels only, below promotion threshold, no walk-forward validation yet
+
+## Outcome-Joined Dataset v1
+
+Status: GOOD_FOR_REPORT_ONLY_AND_CHALLENGER_SHADOW
+
+- File: logs/ml_dataset_v4_outcome_join_v1.jsonl
+- Rows: 149
+- Wins: 65
+- Losses: 84
+- Symbol count: 13
+- Feature source:
+  - v4_current14: 106
+  - v3_feature_join: 43
+- Unmatched outcome labels: 32
+- Promotion ready: false
+
+Allowed:
+- Challenger shadow research
+- Report-only training experiments
+- Pair-level outcome analysis
+- Feature/outcome sanity checks
+
+Not allowed:
+- Live model promotion
+- Auto-promotion
+- Lowering ML gate based on this file alone
+
+Remaining blockers:
+- Below 500 matched trainable labels
+- Labels inferred from cleanup lifecycle, not Binance order-history confirmed
+- Walk-forward validation not run
+- BTCUSDT has no outcome-joined label yet
