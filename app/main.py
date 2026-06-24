@@ -893,7 +893,15 @@ def live_try_set_margin_and_leverage(plan: Dict[str, Any]) -> dict:
 
     symbol = str(plan.get("symbol") or "").upper()
     lev = int(plan.get("leverage") or env_int("DEFAULT_LEVERAGE", 2))
-    margin_type = str(os.getenv("MARGIN_TYPE") or plan.get("margin_type") or "ISOLATED").upper()
+    # === NORMALIZE_MARGIN_TYPE_20260624 ===
+    raw_margin_type = os.getenv("MARGIN_TYPE") or plan.get("margin_type") or "CROSSED"
+    margin_type = str(raw_margin_type).strip().upper()
+    if margin_type in ("CROSS", "CROSSED"):
+        margin_type = "CROSSED"
+    elif margin_type == "ISOLATED":
+        margin_type = "ISOLATED"
+    else:
+        margin_type = "CROSSED"
 
     margin_res = live_signed_request("POST", "/fapi/v1/marginType", {
         "symbol": symbol,
@@ -3489,7 +3497,15 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
         "tp_normalized": p.get("tp_normalized"),
         "tp_normalize_reason": p.get("tp_normalize_reason"),
         "leverage": env_int("DEFAULT_LEVERAGE", 2),
-        "margin_type": "ISOLATED",
+        # === PLAN_MARGIN_TYPE_FROM_ENV_20260624 ===
+        # === PLAN_MARGIN_TYPE_FROM_ENV_SAFE_20260624 ===
+        "margin_type": (
+            "CROSSED"
+            if str(os.getenv("MARGIN_TYPE") or "CROSSED").strip().upper() in ("CROSS", "CROSSED")
+            else "ISOLATED"
+            if str(os.getenv("MARGIN_TYPE") or "CROSSED").strip().upper() == "ISOLATED"
+            else "CROSSED"
+        ),
         "quantity": None,
         "notional_usdt_cap": env_int("TESTNET_MAX_NOTIONAL_USDT", 50),
         "risk_usdt": env_int("TESTNET_RISK_USDT_PER_TRADE", 5),
