@@ -61,7 +61,12 @@ MARKET_LAST_ERROR = ""
 MARKET_LAST_CLOSED: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(title="AI Trading VPS Bot", version=APP_VERSION)
-
+try:
+    from app.dashboard import router as dashboard_router
+    app.include_router(dashboard_router)
+    print("[dashboard] enabled")
+except Exception as e:
+    print(f"[dashboard] load failed: {e}")
 
 class SignalPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -813,6 +818,9 @@ def live_fetch_open_orders(symbol: str) -> dict:
 
 
 def live_try_set_margin_and_leverage(plan: Dict[str, Any]) -> dict:
+    if not isinstance(plan, dict):
+        plan = {}
+    p = plan
     # === ML_HARD_GATE_PRE_LIVE_20260620 ===
     # Hard-block live execution BEFORE margin/leverage, entry_build, and live_place_order.
     if env_bool("ML_PREDICTION_ENABLED", True) and env_bool("ML_GATE_ENABLED", False) and ml_gate_mode() == "HARD_GATE":
@@ -10648,4 +10656,56 @@ except Exception as _v2_e:
         print("[ml_gate_sklearn_v2] patch failed", str(_v2_e))
     except Exception:
         pass
+
+
+# === FIX_BASE_EVENT_ALIAS_20260623 ===
+# Some patched live/bridge code calls base_event(), while older helper is named v010_base_event().
+# Keep this alias global so runtime bridge logging does not crash before order decision.
+try:
+    base_event
+except NameError:
+    try:
+        base_event = v010_base_event
+    except NameError:
+        def base_event(symbol: str = "", action: str = "", reason: str = "") -> dict:
+            from datetime import datetime, timezone
+            return {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol or ""),
+                "event_type": str(action or "BASE_EVENT"),
+                "reason": str(reason or ""),
+            }
+
+
+# === FIX_BASE_EVENT_COMPAT_DICT_CALLABLE_20260623 ===
+# Compatibility shim:
+# - some code calls base_event(symbol, action, reason)
+# - some code mutates base_event["key"] = value
+# This object supports both so bridge logging cannot kill execution.
+class _BaseEventCompat(dict):
+    def __call__(self, symbol: str = "", action: str = "", reason: str = "") -> dict:
+        try:
+            return v010_base_event(symbol, action, reason)
+        except Exception:
+            from datetime import datetime, timezone
+            return {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol or ""),
+                "event_type": str(action or "BASE_EVENT"),
+                "reason": str(reason or ""),
+            }
+
+    def __setitem__(self, key, value):
+        try:
+            if "created_at_utc" not in self:
+                from datetime import datetime, timezone
+                dict.__setitem__(self, "created_at_utc", datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+        dict.__setitem__(self, key, value)
+
+try:
+    base_event = _BaseEventCompat()
+except Exception:
+    pass
 
