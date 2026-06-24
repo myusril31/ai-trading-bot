@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "warnings": [
+    "below_500_trainable_labels_for_model_promotion",
+    "below_150_losses_for_reliable_hard_gate_training",
+    "missing_required_features_present"
+  ],
+  "checks": {
+    "has_rows": true,
+    "no_duplicate_signal_keys": true,
+    "missing_required_counts": {
+      "score": 14
+    },
+    "trainable_label_rows": 0,
+    "losses": 0
+  }
+}

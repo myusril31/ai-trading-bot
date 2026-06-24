@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "dataset_version": "ml_dataset_v4_candidate_join_20260620_current14",
+  "source_dataset_version": "ml_dataset_v4_candidate_join_20260620",
+  "rows": 509,
+  "trainable_label_rows": 281,
+  "wins": 190,
+  "losses": 91,
+  "feature_source_counts": {
+    "SIGNAL_ROW_FALLBACK": 509
+  },
+  "symbols": [
+    "ADAUSDT",
+    "AVAXUSDT",
+    "BCHUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "HYPEUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "PAXGUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "UNIUSDT",
+    "XRPUSDT",
+    "ZECUSDT"
+  ],
+  "out_file": "/home/ubuntu/ai-trading-vps-bot/logs/ml_dataset_v4_current14_candidate_join.jsonl",
+  "note": "Current 14-pair candidate export only. REPORT_ONLY."
+}

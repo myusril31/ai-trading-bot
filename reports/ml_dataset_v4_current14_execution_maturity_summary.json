@@ -1,0 +1,51 @@
+{
+  "dataset_version": "v4_current14",
+  "created_at_utc": "2026-06-24T18:04:07.311099+00:00",
+  "output": "logs/ml_dataset_v4_current14_execution_maturity_join.jsonl",
+  "current14": [
+    "ADAUSDT",
+    "AVAXUSDT",
+    "BCHUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "HYPEUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "PAXGUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "UNIUSDT",
+    "XRPUSDT",
+    "ZECUSDT"
+  ],
+  "rows": 681,
+  "trainable_label_rows": 0,
+  "wins": 0,
+  "losses": 0,
+  "live_order_placed_rows": 184,
+  "position_confirmed_rows": 195,
+  "protection_ok_rows": 184,
+  "decision_counts": {
+    "REJECT": 282,
+    "NONE": 202,
+    "ACCEPT": 195,
+    "REFRESH_RECOMPUTE_DONE": 2
+  },
+  "reason_counts": {
+    "NONE": 202,
+    "LIVE_ORDER_PLACED": 179,
+    "REJECT": 109,
+    "LIVE_ENTRY_FAILED": 93,
+    "LIVE_LIMIT_IOC_NOT_FILLED_OR_POSITION_NOT_CONFIRMED": 40,
+    "LIVE_ENTRY_PLACED_PROTECTION_PARTIAL_OR_FAILED": 26,
+    "live_preflight_failed": 16,
+    "all_paper_gates_pass": 13,
+    "LIVE_RR_TOO_LOW_REFRESH_RECOMPUTE": 2,
+    "duplicate_signal_key": 1
+  },
+  "missing_required_counts": {
+    "score": 14
+  },
+  "duplicate_signal_keys": 0,
+  "note": "Dataset v4 candidate join. Closed trade labels require outcome_labeler for true model training maturity."
+}
