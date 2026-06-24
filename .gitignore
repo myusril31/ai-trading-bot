@@ -65,3 +65,7 @@ FETCH_HEAD
 *.bak-*
 app/main.py.bak*
 app/vps_smc.py.bak*
+
+# local VPS patch/dashboard scratch
+ai_trading_quant_patch_v1.sh
+app/dashboard.py
