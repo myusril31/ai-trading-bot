@@ -116,3 +116,12 @@ Not allowed:
 - Live model promotion from inferred labels only.
 - Auto-promotion.
 - Lowering ML threshold based on inferred labels only.
+
+## Label Readiness v1 Outcome-Aware
+
+Status: ML_LABEL_READY_REPORT_ONLY_INFERRED
+
+- Primary source: outcome_labels_v1 matched_trade rows
+- Use: report-only and challenger shadow research
+- Promotion ready: false
+- Reason: inferred cleanup labels only, below promotion threshold, no walk-forward validation yet
