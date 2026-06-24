@@ -84,3 +84,35 @@ V4_CANDIDATE_READY_WITH_WARNINGS
 
 Status: DONE for report-only and challenger shadow.
 Next: outcome_labeler_v1.
+
+## Outcome Labeler v1
+
+Status: GOOD_FOR_LOCAL_INFERRED_LABELS
+
+- File: logs/outcome_labels_v1.jsonl
+- Rows: 206
+- Trainable labels: 201
+- Wins: 87
+- Losses: 114
+- Ambiguous: 5
+- Matched trade metadata rows: 186
+- Unmatched rows: 20
+- Label source: tp_lifecycle_cleanup_inference_v1
+
+## Outcome Label Usage Policy
+
+Allowed for:
+- Report-only label maturity audit
+- Matched-trade feature analysis
+- Challenger shadow research
+- Pair-level win/loss distribution
+
+Training priority:
+1. Use matched_trade=true and trainable_label=true first.
+2. Exclude CLOSED_AMBIGUOUS.
+3. Treat unmatched rows as report-only until Binance/order-history confirmation exists.
+
+Not allowed:
+- Live model promotion from inferred labels only.
+- Auto-promotion.
+- Lowering ML threshold based on inferred labels only.
