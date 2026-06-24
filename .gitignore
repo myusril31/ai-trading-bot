@@ -60,3 +60,8 @@ FETCH_HEAD
 *.backup_*
 *.backup.*
 *.bak.*
+
+# VPS hotfix backups
+*.bak-*
+app/main.py.bak*
+app/vps_smc.py.bak*
