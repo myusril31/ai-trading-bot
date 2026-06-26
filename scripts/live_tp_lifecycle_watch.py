@@ -421,6 +421,13 @@ def cleanup_closed_symbols(state):
         st["closed_at_utc"] = m.utc_now_iso()
         st["cleanup_count"] = len(cancel_res)
         state["symbols"][symbol] = st
+
+        # === SKIP_EMPTY_TP_CLEANUP_LOG_20260627 ===
+        # Skip useless cleanup rows when there is no open algo and no cancel result.
+        # This prevents NO_PREFIX spam from polluting tp_lifecycle_events.jsonl.
+        if len(algo) <= 0 and not cancel_res:
+            continue
+
         ev = {
             "event_at_utc": m.utc_now_iso(),
             "action": "TP_LIFECYCLE_POSITION_CLOSED_CLEANUP",

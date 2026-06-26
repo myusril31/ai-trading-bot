@@ -2940,8 +2940,24 @@ def _vps_smc_route_core_quant_v1(result: Dict[str, Any], core_row: Optional[Dict
     ok_accepted = bool(isinstance(bridge_res, dict) and bridge_res.get("ok") is True and not rejectish)
     lock_on_reject = _env_bool("CORE_QUANT_DEDUP_LOCK_ON_REJECT", False)
 
+    # === CORE_QUANT_LOCK_MARGIN_INSUFFICIENT_20260627 ===
+    # Keep normal no-trade/RR reject retry behavior, but do not spam Binance
+    # when entry failed because account margin is insufficient.
+    try:
+        _bridge_txt = json.dumps(bridge_result, ensure_ascii=False)
+    except Exception:
+        _bridge_txt = str(bridge_result)
+    margin_insufficient_reject = bool(
+        rejectish
+        and (
+            "-2019" in _bridge_txt
+            or "Margin is insufficient" in _bridge_txt
+            or "margin is insufficient" in _bridge_txt.lower()
+        )
+    )
+
 # === CORE_QUANT_DEDUP_ORDERISH_ONLY_20260623 ===
-    should_lock_dedup = bool(orderish or (lock_on_reject and rejectish))
+    should_lock_dedup = bool(orderish or margin_insufficient_reject or (lock_on_reject and rejectish))
 
     if should_lock_dedup:
         logged_signal_keys[signal_key] = signal_row["created_at_utc"]
