@@ -1,35 +1,71 @@
-# secrets / env
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual env
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets / env
 .env
 .env.*
-*.env
+*.pem
+*.key
+*.crt
+*.p12
+*.json.key
+service-account*.json
+google-credentials*.json
+credentials*.json
+secrets*.json
+*secret*
+*token*
 
-# runtime data
+# Runtime logs/state/data
 logs/
 state/
-backups/
-
-# python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# local backups
-*.bak
-*.bak_*
-*.save
-app/*.bak
-app/*.save
-app/main.py.bak*
-
-# explicit safety
-state/private/
-state/ml_models/*.pkl
-**/google_service_account.json
-*.service-account.json
-
-# local runtime / deploy backups
+reports/
+artifacts/
 data/
-logs/
-state/private/
-docker-compose.yml.bak.*
+*.log
+*.jsonl
+*.pid
+*.sock
+
+# Local backups / generated
+backups/
+backup/
+*.bak
+*.tmp
 FETCH_HEAD
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Gitignore/local source backup files
+.gitignore.bak.*
+*.backup*
+*.backup_*
+*.backup.*
+*.bak.*
+
+# VPS hotfix backups
+*.bak-*
+app/main.py.bak*
+app/vps_smc.py.bak*
+
+# local VPS patch/dashboard scratch
+ai_trading_quant_patch_v1.sh
+app/dashboard.py

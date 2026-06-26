@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AI Trading 2026 Forward Outcomes Builder V1 every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=30
+Persistent=true
+Unit=vps-forward-outcomes-builder-v1.service
+
+[Install]
+WantedBy=timers.target

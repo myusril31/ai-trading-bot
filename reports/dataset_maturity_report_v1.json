@@ -1,0 +1,224 @@
+{
+  "ok": true,
+  "version": "dataset_maturity_report_v1_20260617",
+  "mode": "REPORT_ONLY",
+  "created_at_wib": "2026-06-25 00:51:59 WIB",
+  "overall_state": "DATASET_USABLE_REPORT_ONLY",
+  "component_count": 10,
+  "state_counts": {
+    "MATURE_ENOUGH_REPORT_ONLY": 10
+  },
+  "note": "REPORT_ONLY. Does not train models, modify live gates, or change trading behavior.",
+  "rows": [
+    {
+      "component": "score_v2_recalc_shadow",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/score_v2_recalc_shadow_v1.jsonl",
+      "kind": "jsonl",
+      "exists": true,
+      "size_bytes": 885204,
+      "row_count": 1060,
+      "symbol_count": 16,
+      "last_seen_wib": "2026-06-25 00:42:57 WIB",
+      "age_hours": 0.1509,
+      "min_rows": 100,
+      "min_symbols": 10,
+      "max_age_hours": 6,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "ml_dataset_feature_join",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/ml_dataset_v3_feature_join.jsonl",
+      "kind": "jsonl",
+      "exists": true,
+      "size_bytes": 1549415,
+      "row_count": 764,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:48:32 WIB",
+      "age_hours": 0.058,
+      "min_rows": 100,
+      "min_symbols": 10,
+      "max_age_hours": 6,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "forward_outcomes",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/forward_outcomes_v1.jsonl",
+      "kind": "jsonl",
+      "exists": true,
+      "size_bytes": 464340,
+      "row_count": 500,
+      "symbol_count": 16,
+      "last_seen_wib": "2026-06-25 00:45:01 WIB",
+      "age_hours": 0.1166,
+      "min_rows": 50,
+      "min_symbols": 8,
+      "max_age_hours": 48,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "pair_league_policy_snapshots",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/pair_league_policy_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 999001,
+      "row_count": 2758,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:34:35 WIB",
+      "age_hours": 0.2907,
+      "min_rows": 28,
+      "min_symbols": 10,
+      "max_age_hours": 6,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "pair_policy_calibration_snapshots",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/pair_policy_calibration_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 990529,
+      "row_count": 2758,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:34:38 WIB",
+      "age_hours": 0.2902,
+      "min_rows": 14,
+      "min_symbols": 10,
+      "max_age_hours": 6,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "orderbook_pricing_snapshots",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/orderbook_pricing_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 2810906,
+      "row_count": 10878,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:48:39 WIB",
+      "age_hours": 0.0574,
+      "min_rows": 56,
+      "min_symbols": 10,
+      "max_age_hours": 2,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "orderbook_stability_snapshots",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/orderbook_stability_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 9055663,
+      "row_count": 21588,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:48:57 WIB",
+      "age_hours": 0.054,
+      "min_rows": 28,
+      "min_symbols": 10,
+      "max_age_hours": 2,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "orderbook_shadow_guard_snapshots",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/orderbook_shadow_guard_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 2848004,
+      "row_count": 10794,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:48:58 WIB",
+      "age_hours": 0.0548,
+      "min_rows": 14,
+      "min_symbols": 10,
+      "max_age_hours": 2,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "orderbook_shadow_guard_validation",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/logs/orderbook_shadow_guard_validation_snapshots_v1.csv",
+      "kind": "csv",
+      "exists": true,
+      "size_bytes": 3194570,
+      "row_count": 10766,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:49:01 WIB",
+      "age_hours": 0.055,
+      "min_rows": 14,
+      "min_symbols": 10,
+      "max_age_hours": 2,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    },
+    {
+      "component": "latest_freqai_features",
+      "mode": "REPORT_ONLY",
+      "path": "/home/ubuntu/ai-trading-vps-bot/state/features/latest_freqai_features_v1.json",
+      "kind": "json",
+      "exists": true,
+      "size_bytes": 23383,
+      "row_count": 14,
+      "symbol_count": 14,
+      "last_seen_wib": "2026-06-25 00:48:42 WIB",
+      "age_hours": 0.0603,
+      "min_rows": 1,
+      "min_symbols": 8,
+      "max_age_hours": 6,
+      "parse_error_count": 0,
+      "maturity_state": "MATURE_ENOUGH_REPORT_ONLY",
+      "recommendation": "REPORT_ONLY_OK",
+      "reasons": [
+        "meets_minimum_dataset_thresholds"
+      ]
+    }
+  ]
+}

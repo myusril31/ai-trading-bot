@@ -22,6 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 import app.vps_smc as vps_smc
+import app.quant_engine as quant_engine
 
 
 APP_VERSION = "v0.25-p0-vps-smc-primary-execution-bridge"
@@ -60,7 +61,12 @@ MARKET_LAST_ERROR = ""
 MARKET_LAST_CLOSED: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(title="AI Trading VPS Bot", version=APP_VERSION)
-
+try:
+    from app.dashboard import router as dashboard_router
+    app.include_router(dashboard_router)
+    print("[dashboard] enabled")
+except Exception as e:
+    print(f"[dashboard] load failed: {e}")
 
 class SignalPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -471,6 +477,1435 @@ def paper_slippage_buffer_rate() -> float:
 def paper_net_pnl_enabled() -> bool:
     return env_bool("PAPER_NET_PNL_ENABLED", True)
 
+
+# =========================
+# LIVE SMALL CAPITAL EXECUTOR
+# =========================
+
+def live_fapi_base_url() -> str:
+    return str(os.getenv("BINANCE_FAPI_BASE_URL") or "https://fapi.binance.com").rstrip("/")
+
+def live_api_credentials() -> dict:
+    api_key = (
+        os.getenv("BINANCE_LIVE_API_KEY")
+        or os.getenv("BINANCE_API_KEY")
+        or os.getenv("BINANCE_FUTURES_LIVE_API_KEY")
+        or ""
+    )
+    api_secret = (
+        os.getenv("BINANCE_LIVE_API_SECRET")
+        or os.getenv("BINANCE_API_SECRET")
+        or os.getenv("BINANCE_FUTURES_LIVE_API_SECRET")
+        or ""
+    )
+    return {
+        "ok": bool(api_key and api_secret),
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "reason": None if api_key and api_secret else "missing_live_api_credentials",
+    }
+
+def live_signed_request(method: str, path: str, params: dict | None = None) -> dict:
+    creds = live_api_credentials()
+    if not creds.get("ok"):
+        return {"ok": False, "reason": creds.get("reason"), "http_status": None, "body": None, "path": path}
+
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+    params.setdefault("recvWindow", 5000)
+
+    query = urllib.parse.urlencode(params, doseq=True)
+    sig = hmac.new(
+        str(creds["api_secret"]).encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    url = live_fapi_base_url() + path + "?" + query + "&signature=" + sig
+    req = urllib.request.Request(
+        url,
+        headers={"X-MBX-APIKEY": str(creds["api_key"])},
+        method=method.upper()
+    )
+
+    if method.upper() in ("POST", "PUT", "DELETE"):
+        req.data = b""
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                body = json.loads(raw)
+            except Exception:
+                body = raw
+            return {
+                "ok": 200 <= int(r.status) < 300,
+                "http_status": int(r.status),
+                "body": body,
+                "reason": None,
+                "path": path,
+                "method": method.upper(),
+            }
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = raw
+        return {
+            "ok": False,
+            "http_status": int(e.code),
+            "body": body,
+            "reason": "binance_http_error",
+            "path": path,
+            "method": method.upper(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "http_status": None,
+            "body": None,
+            "reason": f"live_request_exception:{type(e).__name__}:{e}",
+            "path": path,
+            "method": method.upper(),
+        }
+
+def _live_client_order_id(prefix: str, signal_key: str, label: str) -> str:
+    raw = f"{prefix}_{abs(hash(signal_key)) % 999999999}_{label}"
+    return "".join(ch for ch in raw if ch.isalnum() or ch in ("_", "-"))[:36]
+
+def live_place_order(params: dict) -> dict:
+    return live_signed_request("POST", "/fapi/v1/order", params)
+
+
+def live_place_algo_order(params: dict) -> dict:
+    """
+    Binance USD-M Futures conditional orders.
+    Auto-normalize per-symbol:
+    - /fapi/v1/algoOrder
+    - algoType=CONDITIONAL
+    - stopPrice -> triggerPrice
+    - price rounded by PRICE_FILTER.tickSize
+    - quantity rounded by LOT_SIZE.stepSize
+    """
+    import json as _json
+    import urllib.request as _urlreq
+    from decimal import Decimal, ROUND_DOWN, ROUND_UP
+
+    q = dict(params or {})
+
+    if "newClientOrderId" in q and "clientAlgoId" not in q:
+        q["clientAlgoId"] = q.pop("newClientOrderId")
+
+    if "stopPrice" in q and "triggerPrice" not in q:
+        q["triggerPrice"] = q.pop("stopPrice")
+
+    q.setdefault("algoType", "CONDITIONAL")
+    q.setdefault("positionSide", "BOTH")
+    q.setdefault("workingType", "CONTRACT_PRICE")
+    q.setdefault("priceProtect", "false")
+
+    if str(q.get("closePosition", "")).lower() == "true":
+        q.pop("quantity", None)
+        q.pop("reduceOnly", None)
+    else:
+        q.pop("closePosition", None)
+
+    def _fmt_decimal(x):
+        return format(Decimal(str(x)).normalize(), "f")
+
+    def _round_to_step(value, step, mode="down"):
+        v = Decimal(str(value))
+        st = Decimal(str(step))
+        if st == 0:
+            return _fmt_decimal(v)
+        rounding = ROUND_UP if mode == "up" else ROUND_DOWN
+        n = (v / st).to_integral_value(rounding=rounding)
+        return _fmt_decimal(n * st)
+
+    def _filters(symbol):
+        symbol = str(symbol or "").upper().strip()
+        cache = getattr(live_place_algo_order, "_filters_cache", {})
+        if symbol in cache:
+            return cache[symbol]
+
+        url = live_fapi_base_url() + "/fapi/v1/exchangeInfo"
+        with _urlreq.urlopen(url, timeout=15) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+
+        for item in data.get("symbols", []):
+            if item.get("symbol") == symbol:
+                fs = {f.get("filterType"): f for f in item.get("filters", [])}
+                out = {
+                    "tickSize": fs.get("PRICE_FILTER", {}).get("tickSize", "0.0001"),
+                    "stepSize": fs.get("LOT_SIZE", {}).get("stepSize", "0.1"),
+                    "minQty": fs.get("LOT_SIZE", {}).get("minQty", "0"),
+                    "minNotional": fs.get("MIN_NOTIONAL", {}).get("notional", "0"),
+                }
+                cache[symbol] = out
+                setattr(live_place_algo_order, "_filters_cache", cache)
+                return out
+
+        out = {"tickSize": "0.0001", "stepSize": "0.1", "minQty": "0", "minNotional": "0"}
+        cache[symbol] = out
+        setattr(live_place_algo_order, "_filters_cache", cache)
+        return out
+
+    symbol = str(q.get("symbol") or "").upper().strip()
+    if symbol:
+        f = _filters(symbol)
+        tick = f.get("tickSize", "0.0001")
+        step = f.get("stepSize", "0.1")
+
+        side = str(q.get("side") or "").upper()
+        typ = str(q.get("type") or "").upper()
+
+        # Final anti -2021 guard:
+        # STOP/TP trigger must be on the correct side of live current price
+        # right before POST /fapi/v1/algoOrder.
+        side_guard_enabled = str(os.getenv("PROTECTION_SIDE_GUARD_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+        if side_guard_enabled and "triggerPrice" in q and q.get("triggerPrice") not in (None, ""):
+            try:
+                ref = live_bad_fill_current_price(symbol)
+            except Exception:
+                ref = Decimal("0")
+
+            try:
+                trig = Decimal(str(q.get("triggerPrice")))
+            except Exception:
+                trig = Decimal("0")
+
+            if ref > 0 and trig > 0:
+                side_buf = Decimal(str(os.getenv("PROTECTION_SIDE_GUARD_BUFFER_PCT", os.getenv("RANGE_SIDE_GUARD_BUFFER_PCT", "0.05")))) / Decimal("100")
+                tp_buf = Decimal(str(os.getenv("PROTECTION_TP_MIN_PROFIT_PCT", os.getenv("RANGE_TP1_MIN_PROFIT_PCT", "0.20")))) / Decimal("100")
+                old_trig = trig
+                adjusted_reason = None
+
+                if typ == "STOP_MARKET":
+                    # LONG exit SL = SELL stop below current
+                    if side == "SELL" and trig >= ref:
+                        trig = ref * (Decimal("1") - side_buf)
+                        adjusted_reason = "LONG_SL_trigger_not_below_ref"
+                    # SHORT exit SL = BUY stop above current
+                    elif side == "BUY" and trig <= ref:
+                        trig = ref * (Decimal("1") + side_buf)
+                        adjusted_reason = "SHORT_SL_trigger_not_above_ref"
+
+                elif typ == "TAKE_PROFIT_MARKET":
+                    # LONG exit TP = SELL take-profit above current
+                    if side == "SELL" and trig <= ref:
+                        trig = ref * (Decimal("1") + tp_buf)
+                        adjusted_reason = "LONG_TP_trigger_not_above_ref"
+                    # SHORT exit TP = BUY take-profit below current
+                    elif side == "BUY" and trig >= ref:
+                        trig = ref * (Decimal("1") - tp_buf)
+                        adjusted_reason = "SHORT_TP_trigger_not_below_ref"
+
+                if adjusted_reason:
+                    q["side_guard_meta"] = {
+                        "adjusted": True,
+                        "reason": adjusted_reason,
+                        "ref_price": _fmt_decimal(ref),
+                        "old_triggerPrice": _fmt_decimal(old_trig),
+                        "new_triggerPrice": _fmt_decimal(trig),
+                        "type": typ,
+                        "side": side,
+                    }
+                    q["triggerPrice"] = _fmt_decimal(trig)
+
+        if "quantity" in q and q.get("quantity") not in (None, ""):
+            q["quantity"] = _round_to_step(q["quantity"], step, "down")
+
+        if "triggerPrice" in q and q.get("triggerPrice") not in (None, ""):
+            # Preserve trigger direction:
+            # SHORT exit = BUY: SL STOP round up, TP round down.
+            # LONG exit  = SELL: SL STOP round down, TP round up.
+            if typ == "STOP_MARKET":
+                mode = "up" if side == "BUY" else "down"
+            elif typ == "TAKE_PROFIT_MARKET":
+                mode = "down" if side == "BUY" else "up"
+            else:
+                mode = "down"
+
+            q["triggerPrice"] = _round_to_step(q["triggerPrice"], tick, mode)
+
+        q["filter_meta"] = f
+
+    # Jangan kirim metadata internal ke Binance.
+    request_meta = dict(q)
+    q.pop("filter_meta", None)
+    q.pop("side_guard_meta", None)
+
+    res = live_signed_request("POST", "/fapi/v1/algoOrder", q)
+    res["request_params"] = q
+    res["filter_meta"] = request_meta.get("filter_meta")
+    res["side_guard_meta"] = request_meta.get("side_guard_meta")
+    return res
+
+
+def live_futures_position_risk(symbol: str) -> dict:
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return {"ok": False, "reason": "symbol_required_for_position_risk", "body": [], "positions": [], "raw": None}
+
+    res = live_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    body = res.get("body")
+    positions = body if isinstance(body, list) else []
+    return {
+        "ok": bool(res.get("ok")),
+        "reason": None if bool(res.get("ok")) else (res.get("reason") or "live_position_risk_failed"),
+        "http_status": res.get("http_status"),
+        "body": body,
+        "positions": positions,
+        "raw": res,
+    }
+
+
+def live_fetch_open_orders(symbol: str) -> dict:
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return {
+            "ok": False,
+            "reason": "symbol_required_for_open_orders",
+            "orders": [],
+            "normal_orders": [],
+            "algo_orders": [],
+            "raw": None,
+        }
+
+    normal_res = live_signed_request("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+    algo_res = live_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+
+    normal_body = normal_res.get("body")
+    algo_body = algo_res.get("body")
+
+    normal_orders = normal_body if isinstance(normal_body, list) else []
+    algo_orders = algo_body if isinstance(algo_body, list) else []
+
+    combined = []
+
+    for row in normal_orders:
+        if isinstance(row, dict):
+            x = dict(row)
+            x["_source_endpoint"] = "openOrders"
+            combined.append(x)
+
+    for row in algo_orders:
+        if isinstance(row, dict):
+            x = dict(row)
+            x["_source_endpoint"] = "openAlgoOrders"
+            combined.append(x)
+
+    ok = bool(normal_res.get("ok")) and bool(algo_res.get("ok"))
+
+    return {
+        "ok": ok,
+        "reason": None if ok else (
+            normal_res.get("reason")
+            or algo_res.get("reason")
+            or "live_open_orders_or_algo_orders_failed"
+        ),
+        "orders": combined,
+        "normal_orders": normal_orders,
+        "algo_orders": algo_orders,
+        "normal_open_count": len(normal_orders),
+        "algo_open_count": len(algo_orders),
+        "raw": {
+            "openOrders": normal_res,
+            "openAlgoOrders": algo_res,
+        },
+    }
+
+
+def live_try_set_margin_and_leverage(plan: Dict[str, Any]) -> dict:
+    if not isinstance(plan, dict):
+        plan = {}
+    p = plan
+    # === ML_HARD_GATE_PRE_LIVE_20260620 ===
+    # Hard-block live execution BEFORE margin/leverage, entry_build, and live_place_order.
+    if env_bool("ML_PREDICTION_ENABLED", True) and env_bool("ML_GATE_ENABLED", False) and ml_gate_mode() == "HARD_GATE":
+        try:
+            score_res = score_ml_prediction_internal(signal_key_of(p), p)
+        except Exception as e:
+            score_res = {
+                "ok": False,
+                "ml_decision": "REJECT_BY_ML_GATE" if not env_bool("ML_GATE_FAIL_OPEN", False) else "ML_GATE_ERROR_FAIL_OPEN",
+                "reason": "ml_gate_exception_fail_closed" if not env_bool("ML_GATE_FAIL_OPEN", False) else "ml_gate_exception_fail_open",
+                "error": f"{type(e).__name__}: {e}",
+                "ml_gate_mode": ml_gate_mode(),
+                "model_version": os.getenv("ML_GATE_MODEL", "unknown"),
+            }
+
+        raw_ml_decision = str(score_res.get("ml_decision") or score_res.get("decision") or "").strip().upper()
+        ml_reason = score_res.get("reason") or score_res.get("decision") or "ml_hard_gate"
+        ml_prob = (
+            score_res.get("probability_win")
+            if score_res.get("probability_win") is not None
+            else score_res.get("p_win")
+            if score_res.get("p_win") is not None
+            else score_res.get("p_win_adj")
+        )
+
+        ml_fields = {
+            "ml_gate_mode": score_res.get("ml_gate_mode") or ml_gate_mode(),
+            "ml_gate_decision": score_res.get("ml_decision") or score_res.get("decision"),
+            "ml_gate_reason": ml_reason,
+            "ml_probability_win": ml_prob,
+            "ml_prob": ml_prob,
+            "ml_score": score_res.get("ml_score"),
+            "ml_confidence": score_res.get("confidence") or score_res.get("ml_confidence"),
+            "ml_model_version": score_res.get("model_version"),
+        }
+
+        for k, v in ml_fields.items():
+            p[k] = v
+            plan[k] = v
+            base_event[k] = v
+
+        hard_reject_decisions = {
+            "REJECT_BY_ML_GATE",
+            "ML_BLOCK_LOW_PWIN",
+            "ML_BLOCK_LOW_CONFIDENCE",
+            "ML_MODEL_ERROR_FAIL_CLOSED",
+            "ML_GATE_ERROR_FAIL_CLOSED",
+        }
+
+        if raw_ml_decision in hard_reject_decisions:
+            event = dict(base_event)
+            event.update({
+                "action": "LIVE_SMALL_CAPITAL_ML_GATE",
+                "decision": "REJECT",
+                "reason": ml_reason,
+                "gate": "ml_gate",
+                "plan": plan,
+                "ml_score_result": score_res,
+            })
+            append_jsonl(EXECUTION_EVENTS_LOG, event)
+            return {
+                "ok": False,
+                "decision": "REJECT",
+                "reason": ml_reason,
+                "gate": "ml_gate",
+                "plan": plan,
+                "ml_score_result": score_res,
+                **ml_fields,
+            }
+
+    symbol = str(plan.get("symbol") or "").upper()
+    lev = int(plan.get("leverage") or env_int("DEFAULT_LEVERAGE", 2))
+    # === NORMALIZE_MARGIN_TYPE_20260624 ===
+    raw_margin_type = os.getenv("MARGIN_TYPE") or plan.get("margin_type") or "CROSSED"
+    margin_type = str(raw_margin_type).strip().upper()
+    if margin_type in ("CROSS", "CROSSED"):
+        margin_type = "CROSSED"
+    elif margin_type == "ISOLATED":
+        margin_type = "ISOLATED"
+    else:
+        margin_type = "CROSSED"
+
+    margin_res = live_signed_request("POST", "/fapi/v1/marginType", {
+        "symbol": symbol,
+        "marginType": margin_type,
+    })
+
+    # Binance returns error if margin type already set. Treat that as non-fatal.
+    margin_ok = bool(margin_res.get("ok"))
+    body = margin_res.get("body")
+    body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+    if (not margin_ok) and ("No need to change margin type" in body_text or "-4046" in body_text):
+        margin_ok = True
+
+    lev_res = live_signed_request("POST", "/fapi/v1/leverage", {
+        "symbol": symbol,
+        "leverage": lev,
+    })
+
+    return {
+        "ok": margin_ok and bool(lev_res.get("ok")),
+        "margin": margin_res,
+        "leverage": lev_res,
+        "margin_ok": margin_ok,
+        "leverage_ok": bool(lev_res.get("ok")),
+    }
+
+
+def _live_plain_decimal(x: Decimal) -> str:
+    out = format(Decimal(str(x)).normalize(), "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out or "0"
+
+
+def live_get_position_snapshot(symbol: str) -> dict:
+    symbol = str(symbol or "").upper().strip()
+
+    fn = globals().get("live_futures_position_risk")
+    if callable(fn):
+        res = fn(symbol)
+    else:
+        res = live_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+
+    body = res.get("positions") or res.get("body")
+    if isinstance(body, dict):
+        body = body.get("positions") or body.get("body") or []
+
+    positions = body if isinstance(body, list) else []
+    pos = None
+    for row in positions:
+        if str(row.get("symbol") or "").upper() == symbol:
+            pos = row
+            break
+
+    return {
+        "ok": bool(res.get("ok")),
+        "reason": None if bool(res.get("ok")) else (res.get("reason") or "position_risk_failed"),
+        "raw": res,
+        "position": pos,
+    }
+
+
+def live_wait_position_after_entry(symbol: str, direction: str, signal_key: str = "") -> dict:
+    symbol = str(symbol or "").upper().strip()
+    d = str(direction or "").upper()
+    attempts = env_int("LIVE_WAIT_POSITION_ATTEMPTS", 14)
+    sleep_sec = env_float("LIVE_WAIT_POSITION_SLEEP_SEC", 0.5)
+
+    last = None
+
+    for i in range(max(1, attempts)):
+        snap = live_get_position_snapshot(symbol)
+        last = snap
+
+        pos = snap.get("position") or {}
+        try:
+            amt = Decimal(str(pos.get("positionAmt") or "0"))
+            entry_price = Decimal(str(pos.get("entryPrice") or "0"))
+        except Exception:
+            amt = Decimal("0")
+            entry_price = Decimal("0")
+
+        sign_ok = (d == "LONG" and amt > 0) or (d == "SHORT" and amt < 0)
+
+        if bool(snap.get("ok")) and sign_ok and abs(amt) > 0:
+            return {
+                "ok": True,
+                "reason": "position_confirmed_after_entry",
+                "attempt": i + 1,
+                "symbol": symbol,
+                "direction": direction,
+                "positionAmt": _live_plain_decimal(amt),
+                "positionQty": _live_plain_decimal(abs(amt)),
+                "entryPrice": _live_plain_decimal(entry_price),
+                "position": pos,
+                "raw": snap.get("raw"),
+            }
+
+        time.sleep(max(0.1, sleep_sec))
+
+    return {
+        "ok": False,
+        "reason": "position_not_confirmed_after_entry",
+        "symbol": symbol,
+        "direction": direction,
+        "attempts": attempts,
+        "last_snapshot": last,
+    }
+
+
+def live_apply_actual_position_to_plan(plan: Dict[str, Any], fill_res: dict) -> Dict[str, Any]:
+    out = dict(plan or {})
+    pos = (fill_res or {}).get("position") or {}
+
+    try:
+        amt = Decimal(str(pos.get("positionAmt") or fill_res.get("positionAmt") or "0"))
+    except Exception:
+        amt = Decimal("0")
+
+    qty = abs(amt)
+    if qty <= 0:
+        return out
+
+    policy = str(os.getenv("LIVE_TP_POLICY") or os.getenv("TP_POLICY") or "").strip().upper()
+    if policy in ("FULL_TP1", "TP1_FULL", "100_TP1", "ALL_TP1"):
+        q1 = qty
+        q2 = Decimal("0")
+        q3 = Decimal("0")
+        split_mode = "FULL_TP1_actual_position_qty"
+    else:
+        q1 = qty * Decimal("0.40")
+        q2 = qty * Decimal("0.35")
+        q3 = qty - q1 - q2
+        split_mode = "40_35_25_actual_position_qty"
+
+    out["quantity"] = _live_plain_decimal(qty)
+    out["tp1_qty"] = _live_plain_decimal(q1)
+    out["tp2_qty"] = _live_plain_decimal(q2)
+    out["tp3_qty"] = _live_plain_decimal(q3)
+    out["tp_split_mode"] = split_mode
+    out["protection_qty_source"] = "binance_positionRisk_after_entry"
+
+    try:
+        ep = Decimal(str(pos.get("entryPrice") or fill_res.get("entryPrice") or "0"))
+        if ep > 0:
+            out["actual_entry_price"] = _live_plain_decimal(ep)
+    except Exception:
+        pass
+
+    return out
+
+
+
+
+def live_bad_fill_decimal_str(x) -> str:
+    from decimal import Decimal
+    out = format(Decimal(str(x)).normalize(), "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out or "0"
+
+
+def live_bad_fill_current_price(symbol: str) -> Decimal:
+    import json as _json
+    import urllib.request as _urlreq
+    try:
+        url = live_fapi_base_url().rstrip("/") + "/fapi/v1/ticker/price?symbol=" + str(symbol).upper().strip()
+        with _urlreq.urlopen(url, timeout=5) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+        return Decimal(str(data.get("price") or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def live_apply_bad_fill_tight_sl(plan: Dict[str, Any], entry_fill_res: dict) -> Dict[str, Any]:
+    """
+    BAD_FILL_ACTION=TIGHT_SL:
+    if actual entry is too adverse vs plan entry, keep trade alive but tighten SL.
+
+    LONG adverse  = actual_entry > plan_entry
+    SHORT adverse = actual_entry < plan_entry
+    """
+    out = dict(plan or {})
+
+    guard_enabled = str(os.getenv("BAD_FILL_GUARD_ENABLED", "false")).strip().lower() in ("1", "true", "yes", "y", "on")
+    if not guard_enabled:
+        out["bad_fill_guard_enabled"] = False
+        return out
+
+    out["bad_fill_guard_enabled"] = True
+
+    action = str(os.getenv("BAD_FILL_ACTION", "")).strip().upper()
+    if action not in ("TIGHT_SL", "TIGHT_STOP", "TIGHT"):
+        return out
+
+    try:
+        direction = str(out.get("direction") or out.get("payload", {}).get("direction") or "").upper()
+        if direction.startswith("LONG"):
+            direction = "LONG"
+        elif direction.startswith("SHORT"):
+            direction = "SHORT"
+        else:
+            return out
+
+        plan_entry = Decimal(str(out.get("entry_mid") or out.get("entry") or out.get("payload", {}).get("entry_mid") or out.get("payload", {}).get("entry") or "0"))
+        actual_entry = Decimal(str(out.get("actual_entry_price") or entry_fill_res.get("entryPrice") or "0"))
+        if plan_entry <= 0 or actual_entry <= 0:
+            return out
+
+        if direction == "LONG":
+            signed = (actual_entry - plan_entry) / plan_entry * Decimal("100")
+        else:
+            signed = (plan_entry - actual_entry) / plan_entry * Decimal("100")
+
+        adverse = signed if signed > 0 else Decimal("0")
+        max_bad = Decimal(str(os.getenv("MAX_ADVERSE_SLIPPAGE_PCT", "0.60")))
+
+        out["actual_entry_price"] = live_bad_fill_decimal_str(actual_entry)
+        out["adverse_slippage_pct"] = live_bad_fill_decimal_str(adverse)
+        out["bad_fill_threshold_pct"] = live_bad_fill_decimal_str(max_bad)
+
+        if adverse <= max_bad:
+            out["bad_fill"] = False
+            return out
+
+        symbol = str(out.get("symbol") or "").upper().strip()
+        current = live_bad_fill_current_price(symbol)
+        ref = current if current > 0 else actual_entry
+
+        sl_buf = Decimal(str(os.getenv("BAD_FILL_TIGHT_SL_BUFFER_PCT", "0.20"))) / Decimal("100")
+        tp_buf = Decimal(str(os.getenv("BAD_FILL_TP1_MIN_PROFIT_PCT", "0.20"))) / Decimal("100")
+
+        old_sl = Decimal(str(out.get("sl") or "0"))
+        old_tp1 = Decimal(str(out.get("tp1") or "0"))
+
+        if direction == "LONG":
+            tight_sl = ref * (Decimal("1") - sl_buf)
+            min_tp1 = ref * (Decimal("1") + tp_buf)
+            new_tp1 = max(old_tp1, min_tp1) if old_tp1 > 0 else min_tp1
+        else:
+            tight_sl = ref * (Decimal("1") + sl_buf)
+            min_tp1 = ref * (Decimal("1") - tp_buf)
+            new_tp1 = min(old_tp1, min_tp1) if old_tp1 > 0 else min_tp1
+
+        out["bad_fill"] = True
+        out["bad_fill_action"] = "TIGHT_SL"
+        out["bad_fill_reason"] = "adverse_slippage_gt_threshold"
+        out["bad_fill_plan_entry"] = live_bad_fill_decimal_str(plan_entry)
+        out["bad_fill_actual_entry"] = live_bad_fill_decimal_str(actual_entry)
+        out["bad_fill_current_ref"] = live_bad_fill_decimal_str(ref)
+        out["bad_fill_old_sl"] = live_bad_fill_decimal_str(old_sl)
+        out["bad_fill_old_tp1"] = live_bad_fill_decimal_str(old_tp1)
+        out["sl"] = live_bad_fill_decimal_str(tight_sl)
+        out["tp1"] = live_bad_fill_decimal_str(new_tp1)
+        out["tp2_qty"] = "0"
+        out["tp3_qty"] = "0"
+        out["tp_split_mode"] = "BAD_FILL_TIGHT_SL_FULL_TP1"
+
+        return out
+
+    except Exception as e:
+        out["bad_fill_check_error"] = f"{type(e).__name__}:{e}"
+        return out
+
+
+
+
+def live_range_decimal_str(x) -> str:
+    out = format(Decimal(str(x)).normalize(), "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out or "0"
+
+
+def live_apply_range_plan_rebase(plan: Dict[str, Any], entry_fill_res: dict) -> Dict[str, Any]:
+    """
+    Range Plan Rebase:
+    - Build entry range from plan_entry +/- ENTRY_RANGE_BUFFER_PCT.
+    - If actual entry is still inside valid adverse range:
+        SL/TP1 are rebased from actual entry using original plan risk/reward distance.
+    - If actual entry is outside adverse range:
+        only tag range_entry_in_range=false; BAD_FILL guard handles tight SL after this.
+    """
+    out = dict(plan or {})
+
+    enabled = str(os.getenv("LIVE_RANGE_PLAN_ENABLED", "false")).strip().lower() in ("1", "true", "yes", "y", "on")
+    rebase_enabled = str(os.getenv("RANGE_REBASE_SL_TP", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+    preserve_rr = str(os.getenv("RANGE_PRESERVE_RR", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+    no_worse_sl = str(os.getenv("RANGE_SL_NO_WORSE_THAN_PLAN", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+
+    out["range_plan_enabled"] = bool(enabled)
+
+    if not enabled:
+        return out
+
+    try:
+        direction = str(out.get("direction") or out.get("payload", {}).get("direction") or "").upper()
+        if direction.startswith("LONG"):
+            direction = "LONG"
+        elif direction.startswith("SHORT"):
+            direction = "SHORT"
+        else:
+            out["range_plan_error"] = "direction_unknown"
+            return out
+
+        plan_entry = Decimal(str(out.get("entry_mid") or out.get("entry") or out.get("payload", {}).get("entry_mid") or out.get("payload", {}).get("entry") or "0"))
+        actual_entry = Decimal(str(out.get("actual_entry_price") or entry_fill_res.get("entryPrice") or "0"))
+        old_sl = Decimal(str(out.get("sl") or "0"))
+        old_tp1 = Decimal(str(out.get("tp1") or "0"))
+
+        if plan_entry <= 0 or actual_entry <= 0 or old_sl <= 0 or old_tp1 <= 0:
+            out["range_plan_error"] = "missing_price"
+            return out
+
+        buf_pct = Decimal(str(os.getenv("ENTRY_RANGE_BUFFER_PCT", os.getenv("MAX_ADVERSE_SLIPPAGE_PCT", "0.60"))))
+        buf = buf_pct / Decimal("100")
+
+        # Adverse-valid range.
+        # LONG bad if actual too high. SHORT bad if actual too low.
+        if direction == "LONG":
+            entry_range_lo = plan_entry
+            entry_range_hi = plan_entry * (Decimal("1") + buf)
+            adverse_slip = (actual_entry - plan_entry) / plan_entry * Decimal("100")
+            entry_in_range = actual_entry <= entry_range_hi
+        else:
+            entry_range_lo = plan_entry * (Decimal("1") - buf)
+            entry_range_hi = plan_entry
+            adverse_slip = (plan_entry - actual_entry) / plan_entry * Decimal("100")
+            entry_in_range = actual_entry >= entry_range_lo
+
+        adverse_slip = adverse_slip if adverse_slip > 0 else Decimal("0")
+
+        out["range_entry_buffer_pct"] = live_range_decimal_str(buf_pct)
+        out["range_entry_lo"] = live_range_decimal_str(entry_range_lo)
+        out["range_entry_hi"] = live_range_decimal_str(entry_range_hi)
+        out["range_plan_entry"] = live_range_decimal_str(plan_entry)
+        out["range_actual_entry"] = live_range_decimal_str(actual_entry)
+        out["range_adverse_slippage_pct"] = live_range_decimal_str(adverse_slip)
+        out["range_entry_in_range"] = bool(entry_in_range)
+
+        if not entry_in_range:
+            out["range_decision"] = "OUT_OF_RANGE_BAD_FILL_CANDIDATE"
+            return out
+
+        out["range_decision"] = "IN_RANGE_REBASE_ALLOWED"
+
+        if not rebase_enabled:
+            return out
+
+        risk_dist = abs(old_sl - plan_entry)
+        rr_target_r = Decimal(str(os.getenv("RR_TARGET_R", "1.2")))
+        actual_risk_dist = abs(actual_entry - old_sl)
+        reward_dist = actual_risk_dist * rr_target_r if actual_risk_dist > 0 else abs(plan_entry - old_tp1)
+        out["post_fill_rr_rebase_applied"] = True
+        out["post_fill_rr_target_r"] = str(rr_target_r)
+        out["post_fill_actual_risk_dist"] = str(actual_risk_dist)
+
+        if risk_dist <= 0 or reward_dist <= 0:
+            out["range_plan_error"] = "bad_risk_reward_distance"
+            return out
+
+        symbol = str(out.get("symbol") or "").upper().strip()
+        current_ref = live_bad_fill_current_price(symbol) if symbol else Decimal("0")
+        ref_price = current_ref if current_ref > 0 else actual_entry
+
+        side_guard = Decimal(str(os.getenv("RANGE_SIDE_GUARD_BUFFER_PCT", "0.05"))) / Decimal("100")
+        tp_min_profit = Decimal(str(os.getenv("RANGE_TP1_MIN_PROFIT_PCT", os.getenv("BAD_FILL_TP1_MIN_PROFIT_PCT", "0.20")))) / Decimal("100")
+
+        if direction == "LONG":
+            rebase_sl = actual_entry - risk_dist
+            rebase_tp1 = actual_entry + reward_dist
+
+            # LONG SL must stay below current/ref price.
+            old_sl_valid_side = old_sl < ref_price
+            final_sl = max(rebase_sl, old_sl) if (no_worse_sl and old_sl_valid_side) else rebase_sl
+
+            max_valid_sl = ref_price * (Decimal("1") - side_guard)
+            if final_sl >= max_valid_sl:
+                final_sl = max_valid_sl
+
+            final_tp1 = rebase_tp1
+            min_valid_tp1 = ref_price * (Decimal("1") + tp_min_profit)
+            if final_tp1 <= min_valid_tp1:
+                final_tp1 = min_valid_tp1
+
+        else:
+            rebase_sl = actual_entry + risk_dist
+            rebase_tp1 = actual_entry - reward_dist
+
+            # SHORT SL must stay above current/ref price.
+            old_sl_valid_side = old_sl > ref_price
+            final_sl = min(rebase_sl, old_sl) if (no_worse_sl and old_sl_valid_side) else rebase_sl
+
+            min_valid_sl = ref_price * (Decimal("1") + side_guard)
+            if final_sl <= min_valid_sl:
+                final_sl = min_valid_sl
+
+            final_tp1 = rebase_tp1
+            max_valid_tp1 = ref_price * (Decimal("1") - tp_min_profit)
+            if final_tp1 >= max_valid_tp1:
+                final_tp1 = max_valid_tp1
+
+        out["range_ref_price"] = live_range_decimal_str(ref_price)
+        out["range_old_sl_valid_side"] = bool(old_sl_valid_side)
+
+        out["range_old_sl"] = live_range_decimal_str(old_sl)
+        out["range_old_tp1"] = live_range_decimal_str(old_tp1)
+        out["range_risk_dist"] = live_range_decimal_str(risk_dist)
+        out["range_reward_dist"] = live_range_decimal_str(reward_dist)
+        out["range_rebase_sl"] = live_range_decimal_str(rebase_sl)
+        out["range_rebase_tp1"] = live_range_decimal_str(rebase_tp1)
+        out["range_final_sl"] = live_range_decimal_str(final_sl)
+        out["range_final_tp1"] = live_range_decimal_str(final_tp1)
+
+        out["sl"] = live_range_decimal_str(final_sl)
+        out["tp1"] = live_range_decimal_str(final_tp1)
+        out["tp2_qty"] = "0"
+        out["tp3_qty"] = "0"
+        out["tp_split_mode"] = "RANGE_REBASE_FULL_TP1"
+
+        return out
+
+    except Exception as e:
+        out["range_plan_error"] = f"{type(e).__name__}:{e}"
+        return out
+
+
+
+
+def live_entry_plain_decimal(x) -> str:
+    from decimal import Decimal
+    out = format(Decimal(str(x)).normalize(), "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out or "0"
+
+
+def live_entry_round_to_step(value, step, mode="down") -> str:
+    from decimal import Decimal, ROUND_DOWN, ROUND_UP
+    v = Decimal(str(value))
+    st = Decimal(str(step))
+    if st <= 0:
+        return live_entry_plain_decimal(v)
+    rounding = ROUND_UP if str(mode).lower() == "up" else ROUND_DOWN
+    n = (v / st).to_integral_value(rounding=rounding)
+    return live_entry_plain_decimal(n * st)
+
+
+def live_entry_symbol_filters(symbol: str) -> dict:
+    import json as _json
+    import urllib.request as _urlreq
+
+    symbol = str(symbol or "").upper().strip()
+    cache = getattr(live_entry_symbol_filters, "_cache", {})
+    if symbol in cache:
+        return cache[symbol]
+
+    out = {
+        "tickSize": "0.0001",
+        "stepSize": "0.1",
+        "minQty": "0",
+        "minNotional": "0",
+    }
+
+    try:
+        url = live_fapi_base_url().rstrip("/") + "/fapi/v1/exchangeInfo"
+        with _urlreq.urlopen(url, timeout=15) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+
+        for item in data.get("symbols", []):
+            if item.get("symbol") == symbol:
+                fs = {f.get("filterType"): f for f in item.get("filters", [])}
+                out = {
+                    "tickSize": fs.get("PRICE_FILTER", {}).get("tickSize", "0.0001"),
+                    "stepSize": fs.get("LOT_SIZE", {}).get("stepSize", "0.1"),
+                    "minQty": fs.get("LOT_SIZE", {}).get("minQty", "0"),
+                    "minNotional": fs.get("MIN_NOTIONAL", {}).get("notional", "0"),
+                }
+                break
+    except Exception as e:
+        out["filter_error"] = f"{type(e).__name__}:{e}"
+
+    cache[symbol] = out
+    setattr(live_entry_symbol_filters, "_cache", cache)
+    return out
+
+
+def live_plan_entry_price(plan: Dict[str, Any]) -> str:
+    payload = plan.get("payload") if isinstance(plan.get("payload"), dict) else {}
+    v = (
+        plan.get("entry_mid")
+        or plan.get("entry")
+        or plan.get("entry_price")
+        or payload.get("entry_mid")
+        or payload.get("entry")
+        or payload.get("entry_price")
+    )
+    return str(v or "")
+
+
+
+# === ORDERBOOK_EXISTING_SHADOW_BRIDGE_20260620 ===
+def live_read_latest_orderbook_shadow_guard(symbol: str) -> dict:
+    """
+    Read latest REPORT_ONLY orderbook shadow guard result for a symbol.
+    Source: logs/orderbook_shadow_guard_snapshots_v1.jsonl
+    This does not fetch Binance. It bridges existing orderbook chain into live execution.
+    """
+    import json
+    from datetime import datetime, timedelta
+
+    symbol = str(symbol or "").upper().replace("BINANCE:", "").replace(".P", "").strip()
+    path = LOG_DIR / "orderbook_shadow_guard_snapshots_v1.jsonl"
+
+    if not path.exists():
+        return {
+            "ok": False,
+            "reason": "orderbook_shadow_guard_log_missing",
+            "symbol": symbol,
+            "path": str(path),
+        }
+
+    latest = None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if str(row.get("symbol") or "").upper().strip() == symbol:
+                    latest = row
+
+        if not latest:
+            return {
+                "ok": False,
+                "reason": "orderbook_shadow_guard_symbol_missing",
+                "symbol": symbol,
+                "path": str(path),
+            }
+
+        created_at_wib = str(latest.get("created_at_wib") or "").replace(" WIB", "").strip()
+        age_min = None
+        if created_at_wib:
+            try:
+                ts = datetime.strptime(created_at_wib, "%Y-%m-%d %H:%M:%S")
+                now_wib = datetime.utcnow() + timedelta(hours=7)
+                age_min = (now_wib - ts).total_seconds() / 60.0
+            except Exception:
+                age_min = None
+
+        max_age_min = env_float("ORDERBOOK_BRIDGE_MAX_AGE_MIN", 30)
+        stale = bool(age_min is not None and age_min > max_age_min)
+
+        return {
+            "ok": not stale,
+            "reason": "orderbook_shadow_guard_stale" if stale else "orderbook_shadow_guard_ok",
+            "symbol": symbol,
+            "age_min": age_min,
+            "max_age_min": max_age_min,
+            "row": latest,
+            "path": str(path),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "orderbook_shadow_guard_read_exception",
+            "error": f"{type(e).__name__}: {e}",
+            "symbol": symbol,
+            "path": str(path),
+        }
+
+
+def live_orderbook_existing_bridge_guard(symbol: str, plan: Dict[str, Any]) -> dict:
+    """
+    Bridge existing orderbook shadow guard into live execution.
+    Default is SHADOW, so it logs would-block but does not block order.
+    LIVE_BLOCK can be enabled later after validation.
+    """
+    if not env_bool("ORDERBOOK_BRIDGE_ENABLED", True):
+        return {
+            "ok": True,
+            "enabled": False,
+            "mode": "DISABLED",
+            "decision": "ORDERBOOK_BRIDGE_DISABLED",
+            "reason": "orderbook_bridge_disabled",
+        }
+
+    mode = str(os.getenv("ORDERBOOK_BRIDGE_MODE", "SHADOW")).strip().upper()
+    res = live_read_latest_orderbook_shadow_guard(symbol)
+
+    row = res.get("row") or {}
+    guard_state = str(row.get("guard_state") or "UNKNOWN").upper()
+    severity = str(row.get("severity") or "UNKNOWN").upper()
+    shadow_action = str(row.get("shadow_action") or "UNKNOWN").upper()
+    would_block = bool(row.get("would_block_if_live")) or guard_state == "WOULD_BLOCK_IF_LIVE" or "BLOCK" in severity
+
+    if not bool(res.get("ok")):
+        decision = "ORDERBOOK_BRIDGE_REJECT" if mode == "LIVE_BLOCK" else "ORDERBOOK_BRIDGE_SHADOW_DATA_BAD"
+        return {
+            "ok": mode != "LIVE_BLOCK",
+            "enabled": True,
+            "mode": mode,
+            "decision": decision,
+            "reason": res.get("reason"),
+            "symbol": symbol,
+            "source_ok": False,
+            "source_age_min": res.get("age_min"),
+            "guard_state": guard_state,
+            "severity": severity,
+            "shadow_action": shadow_action,
+            "would_block_if_live": would_block,
+            "row": row,
+        }
+
+    if would_block and mode == "LIVE_BLOCK":
+        decision = "ORDERBOOK_REJECT"
+        ok = False
+    elif would_block:
+        decision = "ORDERBOOK_SHADOW_WOULD_BLOCK"
+        ok = True
+    else:
+        decision = "ORDERBOOK_ALLOW"
+        ok = True
+
+    return {
+        "ok": ok,
+        "enabled": True,
+        "mode": mode,
+        "decision": decision,
+        "reason": "|".join(row.get("hard_reasons") or row.get("soft_reasons") or []) or row.get("shadow_action") or "orderbook_bridge_ok",
+        "symbol": symbol,
+        "source_ok": True,
+        "source_age_min": res.get("age_min"),
+        "guard_state": guard_state,
+        "severity": severity,
+        "shadow_action": shadow_action,
+        "would_block_if_live": would_block,
+        "grade24": row.get("grade24"),
+        "grade7": row.get("grade7"),
+        "latest_pricing_status": row.get("latest_pricing_status"),
+        "ok_share24": row.get("ok_share24"),
+        "sample24": row.get("sample24"),
+        "spread_bps_p95": row.get("spread_bps_p95"),
+        "worst_slip_50_p95": row.get("worst_slip_50_p95"),
+        "min_depth10_p10": row.get("min_depth10_p10"),
+        "latest_spread_bps": row.get("latest_spread_bps"),
+        "latest_depth10_bid_usdt": row.get("latest_depth10_bid_usdt"),
+        "latest_depth10_ask_usdt": row.get("latest_depth10_ask_usdt"),
+        "hard_reasons": row.get("hard_reasons"),
+        "soft_reasons": row.get("soft_reasons"),
+        "created_at_wib": row.get("created_at_wib"),
+    }
+
+
+def live_build_entry_order_params(symbol: str, entry_side: str, qty: str, signal_key: str, plan: Dict[str, Any]) -> dict:
+    """
+    Entry order builder.
+
+    MARKET:
+      current old behavior.
+
+    LIMIT_IOC:
+      pure signal plan entry, no pending order numpuk.
+      BUY  price rounded DOWN to tick.
+      SELL price rounded UP to tick.
+      If not immediately fill, Binance cancels it.
+    """
+    symbol = str(symbol or "").upper().strip()
+    side = str(entry_side or "").upper().strip()
+    mode = str(os.getenv("LIVE_ENTRY_ORDER_TYPE", "MARKET")).strip().upper()
+
+    filters = live_entry_symbol_filters(symbol)
+    step = filters.get("stepSize", "0.1")
+    tick = filters.get("tickSize", "0.0001")
+
+    qty2 = live_entry_round_to_step(qty, step, "down")
+
+    if mode in ("LIMIT_IOC", "IOC_LIMIT", "LIMIT_TTL", "LIMIT_GTC", "GTC_LIMIT"):
+        raw_price = live_plan_entry_price(plan)
+        if not raw_price:
+            return {
+                "ok": False,
+                "reason": "missing_plan_entry_for_limit_ioc",
+                "params": None,
+                "meta": {"mode": mode, "filters": filters},
+            }
+
+        # Pure plan, tapi rounding dibuat tidak lebih buruk.
+        # LONG BUY: round down. SHORT SELL: round up.
+        price_mode = "down" if side == "BUY" else "up"
+        price = live_entry_round_to_step(raw_price, tick, price_mode)
+
+        tif = "IOC" if mode in ("LIMIT_IOC", "IOC_LIMIT") else "GTC"
+        entry_mode_label = "LIMIT_IOC" if tif == "IOC" else "LIMIT_TTL"
+
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": tif,
+            "quantity": qty2,
+            "price": price,
+            "newClientOrderId": _live_client_order_id("SMC", signal_key, "ENTRY"),
+        }
+
+        return {
+            "ok": True,
+            "reason": None,
+            "params": params,
+            "meta": {
+                "mode": entry_mode_label,
+                "timeInForce": tif,
+                "ttl_sec": str(os.getenv("LIVE_ENTRY_TTL_SEC", "5400")),
+                "raw_plan_entry": str(raw_price),
+                "rounded_price": price,
+                "price_round_mode": price_mode,
+                "raw_qty": str(qty),
+                "rounded_qty": qty2,
+                "filters": filters,
+                "market_fallback": str(os.getenv("LIVE_MARKET_FALLBACK", "false")).lower(),
+            },
+        }
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty2,
+        "newClientOrderId": _live_client_order_id("SMC", signal_key, "ENTRY"),
+    }
+
+    return {
+        "ok": True,
+        "reason": None,
+        "params": params,
+        "meta": {
+            "mode": "MARKET",
+            "raw_qty": str(qty),
+            "rounded_qty": qty2,
+            "filters": filters,
+        },
+    }
+
+
+def handle_live_small_capital_execution(p: Dict[str, Any], safety: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    signal_key = signal_key_of(p)
+    plan = build_execution_plan(p)
+    plan["execution_mode"] = "LIVE_SMALL_CAPITAL"
+    plan["binance_env"] = "LIVE"
+
+    ok, reason = shared_validate_plan_cost_gate(plan, require_quantity=True)
+
+    base_event = {
+        "event_at_utc": utc_now_iso(),
+        "event_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "execution_mode": execution_mode(),
+        "binance_env": binance_env(),
+        "signal_key": signal_key,
+        "pair": pair_of(p),
+        "symbol": plan.get("symbol"),
+        "source": p.get("source"),
+        "signal_source": p.get("signal_source"),
+        "execution_owner": p.get("execution_owner"),
+        "plan": plan,
+        "safety_summary": safety,
+    }
+
+    append_jsonl(EXECUTION_PLANS_LOG, plan)
+
+    if not ok:
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_EXECUTE",
+            "decision": "REJECT",
+            "reason": reason,
+            "gate": "live_plan_cost_gate",
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {"ok": False, "decision": "REJECT", "reason": reason, "gate": "live_plan_cost_gate", "plan": plan}
+
+    if binance_env() != "LIVE" or execution_mode() != "LIVE_SMALL_CAPITAL":
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_EXECUTE",
+            "decision": "REJECT",
+            "reason": "live_env_or_execution_mode_mismatch",
+            "gate": "live_env_gate",
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {"ok": False, "decision": "REJECT", "reason": "live_env_or_execution_mode_mismatch", "gate": "live_env_gate", "plan": plan}
+
+    if env_bool("KILL_SWITCH", False) or env_bool("EMERGENCY_CLOSE_ENABLED", False):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_EXECUTE",
+            "decision": "REJECT",
+            "reason": "kill_switch_or_emergency_close_active",
+            "gate": "live_kill_switch_gate",
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {"ok": False, "decision": "REJECT", "reason": "kill_switch_or_emergency_close_active", "gate": "live_kill_switch_gate", "plan": plan}
+
+    symbol = str(plan.get("symbol") or "").upper()
+    entry_side = str(plan.get("entry_side") or "").upper()
+    exit_side = str(plan.get("exit_side") or "").upper()
+    qty = str(plan.get("quantity") or "").strip()
+
+    orderbook_bridge = live_orderbook_existing_bridge_guard(symbol, plan)
+
+    orderbook_bridge_fields = {
+        "orderbook_bridge_enabled": orderbook_bridge.get("enabled"),
+        "orderbook_bridge_mode": orderbook_bridge.get("mode"),
+        "orderbook_bridge_decision": orderbook_bridge.get("decision"),
+        "orderbook_bridge_reason": orderbook_bridge.get("reason"),
+        "orderbook_guard_state": orderbook_bridge.get("guard_state"),
+        "orderbook_severity": orderbook_bridge.get("severity"),
+        "orderbook_shadow_action": orderbook_bridge.get("shadow_action"),
+        "orderbook_would_block_if_live": orderbook_bridge.get("would_block_if_live"),
+        "orderbook_grade24": orderbook_bridge.get("grade24"),
+        "orderbook_grade7": orderbook_bridge.get("grade7"),
+        "orderbook_ok_share24": orderbook_bridge.get("ok_share24"),
+        "orderbook_sample24": orderbook_bridge.get("sample24"),
+        "orderbook_spread_bps_p95": orderbook_bridge.get("spread_bps_p95"),
+        "orderbook_worst_slip_50_p95": orderbook_bridge.get("worst_slip_50_p95"),
+        "orderbook_min_depth10_p10": orderbook_bridge.get("min_depth10_p10"),
+        "orderbook_latest_spread_bps": orderbook_bridge.get("latest_spread_bps"),
+        "orderbook_latest_depth10_bid_usdt": orderbook_bridge.get("latest_depth10_bid_usdt"),
+        "orderbook_latest_depth10_ask_usdt": orderbook_bridge.get("latest_depth10_ask_usdt"),
+        "orderbook_source_age_min": orderbook_bridge.get("source_age_min"),
+        "orderbook_source_created_at_wib": orderbook_bridge.get("created_at_wib"),
+    }
+
+    plan.update(orderbook_bridge_fields)
+    base_event.update(orderbook_bridge_fields)
+
+    if not bool(orderbook_bridge.get("ok")):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_ORDERBOOK_BRIDGE",
+            "decision": "REJECT",
+            "reason": orderbook_bridge.get("reason") or "orderbook_bridge_reject",
+            "gate": "orderbook_bridge_gate",
+            "plan": plan,
+            "orderbook_bridge": orderbook_bridge,
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {
+            "ok": False,
+            "decision": "REJECT",
+            "reason": orderbook_bridge.get("reason") or "orderbook_bridge_reject",
+            "gate": "orderbook_bridge_gate",
+            "plan": plan,
+            "orderbook_bridge": orderbook_bridge,
+        }
+
+    setup_res = live_try_set_margin_and_leverage(plan)
+
+    entry_build = live_build_entry_order_params(symbol, entry_side, qty, signal_key, plan)
+    if not bool(entry_build.get("ok")):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_ENTRY",
+            "decision": "LIVE_ENTRY_BUILD_FAILED",
+            "reason": entry_build.get("reason"),
+            "setup_result": setup_res,
+            "entry_build": entry_build,
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {"ok": False, "decision": "LIVE_ENTRY_BUILD_FAILED", "reason": entry_build.get("reason"), "plan": plan, "entry_build": entry_build}
+
+    entry_params = entry_build.get("params")
+    plan["entry_order_type"] = (entry_build.get("meta") or {}).get("mode")
+    plan["entry_order_meta"] = entry_build.get("meta")
+
+    entry_res = live_place_order(entry_params)
+
+    if not bool(entry_res.get("ok")):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_ENTRY",
+            "decision": "LIVE_ENTRY_FAILED",
+            "reason": entry_res.get("reason"),
+            "setup_result": setup_res,
+            "entry_params": entry_params,
+            "entry_result": entry_res,
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {"ok": False, "decision": "LIVE_ENTRY_FAILED", "reason": entry_res.get("reason"), "plan": plan, "entry_result": entry_res}
+
+    # Jangan pasang TP/SL sebelum MARKET entry bener-bener kebaca sebagai posisi live.
+    ensure_tp_split(plan)
+
+    entry_fill_res = live_wait_position_after_entry(symbol, direction_of(p), signal_key)
+    if not bool(entry_fill_res.get("ok")):
+        event = dict(base_event)
+        event.update({
+            "action": "LIVE_SMALL_CAPITAL_EXECUTE",
+            "decision": "LIVE_LIMIT_IOC_NOT_FILLED_OR_POSITION_NOT_CONFIRMED",
+            "reason": entry_fill_res.get("reason"),
+            "setup_result": setup_res,
+            "entry_params": entry_params,
+            "entry_result": entry_res,
+            "entry_fill_result": entry_fill_res,
+            "protection_ok": False,
+            "protective_results": [],
+        })
+        append_jsonl(EXECUTION_EVENTS_LOG, event)
+        return {
+            "ok": False,
+            "decision": "LIVE_LIMIT_IOC_NOT_FILLED_OR_POSITION_NOT_CONFIRMED",
+            "reason": entry_fill_res.get("reason"),
+            "plan": plan,
+            "entry_result": entry_res,
+            "entry_fill_result": entry_fill_res,
+        }
+
+    plan = live_apply_actual_position_to_plan(plan, entry_fill_res)
+    plan = live_apply_range_plan_rebase(plan, entry_fill_res)
+    plan = live_apply_bad_fill_tight_sl(plan, entry_fill_res)
+    qty = str(plan.get("quantity") or qty)
+
+    protective_results = []
+
+    sl_params = {
+        "symbol": symbol,
+        "side": exit_side,
+        "type": "STOP_MARKET",
+        "stopPrice": str(plan.get("sl")),
+        "quantity": qty,
+        "reduceOnly": "true",
+        "workingType": "CONTRACT_PRICE",
+        "newClientOrderId": _live_client_order_id("SMC", signal_key, "SL"),
+    }
+    sl_res = live_place_algo_order(sl_params)
+    protective_results.append({"label": "SL", "params": sl_params, "result": sl_res})
+
+    for label, tp_key, qty_key in [
+        ("TP1", "tp1", "tp1_qty"),
+        ("TP2", "tp2", "tp2_qty"),
+        ("TP3", "tp3", "tp3_qty"),
+    ]:
+        tp_qty = plan.get(qty_key)
+        try:
+            tp_qty_f = float(tp_qty or 0)
+        except Exception:
+            tp_qty_f = 0.0
+        if tp_qty_f <= 0:
+            continue
+
+        tp_params = {
+            "symbol": symbol,
+            "side": exit_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": str(plan.get(tp_key)),
+            "quantity": str(tp_qty),
+            "reduceOnly": "true",
+            "workingType": "CONTRACT_PRICE",
+            "newClientOrderId": _live_client_order_id("SMC", signal_key, label),
+        }
+        tp_res = live_place_algo_order(tp_params)
+        protective_results.append({"label": label, "params": tp_params, "result": tp_res})
+
+    protection_ok = all(bool(x.get("result", {}).get("ok")) for x in protective_results)
+
+    final_decision = "LIVE_ORDER_PLACED" if protection_ok else "LIVE_ENTRY_PLACED_PROTECTION_PARTIAL_OR_FAILED"
+
+    event = dict(base_event)
+    event.update({
+        "action": "LIVE_SMALL_CAPITAL_EXECUTE",
+        "decision": final_decision,
+        "reason": "entry_and_protection_processed",
+        "setup_result": setup_res,
+        "entry_params": entry_params,
+        "entry_result": entry_res,
+        "entry_fill_result": entry_fill_res,
+        "plan": plan,
+        "protective_results": protective_results,
+        "protection_ok": protection_ok,
+    })
+    append_jsonl(EXECUTION_EVENTS_LOG, event)
+
+    v014_execution_summary_write(signal_key, {
+        "pair": pair_of(p),
+        "symbol": symbol,
+        "direction": direction_of(p),
+        "lifecycle_state": final_decision,
+        "entry_order_id": (entry_res.get("body") or {}).get("orderId") if isinstance(entry_res.get("body"), dict) else None,
+        "notes": "live_small_capital_execute_on_confirmed",
+    })
+
+    return {
+        "ok": protection_ok,
+        "decision": final_decision,
+        "reason": "entry_and_protection_processed",
+        "plan": plan,
+        "setup_result": setup_res,
+        "entry_result": entry_res,
+        "entry_fill_result": entry_fill_res,
+        "protective_results": protective_results,
+    }
+
+
 def send_telegram_message(text: str) -> Dict[str, Any]:
     if not env_bool("TELEGRAM_ENABLED", False):
         return {"ok": True, "sent": False, "skipped": True, "reason": "telegram_disabled"}
@@ -698,7 +2133,15 @@ def csv_set(name: str) -> set[str]:
 
 def get_mode() -> str:
     mode = (os.getenv("BOT_MODE") or os.getenv("MODE") or "RECEIVED_ONLY").strip().upper()
-    if mode not in ("RECEIVED_ONLY", "RECEIVER_ONLY", "PAPER"):
+    allowed = (
+        "RECEIVED_ONLY",
+        "RECEIVER_ONLY",
+        "PAPER",
+        "TESTNET",
+        "TESTNET_MARKET",
+        "LIVE_SMALL_CAPITAL",
+    )
+    if mode not in allowed:
         return "RECEIVED_ONLY"
     if mode == "RECEIVER_ONLY":
         return "RECEIVED_ONLY"
@@ -1782,18 +3225,29 @@ def ensure_tp_split(plan: Dict[str, Any]) -> None:
             return float(v)
         except Exception:
             return default
+
     total_qty = _sf(plan.get("quantity_float") or plan.get("quantity"), 0.0)
     if total_qty <= 0:
         plan["tp1_qty"] = 0.0
         plan["tp2_qty"] = 0.0
         plan["tp3_qty"] = 0.0
         return
+
+    policy = str(os.getenv("LIVE_TP_POLICY") or os.getenv("TP_POLICY") or "").strip().upper()
+    if policy in ("FULL_TP1", "TP1_FULL", "100_TP1", "ALL_TP1"):
+        plan["tp1_qty"] = total_qty
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+        plan["tp_split_mode"] = "FULL_TP1"
+        return
+
     p1 = _sf(plan.get("tp1_qty"), 0.0)
     p2 = _sf(plan.get("tp2_qty"), 0.0)
     p3 = _sf(plan.get("tp3_qty"), 0.0)
     if p1 > 0 and p2 >= 0 and p3 >= 0:
         plan["tp1_qty"], plan["tp2_qty"], plan["tp3_qty"] = p1, p2, p3
         return
+
     filters = ((plan.get("quantity_sizing") or {}).get("filters") or {})
     split_res = v011_build_tp_quantities(Decimal(str(total_qty)), filters, {})
     if split_res.get("ok"):
@@ -1803,6 +3257,7 @@ def ensure_tp_split(plan: Dict[str, Any]) -> None:
             plan["tp2_qty"] = _sf(tp_qtys[1], 0.0)
             plan["tp3_qty"] = _sf(tp_qtys[2], 0.0)
             return
+
     plan["tp1_qty"] = 0.0
     plan["tp2_qty"] = 0.0
     plan["tp3_qty"] = 0.0
@@ -2042,7 +3497,15 @@ def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
         "tp_normalized": p.get("tp_normalized"),
         "tp_normalize_reason": p.get("tp_normalize_reason"),
         "leverage": env_int("DEFAULT_LEVERAGE", 2),
-        "margin_type": "ISOLATED",
+        # === PLAN_MARGIN_TYPE_FROM_ENV_20260624 ===
+        # === PLAN_MARGIN_TYPE_FROM_ENV_SAFE_20260624 ===
+        "margin_type": (
+            "CROSSED"
+            if str(os.getenv("MARGIN_TYPE") or "CROSSED").strip().upper() in ("CROSS", "CROSSED")
+            else "ISOLATED"
+            if str(os.getenv("MARGIN_TYPE") or "CROSSED").strip().upper() == "ISOLATED"
+            else "CROSSED"
+        ),
         "quantity": None,
         "notional_usdt_cap": env_int("TESTNET_MAX_NOTIONAL_USDT", 50),
         "risk_usdt": env_int("TESTNET_RISK_USDT_PER_TRADE", 5),
@@ -2136,6 +3599,167 @@ def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
 
     return True, "execution_plan_valid"
 
+
+
+def apply_rr_single_target_rewrite(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RR Single Target Rewrite V1
+
+    Immediate live behavior:
+    - rewrite TP plan to a single full target at RR_TARGET_R
+    - preserve raw TP fields for audit
+    - keep tp1/tp2/tp3 schema compatible
+    - force tp2/tp3 qty to 0 when qty fields exist
+    """
+    enabled = env_bool("RR_TARGET_REWRITE_ENABLED", True)
+    target_r = env_float("RR_TARGET_R", 1.2)
+    mode = str(os.getenv("RR_TARGET_MODE", "SINGLE_FULL")).strip().upper() or "SINGLE_FULL"
+
+    base = {
+        "rr_target_rewrite_enabled": enabled,
+        "rr_target_mode": mode,
+        "rr_target_r": target_r,
+        "rr_rewrite_applied": False,
+        "rr_rewrite_reason": "",
+        "rr_old_tp1_r": None,
+        "rr_old_tp2_r": None,
+        "rr_old_tp3_r": None,
+        "rr_new_tp_r": None,
+        "rr_single_target_price": None,
+    }
+
+    if not enabled:
+        base["rr_rewrite_reason"] = "rr_target_rewrite_disabled"
+        plan.update(base)
+        return {**base, "ok": True}
+
+    entry = to_float_or_none(plan.get("entry_mid") or plan.get("entry") or plan.get("entry_price"))
+    sl = to_float_or_none(plan.get("sl") or plan.get("stop_loss") or plan.get("invalid"))
+    old_tp1 = to_float_or_none(plan.get("tp1"))
+    old_tp2 = to_float_or_none(plan.get("tp2"))
+    old_tp3 = to_float_or_none(plan.get("tp3"))
+
+    direction_raw = str(plan.get("direction") or plan.get("dir") or "").strip().upper()
+    try:
+        d2 = str(direction_of(plan) or "").strip().upper()
+        if d2:
+            direction_raw = d2
+    except Exception:
+        pass
+
+    is_long = direction_raw in ("LONG", "BUY")
+    is_short = direction_raw in ("SHORT", "SELL")
+
+    if entry is None or sl is None or entry <= 0 or sl <= 0:
+        base["rr_rewrite_reason"] = "missing_entry_or_sl"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_missing_entry_or_sl"}
+
+    if not is_long and not is_short:
+        base["rr_rewrite_reason"] = f"invalid_direction:{direction_raw or 'EMPTY'}"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_invalid_direction"}
+
+    if target_r <= 0:
+        base["rr_rewrite_reason"] = f"invalid_target_r:{target_r}"
+        plan.update(base)
+        return {**base, "ok": False, "reason": "rr_invalid_target_r"}
+
+    if is_long:
+        risk = entry - sl
+        if risk <= 0:
+            base["rr_rewrite_reason"] = "invalid_long_risk"
+            plan.update(base)
+            return {**base, "ok": False, "reason": "rr_invalid_long_risk"}
+
+        def rr(tp):
+            return ((tp - entry) / risk) if tp is not None else None
+
+        target = entry + (risk * target_r)
+
+    else:
+        risk = sl - entry
+        if risk <= 0:
+            base["rr_rewrite_reason"] = "invalid_short_risk"
+            plan.update(base)
+            return {**base, "ok": False, "reason": "rr_invalid_short_risk"}
+
+        def rr(tp):
+            return ((entry - tp) / risk) if tp is not None else None
+
+        target = entry - (risk * target_r)
+
+    # Preserve raw targets once.
+    if plan.get("raw_tp1") is None:
+        plan["raw_tp1"] = old_tp1
+    if plan.get("raw_tp2") is None:
+        plan["raw_tp2"] = old_tp2
+    if plan.get("raw_tp3") is None:
+        plan["raw_tp3"] = old_tp3
+
+    old_rr1 = rr(old_tp1)
+    old_rr2 = rr(old_tp2)
+    old_rr3 = rr(old_tp3)
+
+    # Keep schema compatible. Execution qty will make it a single target.
+    plan["tp1"] = target
+    plan["tp2"] = target
+    plan["tp3"] = target
+
+    # Force single full target if quantities are already known.
+    q1 = to_float_or_none(plan.get("tp1_qty"))
+    q2 = to_float_or_none(plan.get("tp2_qty"))
+    q3 = to_float_or_none(plan.get("tp3_qty"))
+    q_total = None
+
+    known_qs = [x for x in [q1, q2, q3] if x is not None and x > 0]
+    if known_qs:
+        q_total = sum(known_qs)
+    else:
+        q_total = (
+            to_float_or_none(plan.get("quantity"))
+            or to_float_or_none(plan.get("qty"))
+            or to_float_or_none(plan.get("order_qty"))
+            or to_float_or_none(plan.get("position_qty"))
+        )
+
+    if q_total is not None and q_total > 0:
+        plan["tp1_qty"] = q_total
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+    else:
+        # Still block partials when downstream respects zero qty.
+        plan["tp2_qty"] = 0.0
+        plan["tp3_qty"] = 0.0
+
+    plan["rr_target_rewrite_enabled"] = True
+    plan["rr_target_mode"] = mode
+    plan["rr_target_r"] = target_r
+    plan["rr_rewrite_applied"] = True
+    plan["rr_rewrite_reason"] = "single_full_target_1r_rewrite"
+    plan["rr_single_target_price"] = target
+    plan["rr_old_tp1_r"] = round(old_rr1, 6) if old_rr1 is not None else None
+    plan["rr_old_tp2_r"] = round(old_rr2, 6) if old_rr2 is not None else None
+    plan["rr_old_tp3_r"] = round(old_rr3, 6) if old_rr3 is not None else None
+    plan["rr_new_tp_r"] = target_r
+    plan["rr_tp1"] = target_r
+    plan["rr_tp2"] = target_r
+    plan["rr_tp3"] = target_r
+    plan["tp_single_full_exit"] = True
+    plan["tp_normalize_reason"] = "rr_single_target_rewrite"
+
+    out = {
+        **base,
+        "ok": True,
+        "rr_rewrite_applied": True,
+        "rr_rewrite_reason": "single_full_target_1r_rewrite",
+        "rr_old_tp1_r": plan["rr_old_tp1_r"],
+        "rr_old_tp2_r": plan["rr_old_tp2_r"],
+        "rr_old_tp3_r": plan["rr_old_tp3_r"],
+        "rr_new_tp_r": target_r,
+        "rr_single_target_price": target,
+    }
+    return out
 
 def normalize_tp_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     direction = str(payload.get("direction") or payload.get("dir") or "").strip().upper()
@@ -3854,6 +5478,26 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
         p["plan_sanity_ok"] = bool(normalize_res.get("ok"))
         p["plan_sanity_reason"] = normalize_res.get("reason")
         p["plan_invalid"] = bool(normalize_res.get("plan_invalid"))
+
+        rr_rewrite_res = apply_rr_single_target_rewrite(p)
+        p["rr_rewrite_ok"] = bool(rr_rewrite_res.get("ok"))
+        p["rr_rewrite_reason"] = rr_rewrite_res.get("rr_rewrite_reason") or rr_rewrite_res.get("reason")
+        p["rr_target_mode"] = rr_rewrite_res.get("rr_target_mode") or p.get("rr_target_mode")
+        p["rr_target_r"] = rr_rewrite_res.get("rr_target_r") or p.get("rr_target_r")
+        p["rr_single_target_price"] = rr_rewrite_res.get("rr_single_target_price") or p.get("rr_single_target_price")
+
+        if bool(rr_rewrite_res.get("rr_rewrite_applied")):
+            normalize_res = normalize_tp_plan(p)
+            p["plan_sanity_ok"] = bool(normalize_res.get("ok"))
+            p["plan_sanity_reason"] = normalize_res.get("reason")
+            p["plan_invalid"] = bool(normalize_res.get("plan_invalid"))
+
+        if not bool(rr_rewrite_res.get("ok")):
+            normalize_res = {"ok": False, "reason": rr_rewrite_res.get("reason") or rr_rewrite_res.get("rr_rewrite_reason") or "rr_rewrite_failed", "plan_invalid": True}
+            p["plan_sanity_ok"] = False
+            p["plan_sanity_reason"] = normalize_res.get("reason")
+            p["plan_invalid"] = True
+
         if not bool(normalize_res.get("ok")):
             decision = {"decision": "REJECT", "reason": normalize_res.get("reason"), "gate": "plan_sanity_gate"}
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
@@ -3871,10 +5515,24 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
                 response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode, "safety_summary": safety}
                 fire_and_forget_ml_shadow_log(p, decision, response, state)
                 return response
-            decision = {"decision": "REJECT", "reason": "live_execution_not_implemented", "gate": "execution_mode_gate"}
+
+            live_res = handle_live_small_capital_execution(p, safety=safety)
+            decision = {
+                "decision": "ACCEPT" if str(live_res.get("decision")) == "LIVE_ORDER_PLACED" else "REJECT",
+                "reason": live_res.get("decision") or live_res.get("reason"),
+                "gate": "live_small_capital_execute_on_confirmed",
+            }
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
             notify_signal_decision_async(p, decision)
-            response = {"ok": True, "decision": decision["decision"], "reason": decision["reason"], "gate": decision["gate"], "signal_id": p.get("signal_id") or p.get("signal_key"), "execution_mode": current_execution_mode}
+            response = {
+                "ok": bool(live_res.get("ok")),
+                "decision": decision["decision"],
+                "reason": decision["reason"],
+                "gate": decision["gate"],
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+                "execution_mode": current_execution_mode,
+                "live_execution": live_res,
+            }
             fire_and_forget_ml_shadow_log(p, decision, response, state)
             return response
 
@@ -5780,12 +7438,20 @@ def v014_reconcile_state(symbol: str = "", signal_key: str = "", ignore_signal_k
     paper_rows = v014_open_paper_positions_for_symbol(symbol, ignore_signal_key=ignore_signal_key) if symbol else (load_state().get("open_paper_positions") or [])
     paper_open = any(str(r.get("status", "OPEN")).upper() == "OPEN" for r in paper_rows)
 
-    position_res = binance_testnet_position_risk(symbol) if symbol else {"ok": False, "reason": "symbol_required_for_position_risk"}
+    if symbol:
+        if execution_mode() == "LIVE_SMALL_CAPITAL" and binance_env() == "LIVE":
+            position_res = live_futures_position_risk(symbol)
+            algo_res = live_fetch_open_orders(symbol)
+        else:
+            position_res = binance_testnet_position_risk(symbol)
+            algo_res = v013_fetch_open_algo_orders(symbol)
+    else:
+        position_res = {"ok": False, "reason": "symbol_required_for_position_risk"}
+        algo_res = {"ok": False, "orders": [], "raw": {"reason": "symbol_required_for_algo_orders"}}
+
     position_amt = "0"
     if symbol and position_res.get("ok"):
         position_amt = v013_extract_position_amt(position_res, symbol)
-
-    algo_res = v013_fetch_open_algo_orders(symbol) if symbol else {"ok": False, "orders": [], "raw": {"reason": "symbol_required_for_algo_orders"}}
     open_orders = algo_res.get("orders") or []
     open_algo_count = len(open_orders)
 
@@ -5797,18 +7463,19 @@ def v014_reconcile_state(symbol: str = "", signal_key: str = "", ignore_signal_k
     if symbol and (not position_res.get("ok") or not algo_res.get("ok")):
         mismatch_state = "UNKNOWN"
         reasons.append(position_res.get("reason") or (algo_res.get("raw") or {}).get("reason") or "exchange_fetch_failed")
-    elif has_position and (not bot_state_detected):
-        mismatch_state = "POSITION_OPEN_NO_STATE"
-        reasons.append("binance_position_open_but_bot_and_paper_state_not_open")
+    elif has_position and open_algo_count > 0:
+        mismatch_state = "POSITION_OPEN_PROTECTED"
+        if not bot_state_detected:
+            reasons.append("binance_position_open_protected_but_bot_state_not_open")
+    elif has_position and open_algo_count == 0:
+        mismatch_state = "UNPROTECTED_POSITION"
+        reasons.append("position_open_without_protection_orders")
     elif bot_state_detected and (not has_position):
         mismatch_state = "STATE_OPEN_NO_POSITION"
         reasons.append("bot_or_paper_state_open_but_binance_position_closed")
     elif (not has_position) and open_algo_count > 0:
         mismatch_state = "STALE_ALGO_NO_POSITION"
         reasons.append("open_algo_orders_exist_without_open_position")
-    elif has_position and open_algo_count == 0:
-        mismatch_state = "UNPROTECTED_POSITION"
-        reasons.append("position_open_without_protection_orders")
     elif (not has_position) and open_algo_count == 0 and (not paper_open):
         mismatch_state = "CLEAN"
     else:
@@ -6698,6 +8365,385 @@ def paper_performance_daily(date_wib: str, x_signal_secret: Optional[str] = Head
 
 
 
+
+
+# =========================
+# Operator Candle Health
+# =========================
+
+def _market_interval_ms(interval: str) -> Optional[int]:
+    m = {
+        "1m": 60_000,
+        "5m": 5 * 60_000,
+        "15m": 15 * 60_000,
+        "4h": 4 * 60 * 60_000,
+    }
+    return m.get(str(interval or "").strip())
+
+
+def _parse_csv_list(raw: Any) -> List[str]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return []
+    return [x.strip() for x in txt.replace(";", ",").split(",") if x.strip()]
+
+
+def market_candle_health(symbols: Optional[List[str]] = None, intervals: Optional[List[str]] = None) -> Dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+
+    clean_symbols = [
+        v010_normalize_symbol(s)
+        for s in (symbols or market_allowlist_symbols())
+        if v010_normalize_symbol(s)
+    ]
+
+    clean_intervals = [
+        str(x).strip()
+        for x in (intervals or ["5m", "15m", "4h"])
+        if str(x).strip() in {"1m", "5m", "15m", "4h"}
+    ] or ["5m", "15m", "4h"]
+
+    grace_mult = max(0.0, env_float("CANDLE_HEALTH_GRACE_MULT", 0.20))
+    min_grace_sec = max(0, env_int("CANDLE_HEALTH_MIN_GRACE_SEC", 120))
+
+    rows: List[Dict[str, Any]] = []
+    missing_count = 0
+    stale_count = 0
+    invalid_count = 0
+
+    for symbol in clean_symbols:
+        for interval in clean_intervals:
+            expected_ms = _market_interval_ms(interval)
+            if not expected_ms:
+                invalid_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "INVALID_INTERVAL",
+                    "reason": "unsupported_interval",
+                    "count": 0,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": None,
+                })
+                continue
+
+            candles = market_load_candles(symbol, interval)
+            closed = [r for r in candles if bool(r.get("is_closed", True))]
+            count = len(closed)
+
+            if not closed:
+                missing_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "MISSING",
+                    "reason": "no_closed_candles",
+                    "count": 0,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": round((expected_ms + max(min_grace_sec * 1000, int(expected_ms * grace_mult))) / 60000.0, 2),
+                })
+                continue
+
+            last = closed[-1]
+            try:
+                last_close_ms = int(last.get("close_time_ms") or last.get("t") or 0)
+            except Exception:
+                last_close_ms = 0
+
+            if last_close_ms <= 0:
+                missing_count += 1
+                rows.append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "ok": False,
+                    "status": "MISSING",
+                    "reason": "invalid_last_close_time",
+                    "count": count,
+                    "last_close_time_ms": None,
+                    "last_close_wib": None,
+                    "age_min": None,
+                    "max_age_min": round((expected_ms + max(min_grace_sec * 1000, int(expected_ms * grace_mult))) / 60000.0, 2),
+                })
+                continue
+
+            grace_ms = max(min_grace_sec * 1000, int(expected_ms * grace_mult))
+            max_age_ms = expected_ms + grace_ms
+            age_ms = max(0, now_ms - last_close_ms)
+            stale = age_ms > max_age_ms
+
+            if stale:
+                stale_count += 1
+
+            last_close_wib = datetime.fromtimestamp(last_close_ms / 1000.0, timezone.utc).astimezone(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+            rows.append({
+                "symbol": symbol,
+                "interval": interval,
+                "ok": not stale,
+                "status": "OK" if not stale else "STALE",
+                "reason": "ok" if not stale else "stale_candle",
+                "count": count,
+                "last_close_time_ms": last_close_ms,
+                "last_close_wib": last_close_wib,
+                "age_min": round(age_ms / 60000.0, 2),
+                "max_age_min": round(max_age_ms / 60000.0, 2),
+            })
+
+    total = len(rows)
+    ok_count = sum(1 for r in rows if r.get("ok"))
+    bad_count = total - ok_count
+    coverage_pct = round((ok_count / total) * 100.0, 2) if total else 0.0
+    status = "OK" if bad_count == 0 else "WARN"
+
+    return {
+        "ok": bad_count == 0,
+        "status": status,
+        "coverage_pct": coverage_pct,
+        "total_checks": total,
+        "ok_count": ok_count,
+        "bad_count": bad_count,
+        "missing_count": missing_count,
+        "stale_count": stale_count,
+        "invalid_count": invalid_count,
+        "symbols": clean_symbols,
+        "intervals": clean_intervals,
+        "rows": rows,
+        "timestamp_utc": utc_now_iso(),
+        "timestamp_wib": wib_now_iso(),
+    }
+
+
+def format_market_candle_health_message(h: Dict[str, Any]) -> str:
+    rows = h.get("rows") or []
+    bad = [r for r in rows if not r.get("ok")]
+
+    lines = [
+        "🕯️ CANDLE HEALTH",
+        f"Status: {h.get('status')}",
+        f"Time: {h.get('timestamp_wib')}",
+        f"Coverage: {h.get('coverage_pct')}%",
+        f"OK: {h.get('ok_count')}/{h.get('total_checks')}",
+        f"Missing: {h.get('missing_count')}",
+        f"Stale: {h.get('stale_count')}",
+        "",
+        "Bad rows:",
+    ]
+
+    if not bad:
+        lines.append("- none")
+    else:
+        for r in bad[:25]:
+            lines.append(
+                f"- {r.get('symbol')} {r.get('interval')} | {r.get('status')} | age={r.get('age_min')}m | max={r.get('max_age_min')}m | last={r.get('last_close_wib')}"
+            )
+
+    if len(bad) > 25:
+        lines.append(f"- ...and {len(bad) - 25} more")
+
+    return "\n".join(lines)
+
+
+@app.api_route("/operator/candle-health", methods=["GET", "POST"])
+def operator_candle_health(request: Request, symbol: str = "", intervals: str = "5m,15m,4h"):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    health = market_candle_health(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+    )
+    return health
+
+
+@app.post("/operator/candle-health/telegram")
+def operator_candle_health_telegram(request: Request, symbol: str = "", intervals: str = "5m,15m,4h"):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    health = market_candle_health(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+    )
+    msg = format_market_candle_health_message(health)
+    telegram = send_telegram_message(msg)
+
+    return {
+        "ok": bool(health.get("ok")) and bool(telegram.get("ok")),
+        "health": health,
+        "telegram": telegram,
+    }
+
+
+
+
+
+# =========================
+# Operator Candle Auto-Heal
+# =========================
+
+def market_candle_health_auto_heal(
+    symbols: Optional[List[str]] = None,
+    intervals: Optional[List[str]] = None,
+    limit: int = 800,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    before = market_candle_health(symbols=symbols, intervals=intervals)
+    bad_rows = [r for r in (before.get("rows") or []) if not r.get("ok")]
+
+    heal_symbols = sorted({str(r.get("symbol") or "").upper() for r in bad_rows if r.get("symbol")})
+    heal_intervals = sorted({str(r.get("interval") or "") for r in bad_rows if r.get("interval")})
+
+    if not bad_rows:
+        return {
+            "ok": True,
+            "action": "NOOP",
+            "reason": "candle_health_ok",
+            "before": before,
+            "bootstrap": None,
+            "after": before,
+            "timestamp_utc": utc_now_iso(),
+            "timestamp_wib": wib_now_iso(),
+        }
+
+    plan = {
+        "symbols": heal_symbols,
+        "intervals": heal_intervals,
+        "bad_count": len(bad_rows),
+        "bad_rows": bad_rows,
+        "limit": int(limit or 800),
+    }
+
+    if dry_run:
+        return {
+            "ok": False,
+            "action": "DRY_RUN",
+            "reason": "stale_or_missing_detected",
+            "plan": plan,
+            "before": before,
+            "bootstrap": None,
+            "after": before,
+            "timestamp_utc": utc_now_iso(),
+            "timestamp_wib": wib_now_iso(),
+        }
+
+    bootstrap = market_rest_bootstrap(heal_symbols, heal_intervals, limit=int(limit or 800))
+    after = market_candle_health(symbols=symbols, intervals=intervals)
+    repaired = bool(after.get("ok"))
+
+    return {
+        "ok": repaired,
+        "action": "BOOTSTRAP",
+        "reason": "auto_heal_completed" if repaired else "auto_heal_incomplete",
+        "plan": plan,
+        "before": before,
+        "bootstrap": bootstrap,
+        "after": after,
+        "timestamp_utc": utc_now_iso(),
+        "timestamp_wib": wib_now_iso(),
+    }
+
+
+def format_market_candle_auto_heal_message(res: Dict[str, Any]) -> str:
+    action = res.get("action")
+    before = res.get("before") or {}
+    after = res.get("after") or {}
+    plan = res.get("plan") or {}
+
+    lines = [
+        "🛠️ CANDLE AUTO-HEAL",
+        f"Action: {action}",
+        f"Result: {'OK' if res.get('ok') else 'WARN'}",
+        f"Time: {res.get('timestamp_wib')}",
+        "",
+        "Before:",
+        f"- status={before.get('status')}",
+        f"- coverage={before.get('coverage_pct')}%",
+        f"- stale={before.get('stale_count')}",
+        f"- missing={before.get('missing_count')}",
+        "",
+        "Plan:",
+        f"- symbols={','.join(plan.get('symbols') or []) or '-'}",
+        f"- intervals={','.join(plan.get('intervals') or []) or '-'}",
+        f"- bad_count={plan.get('bad_count', 0)}",
+        "",
+        "After:",
+        f"- status={after.get('status')}",
+        f"- coverage={after.get('coverage_pct')}%",
+        f"- stale={after.get('stale_count')}",
+        f"- missing={after.get('missing_count')}",
+    ]
+
+    bootstrap = res.get("bootstrap")
+    if isinstance(bootstrap, dict):
+        lines.extend([
+            "",
+            "Bootstrap:",
+            f"- ok={bootstrap.get('ok')}",
+            f"- rows_ingested={bootstrap.get('rows_ingested')}",
+            f"- failures={len(bootstrap.get('failures') or [])}",
+        ])
+
+    return "\n".join(lines)
+
+
+@app.post("/operator/candle-health/auto-heal")
+def operator_candle_health_auto_heal(
+    request: Request,
+    symbol: str = "",
+    intervals: str = "5m,15m,4h",
+    limit: int = 800,
+    dry_run: bool = False,
+):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    res = market_candle_health_auto_heal(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+        limit=limit,
+        dry_run=dry_run,
+    )
+    return res
+
+
+@app.post("/operator/candle-health/auto-heal/telegram")
+def operator_candle_health_auto_heal_telegram(
+    request: Request,
+    symbol: str = "",
+    intervals: str = "5m,15m,4h",
+    limit: int = 800,
+    dry_run: bool = False,
+):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    symbols = _parse_csv_list(symbol)
+    res = market_candle_health_auto_heal(
+        symbols=symbols or None,
+        intervals=_parse_csv_list(intervals) or ["5m", "15m", "4h"],
+        limit=limit,
+        dry_run=dry_run,
+    )
+    msg = format_market_candle_auto_heal_message(res)
+    telegram = send_telegram_message(msg)
+
+    return {
+        "ok": bool(res.get("ok")) and bool(telegram.get("ok")),
+        "auto_heal": res,
+        "telegram": telegram,
+    }
+
+
+
 @app.api_route("/operator/status", methods=["GET", "POST"])
 def operator_status(request: Request, payload: Optional[OperatorSymbolPayload] = None, symbol: str = ""):
     if not v010_auth_ok(request):
@@ -6881,3 +8927,1801 @@ def operator_daily_report(request: Request, payload: Optional[OperatorSymbolPayl
         report_status = "WARN"
         report = report.replace("Status: OK", "Status: WARN")
     return {"ok": True, "report": report, "telegram": telegram}
+
+
+
+# =========================
+# QUANT v0.1 SHADOW ENGINE
+# =========================
+
+QUANT_SIGNALS_LOG = LOG_DIR / "quant_signals.jsonl"
+QUANT_DIAGNOSTICS_LOG = LOG_DIR / "quant_diagnostics.jsonl"
+QUANT_STATE_FILE = STATE_DIR / "quant_state.json"
+
+class QuantRunOncePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    symbols: Optional[List[str]] = None
+    force: Optional[bool] = False
+
+def _quant_symbols_default() -> List[str]:
+    raw = str(os.getenv("QUANT_SYMBOLS") or "").strip()
+    if raw:
+        return [x.strip().upper() for x in raw.split(",") if x.strip()]
+    return list(quant_engine.DEFAULT_SYMBOLS)
+
+def _quant_cfg() -> Dict[str, Any]:
+    return {
+        "model_family": str(os.getenv("QUANT_MODEL_FAMILY", "RESIDUAL_STAT_ARB")),
+        "model_version": str(os.getenv("QUANT_MODEL_VERSION", "quant_v0.1")),
+        "mode": str(os.getenv("QUANT_MODE", "SHADOW_ONLY")),
+        "lookback_15m": env_int("QUANT_LOOKBACK_15M", 160),
+        "min_abs_z": env_float("QUANT_MIN_ABS_Z", 2.0),
+        "min_score": env_int("QUANT_MIN_SCORE_TELEGRAM", 75),
+        "sl_atr_mult": env_float("QUANT_SL_ATR_MULT", 1.20),
+        "max_atr_pct": env_float("QUANT_MAX_ATR_PCT", 0.05),
+        "fee_slip_est": env_float("QUANT_FEE_SLIP_EST", 0.0009),
+        "eval_tf": str(os.getenv("QUANT_EVAL_TF", "5m")),
+        "max_forward_bars": env_int("QUANT_MAX_FORWARD_BARS", 72),
+    }
+
+def _quant_load_candles(symbols: List[str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    required = sorted(set(list(symbols) + ["BTCUSDT", "ETHUSDT"]))
+    for sym in required:
+        out[sym] = {
+            "5m": market_load_candles(sym, "5m"),
+            "15m": market_load_candles(sym, "15m"),
+            "4h": market_load_candles(sym, "4h"),
+        }
+    return out
+
+def _quant_should_send(sig: Dict[str, Any], state: Dict[str, Any], force: bool = False) -> Tuple[bool, str]:
+    if force:
+        return True, "force"
+    now_ms = int(time.time() * 1000)
+    cooldown_min = env_int("QUANT_COOLDOWN_PAIR_MIN", 90)
+    max_daily = env_int("QUANT_MAX_TELEGRAM_PER_DAY", 10)
+    key = f"{sig.get('symbol')}|{sig.get('direction')}|{sig.get('model_version')}"
+    alerts = state.get("last_alert_ms")
+    if not isinstance(alerts, dict):
+        alerts = {}
+        state["last_alert_ms"] = alerts
+    last = int(alerts.get(key) or 0)
+    if last and now_ms - last < cooldown_min * 60 * 1000:
+        return False, "cooldown"
+
+    day = datetime.now(WIB).strftime("%Y-%m-%d")
+    day_counts = state.get("day_counts")
+    if not isinstance(day_counts, dict):
+        day_counts = {}
+        state["day_counts"] = day_counts
+    if int(day_counts.get(day) or 0) >= max_daily:
+        return False, "daily_limit"
+
+    return True, "ok"
+
+def _quant_mark_sent(sig: Dict[str, Any], state: Dict[str, Any]) -> None:
+    now_ms = int(time.time() * 1000)
+    key = f"{sig.get('symbol')}|{sig.get('direction')}|{sig.get('model_version')}"
+    state.setdefault("last_alert_ms", {})[key] = now_ms
+    day = datetime.now(WIB).strftime("%Y-%m-%d")
+    state.setdefault("day_counts", {})[day] = int(state.setdefault("day_counts", {}).get(day) or 0) + 1
+    state["updated_at_utc"] = utc_now_iso()
+
+@app.get("/quant/status")
+def quant_status(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    st = load_json_file(QUANT_STATE_FILE, {})
+    return {
+        "ok": True,
+        "enabled": env_bool("QUANT_ENGINE_ENABLED", False),
+        "mode": str(os.getenv("QUANT_MODE", "SHADOW_ONLY")),
+        "telegram_enabled": env_bool("QUANT_TELEGRAM_ENABLED", True),
+        "execution_enabled": env_bool("QUANT_EXECUTION_ENABLED", False),
+        "model_family": str(os.getenv("QUANT_MODEL_FAMILY", "RESIDUAL_STAT_ARB")),
+        "model_version": str(os.getenv("QUANT_MODEL_VERSION", "quant_v0.1")),
+        "min_score": env_int("QUANT_MIN_SCORE_TELEGRAM", 75),
+        "min_abs_z": env_float("QUANT_MIN_ABS_Z", 2.0),
+        "symbols": _quant_symbols_default(),
+        "state": st,
+    }
+
+@app.get("/quant/latest")
+def quant_latest(
+    limit: int = 20,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+    rows = _read_jsonl(QUANT_SIGNALS_LOG)
+    return {"ok": True, "rows": rows[-max(1, min(limit, 200)):]}
+
+@app.post("/quant/run-once")
+def quant_run_once(
+    payload: Optional[QuantRunOncePayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    if not env_bool("QUANT_ENGINE_ENABLED", False):
+        return {"ok": True, "skipped": True, "reason": "quant_engine_disabled"}
+
+    if env_bool("QUANT_EXECUTION_ENABLED", False):
+        return {"ok": False, "error": "QUANT_EXECUTION_ENABLED_MUST_STAY_FALSE_FOR_V0_1"}
+
+    req = payload.model_dump(mode="json") if payload else {}
+    symbols = [str(x).upper().strip() for x in (req.get("symbols") or _quant_symbols_default()) if str(x).strip()]
+    force = bool(req.get("force") is True)
+
+    cfg = _quant_cfg()
+    candles = _quant_load_candles(symbols)
+    result = quant_engine.run_once(candles, symbols, cfg)
+
+    append_jsonl(QUANT_DIAGNOSTICS_LOG, {
+        "created_at_utc": utc_now_iso(),
+        "created_at_wib": wib_now_iso(),
+        "result_summary": {
+            "confirmed_count": result.get("confirmed_count"),
+            "total_symbols": result.get("total_symbols"),
+            "model_version": result.get("model_version"),
+        },
+        "diagnostics": result.get("diagnostics", []),
+    })
+
+    state = load_json_file(QUANT_STATE_FILE, {})
+    sent = []
+    skipped = []
+
+    for sig in result.get("signals", []):
+        can_send, reason = _quant_should_send(sig, state, force=force)
+        if not can_send:
+            skipped.append({"signal_key": sig.get("signal_key"), "reason": reason})
+            continue
+
+        append_jsonl(QUANT_SIGNALS_LOG, sig)
+
+        dataset_row = quant_engine.to_dataset_row(sig)
+        append_jsonl(ML_DATASET_ROWS_LOG, dataset_row)
+
+        outcome_eval = None
+        if env_bool("QUANT_OUTCOME_EVALUATE_AFTER_SIGNAL", True):
+            try:
+                outcome_eval = evaluate_forward_outcomes(limit=env_int("QUANT_OUTCOME_EVAL_LIMIT", 50), force=False)
+            except Exception as e:
+                outcome_eval = {"ok": False, "error": str(e)}
+
+        telegram = {"ok": True, "sent": False, "skipped": True, "reason": "quant_telegram_disabled"}
+        if env_bool("QUANT_TELEGRAM_ENABLED", True):
+            telegram = send_telegram_message(quant_engine.format_telegram(sig))
+
+        _quant_mark_sent(sig, state)
+
+        sent.append({
+            "signal_key": sig.get("signal_key"),
+            "symbol": sig.get("symbol"),
+            "direction": sig.get("direction"),
+            "score": sig.get("score"),
+            "telegram": telegram,
+            "outcome_eval": outcome_eval,
+        })
+
+    save_json_file(QUANT_STATE_FILE, state)
+
+    return {
+        "ok": True,
+        "mode": cfg.get("mode"),
+        "execution_enabled": False,
+        "confirmed_count": result.get("confirmed_count"),
+        "sent_count": len(sent),
+        "skipped_count": len(skipped),
+        "sent": sent,
+        "skipped": skipped,
+        "diagnostic_summary": {
+            "total_symbols": result.get("total_symbols"),
+            "confirmed_count": result.get("confirmed_count"),
+            "by_status": {
+                k: sum(1 for d in result.get("diagnostics", []) if d.get("status") == k)
+                for k in sorted(set(d.get("status") for d in result.get("diagnostics", [])))
+            },
+        },
+    }
+
+
+# ============================================================
+# LATENCY AUDIT PATCH v0.1
+# Non-invasive: logs Binance signed request latency + Telegram latency.
+# Does not change signal/entry/TP/SL logic.
+# ============================================================
+try:
+    import os as _lat_os
+    import json as _lat_json
+    import time as _lat_time
+    from pathlib import Path as _LatPath
+    from datetime import datetime as _lat_datetime, timezone as _lat_timezone, timedelta as _lat_timedelta
+
+    _LAT_WIB = _lat_timezone(_lat_timedelta(hours=7))
+    _LAT_ROOT = _LatPath("/app") if _LatPath("/app").exists() else _LatPath(".")
+    _LAT_LOG = _LAT_ROOT / "logs" / "latency_audit.jsonl"
+
+    def _lat_now_ms_():
+        return int(_lat_time.time() * 1000)
+
+    def _lat_now_wib_():
+        return _lat_datetime.now(_LAT_WIB).isoformat(timespec="milliseconds")
+
+    def _lat_enabled_():
+        return str(_lat_os.getenv("LATENCY_AUDIT_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+
+    def _lat_safe_json_(x):
+        try:
+            _lat_json.dumps(x)
+            return x
+        except Exception:
+            return str(x)
+
+    def _lat_append_(row):
+        if not _lat_enabled_():
+            return
+        try:
+            _LAT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            row = dict(row or {})
+            row.setdefault("event_at_wib", _lat_now_wib_())
+            with _LAT_LOG.open("a", encoding="utf-8") as f:
+                f.write(_lat_json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        except Exception as e:
+            try:
+                print(f"[latency_audit] append failed: {e}")
+            except Exception:
+                pass
+
+    if "live_signed_request" in globals() and not globals().get("_LATENCY_AUDIT_LIVE_SIGNED_PATCHED"):
+        _LATENCY_AUDIT_ORIG_LIVE_SIGNED_REQUEST = live_signed_request
+
+        def live_signed_request(method, path, params=None, *args, **kwargs):
+            _t0 = _lat_time.perf_counter()
+            _ms0 = _lat_now_ms_()
+            _err = None
+            _res = None
+            try:
+                _res = _LATENCY_AUDIT_ORIG_LIVE_SIGNED_REQUEST(method, path, params, *args, **kwargs)
+                return _res
+            except Exception as e:
+                _err = e
+                raise
+            finally:
+                try:
+                    _dt = int((_lat_time.perf_counter() - _t0) * 1000)
+                    _params = params if isinstance(params, dict) else {}
+                    _body = _res.get("body") if isinstance(_res, dict) else None
+                    _row = {
+                        "kind": "BINANCE_SIGNED_REQUEST",
+                        "started_ms": _ms0,
+                        "duration_ms": _dt,
+                        "method": str(method),
+                        "path": str(path),
+                        "symbol": str(_params.get("symbol") or ""),
+                        "side": str(_params.get("side") or ""),
+                        "type": str(_params.get("type") or _params.get("algoType") or ""),
+                        "client_order_id": str(_params.get("newClientOrderId") or _params.get("clientOrderId") or _params.get("clientAlgoId") or ""),
+                        "has_error": bool(_err),
+                        "error": str(_err)[:500] if _err else "",
+                    }
+
+                    if isinstance(_res, dict):
+                        _row["res_ok"] = _res.get("ok")
+                        _row["http_code"] = _res.get("httpCode") or _res.get("status_code") or _res.get("code")
+
+                    if isinstance(_body, dict):
+                        _row["binance_code"] = _body.get("code")
+                        _row["binance_msg"] = str(_body.get("msg") or "")[:300]
+                        _row["order_id"] = _body.get("orderId") or _body.get("algoId")
+                        _row["status"] = _body.get("status")
+                    elif isinstance(_body, list):
+                        _row["body_len"] = len(_body)
+
+                    # Fokus endpoint yang penting buat latency eksekusi
+                    if str(path) in (
+                        "/fapi/v1/order",
+                        "/fapi/v1/algoOrder",
+                        "/fapi/v1/openOrders",
+                        "/fapi/v1/positionRisk",
+                        "/fapi/v1/ticker/price",
+                    ):
+                        _lat_append_(_row)
+                except Exception as e:
+                    try:
+                        print(f"[latency_audit] live_signed wrapper log failed: {e}")
+                    except Exception:
+                        pass
+
+        globals()["_LATENCY_AUDIT_LIVE_SIGNED_PATCHED"] = True
+        print("[latency_audit] live_signed_request patched")
+
+    if "send_telegram_message" in globals() and not globals().get("_LATENCY_AUDIT_TELEGRAM_PATCHED"):
+        _LATENCY_AUDIT_ORIG_SEND_TELEGRAM_MESSAGE = send_telegram_message
+
+        def send_telegram_message(text, *args, **kwargs):
+            _t0 = _lat_time.perf_counter()
+            _ms0 = _lat_now_ms_()
+            _err = None
+            _res = None
+            try:
+                _res = _LATENCY_AUDIT_ORIG_SEND_TELEGRAM_MESSAGE(text, *args, **kwargs)
+                return _res
+            except Exception as e:
+                _err = e
+                raise
+            finally:
+                try:
+                    _lat_append_({
+                        "kind": "TELEGRAM_SEND",
+                        "started_ms": _ms0,
+                        "duration_ms": int((_lat_time.perf_counter() - _t0) * 1000),
+                        "text_len": len(str(text or "")),
+                        "has_error": bool(_err),
+                        "error": str(_err)[:500] if _err else "",
+                        "res": _lat_safe_json_(_res),
+                    })
+                except Exception as e:
+                    try:
+                        print(f"[latency_audit] telegram wrapper log failed: {e}")
+                    except Exception:
+                        pass
+
+        globals()["_LATENCY_AUDIT_TELEGRAM_PATCHED"] = True
+        print("[latency_audit] send_telegram_message patched")
+
+except Exception as _lat_patch_e:
+    try:
+        print(f"[latency_audit] patch init failed: {_lat_patch_e}")
+    except Exception:
+        pass
+
+
+
+# === NIGHT_ACCURACY_FIX_V20260611 ===
+# Fix:
+# 1) Old/stale VPS_SMC bridge plan is never executed as-is.
+# 2) If stale/opportunity missed -> quick candle refresh -> recompute SMC -> execute only fresh plan if still valid.
+# 3) Pre-entry live price guard before pipeline execution.
+# 4) Does NOT rebase/adjust plan levels.
+_NIGHT_REFRESH_INFLIGHT = set()
+
+def _night_bool(name, default=False):
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return bool(default)
+
+def _night_float(name, default):
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        return float(str(raw).strip())
+    except Exception:
+        return float(default)
+
+def _night_int(name, default):
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+def _night_dec(x):
+    try:
+        if x is None or str(x).strip() == "":
+            return None
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+def _night_symbol(p):
+    return v010_normalize_symbol((p or {}).get("symbol") or (p or {}).get("pair") or "")
+
+def _night_now_ms():
+    return int(time.time() * 1000)
+
+def _night_age_sec(ms):
+    try:
+        if ms is None or str(ms).strip() == "":
+            return None
+        return max(0.0, (_night_now_ms() - float(ms)) / 1000.0)
+    except Exception:
+        return None
+
+def _night_latest_closed_age(symbol, interval):
+    try:
+        rows = market_load_candles(symbol, interval)
+        if not rows:
+            return {"ok": False, "reason": "NO_CANDLES", "symbol": symbol, "interval": interval}
+        latest = sorted(rows, key=lambda r: int(r.get("close_time_ms") or r.get("open_time_ms") or 0))[-1]
+        close_ms = int(latest.get("close_time_ms") or 0)
+        age = _night_age_sec(close_ms)
+        return {
+            "ok": close_ms > 0 and age is not None,
+            "symbol": symbol,
+            "interval": interval,
+            "close_time_ms": close_ms,
+            "age_sec": age,
+            "close": latest.get("close"),
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"latest_age_error:{e}", "symbol": symbol, "interval": interval}
+
+def _night_live_price(symbol):
+    try:
+        import urllib.parse as _night_urlparse
+        url = "https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + _night_urlparse.quote(symbol)
+        data = http_get_json(url)
+        px = _night_dec((data or {}).get("price") if isinstance(data, dict) else None)
+        if px is None:
+            return {"ok": False, "reason": "live_price_missing", "raw": data}
+        return {"ok": True, "symbol": symbol, "price": str(px)}
+    except Exception as e:
+        return {"ok": False, "reason": f"live_price_error:{e}"}
+
+def _night_payload_direction(p):
+    raw = str(
+        (p or {}).get("direction")
+        or (p or {}).get("dir")
+        or ((p or {}).get("stageb_confirmation") or {}).get("stageb_direction")
+        or ""
+    ).upper()
+    if raw.startswith("LONG") or raw == "BUY":
+        return "LONG"
+    if raw.startswith("SHORT") or raw == "SELL":
+        return "SHORT"
+    return raw or "UNKNOWN"
+
+def _night_pick_num(p, *keys):
+    for k in keys:
+        d = _night_dec((p or {}).get(k))
+        if d is not None and d > 0:
+            return d
+    payload = (p or {}).get("payload") if isinstance((p or {}).get("payload"), dict) else {}
+    for k in keys:
+        d = _night_dec(payload.get(k))
+        if d is not None and d > 0:
+            return d
+    return None
+
+def _night_guard_payload(p):
+    symbol = _night_symbol(p)
+    direction = _night_payload_direction(p)
+
+    guard = {
+        "ok": True,
+        "action": "PASS",
+        "reason": "fresh_and_executable",
+        "symbol": symbol,
+        "direction": direction,
+        "checked_at_utc": utc_now_iso(),
+    }
+
+    if not symbol:
+        guard.update({"ok": False, "action": "NO_TRADE", "reason": "MISSING_SYMBOL"})
+        return guard
+
+    # Freshness check from local candle store.
+    stageb_5m = _night_latest_closed_age(symbol, "5m")
+    entry_15m = _night_latest_closed_age(symbol, "15m")
+    htf_4h = _night_latest_closed_age(symbol, "4h")
+
+    guard["freshness"] = {
+        "stageb_5m": stageb_5m,
+        "entry_15m": entry_15m,
+        "htf_4h": htf_4h,
+        "max_stageb_5m_sec": _night_int("VPS_SMC_STAGEB_5M_MAX_AGE_SEC", 420),
+        "max_entry_15m_sec": _night_int("VPS_SMC_ENTRY_15M_MAX_AGE_SEC", 1080),
+        "max_htf_4h_sec": _night_int("VPS_SMC_HTF_4H_MAX_AGE_SEC", 15600),
+    }
+
+    def _refresh(reason):
+        guard.update({"ok": False, "action": "REFRESH_RECOMPUTE", "reason": reason})
+        return guard
+
+    if not stageb_5m.get("ok"):
+        return _refresh("STALE_PLAN_STAGEB_5M_NOT_AVAILABLE")
+    if not entry_15m.get("ok"):
+        return _refresh("STALE_PLAN_ENTRY_15M_NOT_AVAILABLE")
+    if not htf_4h.get("ok"):
+        return _refresh("STALE_PLAN_HTF_4H_NOT_AVAILABLE")
+
+    if float(stageb_5m.get("age_sec") or 999999) > _night_int("VPS_SMC_STAGEB_5M_MAX_AGE_SEC", 420):
+        return _refresh("STALE_PLAN_STAGEB_5M_TOO_OLD")
+    if float(entry_15m.get("age_sec") or 999999) > _night_int("VPS_SMC_ENTRY_15M_MAX_AGE_SEC", 1080):
+        return _refresh("STALE_PLAN_ENTRY_15M_TOO_OLD")
+    if float(htf_4h.get("age_sec") or 999999) > _night_int("VPS_SMC_HTF_4H_MAX_AGE_SEC", 15600):
+        return _refresh("STALE_PLAN_HTF_4H_TOO_OLD")
+
+    # Pre-entry live price accuracy guard.
+    if not _night_bool("PRE_ENTRY_PLAN_GUARD_ENABLED", True):
+        guard["pre_entry"] = {"ok": True, "reason": "disabled"}
+        return guard
+
+    tp1 = _night_pick_num(p, "tp1", "raw_tp1")
+    sl = _night_pick_num(p, "sl", "invalid")
+    entry_mid = _night_pick_num(p, "entry_mid", "entry", "entry_price")
+
+    if tp1 is None or sl is None:
+        guard.update({"ok": False, "action": "NO_TRADE", "reason": "PRE_ENTRY_MISSING_TP1_OR_SL"})
+        guard["pre_entry"] = {"tp1": str(tp1), "sl": str(sl)}
+        return guard
+
+    live = _night_live_price(symbol)
+    guard["pre_entry"] = {"live_price_result": live, "tp1": str(tp1), "sl": str(sl), "entry_mid": str(entry_mid) if entry_mid is not None else None}
+
+    if not live.get("ok"):
+        return _refresh("PRE_ENTRY_LIVE_PRICE_UNAVAILABLE")
+
+    live_price = _night_dec(live.get("price"))
+    if live_price is None:
+        return _refresh("PRE_ENTRY_LIVE_PRICE_BAD")
+
+    min_rr = Decimal(str(_night_float("MIN_ENTRY_RR_TO_TP1", 0.70)))
+    max_adverse_pct = Decimal(str(_night_float("MAX_ENTRY_ADVERSE_SLIPPAGE_PCT", 0.30)))
+
+    if direction == "LONG":
+        if _night_bool("REJECT_IF_TP1_TOUCHED_BEFORE_ENTRY", True) and live_price >= tp1:
+            return _refresh("TP1_ALREADY_TOUCHED_BEFORE_ENTRY_REFRESH_RECOMPUTE")
+        if _night_bool("REJECT_IF_SL_TOUCHED_BEFORE_ENTRY", True) and live_price <= sl:
+            guard.update({"ok": False, "action": "NO_TRADE", "reason": "SL_ALREADY_TOUCHED_BEFORE_ENTRY_INVALID"})
+            return guard
+
+        risk = live_price - sl
+        reward = tp1 - live_price
+        if risk <= 0 or reward <= 0:
+            return _refresh("PRE_ENTRY_INVALID_LIVE_RR_GEOMETRY")
+
+        rr = reward / risk
+        guard["pre_entry"]["rr_to_tp1"] = str(rr)
+        if rr < min_rr:
+            return _refresh("LIVE_RR_TOO_LOW_REFRESH_RECOMPUTE")
+
+        if entry_mid is not None and live_price > entry_mid:
+            adverse_pct = ((live_price - entry_mid) / entry_mid) * Decimal("100")
+            guard["pre_entry"]["adverse_pct"] = str(adverse_pct)
+            if adverse_pct > max_adverse_pct:
+                return _refresh("ENTRY_TOO_FAR_FROM_PLAN_REFRESH_RECOMPUTE")
+
+    elif direction == "SHORT":
+        if _night_bool("REJECT_IF_TP1_TOUCHED_BEFORE_ENTRY", True) and live_price <= tp1:
+            return _refresh("TP1_ALREADY_TOUCHED_BEFORE_ENTRY_REFRESH_RECOMPUTE")
+        if _night_bool("REJECT_IF_SL_TOUCHED_BEFORE_ENTRY", True) and live_price >= sl:
+            guard.update({"ok": False, "action": "NO_TRADE", "reason": "SL_ALREADY_TOUCHED_BEFORE_ENTRY_INVALID"})
+            return guard
+
+        risk = sl - live_price
+        reward = live_price - tp1
+        if risk <= 0 or reward <= 0:
+            return _refresh("PRE_ENTRY_INVALID_LIVE_RR_GEOMETRY")
+
+        rr = reward / risk
+        guard["pre_entry"]["rr_to_tp1"] = str(rr)
+        if rr < min_rr:
+            return _refresh("LIVE_RR_TOO_LOW_REFRESH_RECOMPUTE")
+
+        if entry_mid is not None and live_price < entry_mid:
+            adverse_pct = ((entry_mid - live_price) / entry_mid) * Decimal("100")
+            guard["pre_entry"]["adverse_pct"] = str(adverse_pct)
+            if adverse_pct > max_adverse_pct:
+                return _refresh("ENTRY_TOO_FAR_FROM_PLAN_REFRESH_RECOMPUTE")
+
+    else:
+        guard.update({"ok": False, "action": "NO_TRADE", "reason": "PRE_ENTRY_UNKNOWN_DIRECTION"})
+        return guard
+
+    return guard
+
+def _night_append_event(row):
+    try:
+        row = dict(row or {})
+        row["created_at_utc"] = utc_now_iso()
+        append_jsonl(LOG_DIR / "night_accuracy_fix_events.jsonl", row)
+    except Exception:
+        pass
+
+def _night_refresh_recompute(old_payload, reason, guard):
+    symbol = _night_symbol(old_payload)
+    if not symbol:
+        return {"ok": False, "decision": "NO_TRADE", "reason": "refresh_recompute_missing_symbol", "guard": guard}
+
+    if symbol in _NIGHT_REFRESH_INFLIGHT:
+        _night_append_event({
+            "event_type": "NIGHT_REFRESH_RECOMPUTE_BLOCKED_INFLIGHT",
+            "symbol": symbol,
+            "reason": reason,
+            "old_signal_key": (old_payload or {}).get("signal_key"),
+            "guard": guard,
+        })
+        return {
+            "ok": False,
+            "decision": "NO_TRADE",
+            "reason": "FRESH_RECOMPUTE_STILL_BLOCKED",
+            "symbol": symbol,
+            "guard": guard,
+        }
+
+    _NIGHT_REFRESH_INFLIGHT.add(symbol)
+    try:
+        sync_res = None
+        try:
+            sync_res = market_rest_bootstrap([symbol], market_intervals(), limit=_night_int("VPS_SMC_REFRESH_BOOTSTRAP_LIMIT", 20))
+        except Exception as e:
+            sync_res = {"ok": False, "reason": f"quick_sync_error:{e}"}
+
+        old_dedup = os.environ.get("VPS_SMC_DEDUP_ENABLED")
+        os.environ["VPS_SMC_DEDUP_ENABLED"] = "false"
+        try:
+            fresh_run = vps_smc.vps_smc_run_once([symbol])
+        finally:
+            if old_dedup is None:
+                try:
+                    del os.environ["VPS_SMC_DEDUP_ENABLED"]
+                except Exception:
+                    pass
+            else:
+                os.environ["VPS_SMC_DEDUP_ENABLED"] = old_dedup
+
+        out = {
+            "ok": True,
+            "decision": "REFRESH_RECOMPUTE_DONE",
+            "reason": reason,
+            "symbol": symbol,
+            "old_signal_key": (old_payload or {}).get("signal_key"),
+            "quick_sync": sync_res,
+            "fresh_run_summary": {
+                "ok": fresh_run.get("ok") if isinstance(fresh_run, dict) else None,
+                "signal_count": fresh_run.get("signal_count") if isinstance(fresh_run, dict) else None,
+                "summary": fresh_run.get("summary") if isinstance(fresh_run, dict) else None,
+            },
+            "guard": guard,
+        }
+        _night_append_event({"event_type": "NIGHT_REFRESH_RECOMPUTE_DONE", **out})
+        return out
+    finally:
+        try:
+            _NIGHT_REFRESH_INFLIGHT.remove(symbol)
+        except Exception:
+            pass
+
+try:
+    _NIGHT_ORIGINAL_VPS_EXECUTION_BRIDGE = _vps_execution_bridge
+
+    def _night_guarded_vps_execution_bridge(payload):
+        p = dict(payload or {})
+        if not _night_bool("NIGHT_ACCURACY_GUARD_ENABLED", True):
+            return _NIGHT_ORIGINAL_VPS_EXECUTION_BRIDGE(p)
+
+        p["night_accuracy_patch"] = {
+            "enabled": True,
+            "version": "V20260611",
+            "checked_at_utc": utc_now_iso(),
+        }
+
+        guard = _night_guard_payload(p)
+        p["night_accuracy_guard"] = guard
+
+        if guard.get("action") == "PASS":
+            _night_append_event({
+                "event_type": "NIGHT_GUARD_PASS",
+                "symbol": _night_symbol(p),
+                "signal_key": p.get("signal_key"),
+                "guard": guard,
+            })
+            return _NIGHT_ORIGINAL_VPS_EXECUTION_BRIDGE(p)
+
+        if guard.get("action") == "REFRESH_RECOMPUTE" and _night_bool("STALE_PLAN_REFRESH_ENABLED", True):
+            _night_append_event({
+                "event_type": "NIGHT_OLD_PLAN_DISCARDED_REFRESH_RECOMPUTE",
+                "symbol": _night_symbol(p),
+                "signal_key": p.get("signal_key"),
+                "reason": guard.get("reason"),
+                "guard": guard,
+            })
+            return _night_refresh_recompute(p, guard.get("reason"), guard)
+
+        _night_append_event({
+            "event_type": "NIGHT_GUARD_NO_TRADE",
+            "symbol": _night_symbol(p),
+            "signal_key": p.get("signal_key"),
+            "reason": guard.get("reason"),
+            "guard": guard,
+        })
+        return {
+            "ok": False,
+            "decision": "NO_TRADE",
+            "reason": guard.get("reason"),
+            "guard": guard,
+            "symbol": _night_symbol(p),
+            "signal_key": p.get("signal_key"),
+        }
+
+    vps_smc.register_execution_bridge_handler(_night_guarded_vps_execution_bridge)
+    print("[night_accuracy_fix] guarded VPS execution bridge registered")
+except Exception as _night_exc:
+    print(f"[night_accuracy_fix] failed to register guarded bridge: {_night_exc}")
+# === END_NIGHT_ACCURACY_FIX_V20260611 ===
+
+
+
+# === HARD_PRE_ENTRY_GUARD_V20260613 ===
+# Hard layer on top of NIGHT_ACCURACY_FIX:
+# - Enforce final live RR/adverse threshold from env.
+# - Does not rebase SL/TP.
+# - Does not create order.
+# - If final check fails, plan must refresh/recompute instead of executing as-is.
+try:
+    import os as _hpeg_os
+    from decimal import Decimal as _hpeg_Decimal
+
+    def _hpeg_bool(name, default=True):
+        try:
+            raw = _hpeg_os.getenv(name)
+            if raw is None:
+                return bool(default)
+            return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return bool(default)
+
+    def _hpeg_dec(x, default=None):
+        try:
+            if x is None or str(x).strip() == "":
+                return default
+            return _hpeg_Decimal(str(x))
+        except Exception:
+            return default
+
+    def _hpeg_float_env(name, default):
+        try:
+            raw = _hpeg_os.getenv(name)
+            if raw is None or str(raw).strip() == "":
+                return _hpeg_Decimal(str(default))
+            return _hpeg_Decimal(str(raw).strip())
+        except Exception:
+            return _hpeg_Decimal(str(default))
+
+    def _hpeg_block(guard, reason):
+        g = dict(guard or {})
+        g.update({
+            "ok": False,
+            "action": str(_hpeg_os.getenv("PRE_ENTRY_GUARD_ACTION", "REFRESH_RECOMPUTE")),
+            "reason": reason,
+            "hard_pre_entry_guard": True,
+        })
+        try:
+            if "_night_append_event" in globals():
+                _night_append_event({
+                    "event_type": "PRE_ENTRY_HARD_GUARD_BLOCK",
+                    "reason": reason,
+                    "symbol": g.get("symbol"),
+                    "direction": g.get("direction"),
+                    "pre_entry": g.get("pre_entry"),
+                    "guard": g,
+                })
+        except Exception:
+            pass
+        return g
+
+    if "_night_guard_payload" in globals() and not globals().get("_HARD_PRE_ENTRY_GUARD_PATCHED"):
+        _HARD_PRE_ENTRY_ORIG_GUARD_PAYLOAD = _night_guard_payload
+
+        def _night_guard_payload(p):
+            g = _HARD_PRE_ENTRY_ORIG_GUARD_PAYLOAD(p)
+
+            if not _hpeg_bool("PRE_ENTRY_HARD_GUARD_ENABLED", True):
+                return g
+
+            if not isinstance(g, dict):
+                return g
+
+            # Kalau base guard sudah reject/recompute, jangan override.
+            if not bool(g.get("ok")):
+                try:
+                    g["hard_pre_entry_guard_checked"] = True
+                    g["hard_pre_entry_guard_base_failed"] = True
+                except Exception:
+                    pass
+                return g
+
+            pre = g.get("pre_entry") if isinstance(g.get("pre_entry"), dict) else {}
+
+            min_rr = _hpeg_float_env("MIN_ENTRY_RR_TO_TP1", "0.75")
+            max_adv = _hpeg_float_env("MAX_ENTRY_ADVERSE_SLIPPAGE_PCT", "0.25")
+
+            rr = _hpeg_dec(pre.get("rr_to_tp1"))
+            adv = _hpeg_dec(pre.get("adverse_pct"), _hpeg_Decimal("0"))
+
+            try:
+                pre["hard_min_rr"] = str(min_rr)
+                pre["hard_max_adverse_pct"] = str(max_adv)
+                pre["hard_rr_to_tp1"] = str(rr) if rr is not None else None
+                pre["hard_adverse_pct"] = str(adv) if adv is not None else None
+                g["pre_entry"] = pre
+                g["hard_pre_entry_guard_checked"] = True
+            except Exception:
+                pass
+
+            # Missing RR = unsafe. Jangan execute market tanpa geometry final.
+            if rr is None:
+                return _hpeg_block(g, "HARD_PRE_ENTRY_MISSING_RR_NO_EXECUTE")
+
+            if rr < min_rr:
+                return _hpeg_block(g, "HARD_LIVE_RR_TOO_LOW_REFRESH_RECOMPUTE")
+
+            if adv is not None and adv > max_adv:
+                return _hpeg_block(g, "HARD_ENTRY_TOO_FAR_FROM_PLAN_REFRESH_RECOMPUTE")
+
+            return g
+
+        globals()["_HARD_PRE_ENTRY_GUARD_PATCHED"] = True
+        print("[hard_pre_entry_guard] patched")
+
+except Exception as _hpeg_e:
+    try:
+        print(f"[hard_pre_entry_guard] patch init failed: {_hpeg_e}")
+    except Exception:
+        pass
+
+
+
+# === ML_GATE_SCORECARD_V20260613 ===
+# ML Gate v0:
+# - Learns from logs/ml_dataset_rows.jsonl + logs/forward_outcomes.jsonl
+# - Predicts probability that TP1 hits before SL
+# - Blocks execution if p_win_adj < ML_GATE_MIN_P_WIN
+# - Hooked after freshness/pre-entry/hard guard by wrapping _night_guard_payload
+try:
+    import os as _mlg_os
+    import json as _mlg_json
+    import math as _mlg_math
+    import time as _mlg_time
+    from pathlib import Path as _mlg_Path
+    from datetime import datetime as _mlg_datetime, timezone as _mlg_timezone, timedelta as _mlg_timedelta
+    from collections import defaultdict as _mlg_defaultdict
+
+    _MLG_WIB = _mlg_timedelta(hours=7)
+    _MLG_CACHE = {
+        "loaded_at": 0,
+        "model": None,
+    }
+
+    def _mlg_bool(name, default=False):
+        try:
+            raw = _mlg_os.getenv(name)
+            if raw is None:
+                return bool(default)
+            return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return bool(default)
+
+    def _mlg_float_env(name, default):
+        try:
+            raw = _mlg_os.getenv(name)
+            if raw is None or str(raw).strip() == "":
+                return float(default)
+            return float(str(raw).strip())
+        except Exception:
+            return float(default)
+
+    def _mlg_int_env(name, default):
+        try:
+            raw = _mlg_os.getenv(name)
+            if raw is None or str(raw).strip() == "":
+                return int(default)
+            return int(str(raw).strip())
+        except Exception:
+            return int(default)
+
+    def _mlg_safe_float(x):
+        try:
+            if x is None or str(x).strip() == "":
+                return None
+            v = float(str(x))
+            return v if _mlg_math.isfinite(v) else None
+        except Exception:
+            return None
+
+    def _mlg_path(global_name, fallback):
+        try:
+            g = globals().get(global_name)
+            if g is not None:
+                return _mlg_Path(g)
+        except Exception:
+            pass
+        return _mlg_Path(fallback)
+
+    def _mlg_read_jsonl(path):
+        out = []
+        try:
+            path = _mlg_Path(path)
+            if not path.exists():
+                return out
+            with path.open(errors="ignore") as f:
+                for line in f:
+                    try:
+                        out.append(_mlg_json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            return out
+        return out
+
+    def _mlg_signal_key(row):
+        return str((row or {}).get("signal_key") or (row or {}).get("signal_id") or "")
+
+    def _mlg_norm_symbol(x):
+        try:
+            if "v010_normalize_symbol" in globals():
+                return v010_normalize_symbol(x)
+        except Exception:
+            pass
+        return str(x or "").upper().replace("BINANCE:", "").replace(".P", "")
+
+    def _mlg_direction(row):
+        d = str((row or {}).get("direction") or (row or {}).get("dir") or "").strip().upper()
+        if d in ("LONG", "BUY"):
+            return "LONG"
+        if d in ("SHORT", "SELL"):
+            return "SHORT"
+        return d or "UNK"
+
+    def _mlg_parse_time_wib(s):
+        if not s:
+            return None
+        ss = str(s).replace(" WIB", "").replace("T", " ").split("+")[0]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                return _mlg_datetime.strptime(ss[:26], fmt).replace(tzinfo=_mlg_timezone(_MLG_WIB))
+            except Exception:
+                pass
+        return None
+
+    def _mlg_hour(row):
+        for k in ("signal_time_wib", "confirmed_ts_wib", "run_ts_wib", "event_time_wib", "created_at_wib"):
+            dt = _mlg_parse_time_wib((row or {}).get(k))
+            if dt:
+                return int(dt.hour)
+        try:
+            key = _mlg_signal_key(row)
+            ms = int(key.split("|")[-1])
+            dt = _mlg_datetime.fromtimestamp(ms / 1000.0, _mlg_timezone.utc).astimezone(_mlg_timezone(_MLG_WIB))
+            return int(dt.hour)
+        except Exception:
+            return None
+
+    def _mlg_session(h):
+        if h is None:
+            return "UNK"
+        if 0 <= h < 7:
+            return "ASIA_EARLY"
+        if 7 <= h < 13:
+            return "ASIA_DAY"
+        if 13 <= h < 19:
+            return "LONDON"
+        return "NY_LATE"
+
+    def _mlg_bin_num(v, bins):
+        x = _mlg_safe_float(v)
+        if x is None:
+            return "NA"
+        for name, lo, hi in bins:
+            if lo <= x < hi:
+                return name
+        return bins[-1][0] if bins else "NA"
+
+    def _mlg_pick(row, *keys):
+        row = row or {}
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        plan = row.get("plan") if isinstance(row.get("plan"), dict) else {}
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        htf = row.get("htf") if isinstance(row.get("htf"), dict) else {}
+        liq = row.get("liq") if isinstance(row.get("liq"), dict) else {}
+        for k in keys:
+            for obj in (row, payload, plan, meta, htf, liq):
+                try:
+                    if k in obj and obj.get(k) not in (None, ""):
+                        return obj.get(k)
+                except Exception:
+                    pass
+        return None
+
+    def _mlg_features(row):
+        h = _mlg_hour(row)
+        symbol = _mlg_norm_symbol(_mlg_pick(row, "symbol", "pair"))
+        direction = _mlg_direction(row)
+
+        score = _mlg_pick(row, "score", "score_total", "priority_score", "smc_score")
+        rr = _mlg_pick(row, "rr", "rr_tp1", "rr_to_tp1", "rrTp2", "rr_min")
+        entry_dist = _mlg_pick(row, "entryDistPct", "entry_dist_pct", "entry_dist_from_price_pct", "distToZonePct")
+        htf_loc = _mlg_pick(row, "htfLoc", "htf_location", "location")
+        htf_bias = _mlg_pick(row, "htfBias", "htf_bias", "bias")
+        liq_ctx = _mlg_pick(row, "liqCtx", "liq_ctx", "ctx")
+        mode = _mlg_pick(row, "mode", "state", "status")
+
+        return {
+            "symbol": symbol or "UNK",
+            "direction": direction or "UNK",
+            "hour": str(h) if h is not None else "UNK",
+            "session": _mlg_session(h),
+            "score_bin": _mlg_bin_num(score, [
+                ("score<60", -999, 60),
+                ("60-67", 60, 68),
+                ("68-69", 68, 70),
+                ("70-74", 70, 75),
+                ("75-79", 75, 80),
+                ("80+", 80, 999),
+            ]),
+            "rr_bin": _mlg_bin_num(rr, [
+                ("rr<0.7", -999, 0.7),
+                ("0.7-0.9", 0.7, 0.9),
+                ("0.9-1.2", 0.9, 1.2),
+                ("1.2-1.8", 1.2, 1.8),
+                ("1.8+", 1.8, 999),
+            ]),
+            "entry_dist_bin": _mlg_bin_num(entry_dist, [
+                ("dist<0.15", -999, 0.15),
+                ("0.15-0.35", 0.15, 0.35),
+                ("0.35-0.60", 0.35, 0.60),
+                ("0.60-1.00", 0.60, 1.00),
+                ("1.00+", 1.00, 999),
+            ]),
+            "htf_loc": str(htf_loc or "UNK"),
+            "htf_bias": str(htf_bias or "UNK"),
+            "liq_ctx": str(liq_ctx or "UNK"),
+            "mode": str(mode or "UNK"),
+        }
+
+    def _mlg_latest_outcomes():
+        path = _mlg_path("FORWARD_OUTCOMES_LOG", "logs/forward_outcomes.jsonl")
+        latest = {}
+        for r in _mlg_read_jsonl(path):
+            k = _mlg_signal_key(r)
+            if k:
+                latest[k] = r
+        return latest
+
+    def _mlg_label(row, out):
+        try:
+            if out:
+                lw = out.get("label_win")
+                if lw in (0, 1):
+                    return int(lw)
+                target = str(out.get("label_target") or "").upper()
+                if target in ("TP1", "TP2", "TP3"):
+                    return 1
+                if target == "SL":
+                    return 0
+            lw = (row or {}).get("label_win")
+            if lw in (0, 1):
+                return int(lw)
+        except Exception:
+            pass
+        return None
+
+    def _mlg_include_train(row, out):
+        try:
+            if (row or {}).get("include_ml") is False:
+                return False
+            if out and out.get("include_ml_label") is False:
+                return False
+            if _mlg_bool("ML_GATE_TRAIN_ACCEPT_ONLY", False):
+                dec = str((row or {}).get("execution_decision") or "").upper()
+                if dec != "ACCEPT":
+                    return False
+            return _mlg_label(row, out) in (0, 1)
+        except Exception:
+            return False
+
+    def _mlg_build_model():
+        dataset_path = _mlg_path("ML_DATASET_ROWS_LOG", "logs/ml_dataset_rows.jsonl")
+        rows_raw = _mlg_read_jsonl(dataset_path)
+        outcomes = _mlg_latest_outcomes()
+
+        latest_rows = {}
+        for r in rows_raw:
+            k = _mlg_signal_key(r)
+            if k:
+                latest_rows[k] = r
+
+        rows = list(latest_rows.values())
+
+        global_w = 0
+        global_n = 0
+        stats = _mlg_defaultdict(lambda: [0, 0])
+
+        for row in rows:
+            out = outcomes.get(_mlg_signal_key(row))
+            if not _mlg_include_train(row, out):
+                continue
+            y = _mlg_label(row, out)
+            if y not in (0, 1):
+                continue
+
+            global_n += 1
+            global_w += int(y)
+
+            fm = _mlg_features(row)
+            for k, v in fm.items():
+                kk = f"{k}={v}"
+                stats[kk][0] += int(y)
+                stats[kk][1] += 1
+
+        return {
+            "built_at_utc": globals().get("utc_now_iso", lambda: _mlg_datetime.now(_mlg_timezone.utc).isoformat())(),
+            "global_w": global_w,
+            "global_n": global_n,
+            "stats": dict(stats),
+        }
+
+    def _mlg_model():
+        ttl = _mlg_int_env("ML_GATE_CACHE_TTL_SEC", 300)
+        now = _mlg_time.time()
+        if _MLG_CACHE.get("model") and (now - float(_MLG_CACHE.get("loaded_at") or 0)) < ttl:
+            return _MLG_CACHE["model"]
+        model = _mlg_build_model()
+        _MLG_CACHE["model"] = model
+        _MLG_CACHE["loaded_at"] = now
+        return model
+
+    def _mlg_predict(row):
+        model = _mlg_model()
+        global_n = int(model.get("global_n") or 0)
+        global_w = int(model.get("global_w") or 0)
+        gp = (global_w / global_n) if global_n > 0 else 0.50
+
+        min_train = _mlg_int_env("ML_GATE_MIN_TRAIN_ROWS", 120)
+        min_feature_n = _mlg_int_env("ML_GATE_MIN_FEATURE_N", 5)
+
+        if global_n < min_train:
+            return {
+                "ok": bool(_mlg_bool("ML_GATE_FAIL_OPEN", True)),
+                "decision": "ML_PASS_NOT_ENOUGH_DATA" if _mlg_bool("ML_GATE_FAIL_OPEN", True) else "ML_BLOCK_NOT_ENOUGH_DATA",
+                "reason": "ml_gate_not_enough_train_rows",
+                "p_win": round(gp, 4),
+                "p_win_adj": round(gp, 4),
+                "confidence": 0.0,
+                "train_rows": global_n,
+                "global_wr": round(gp, 4),
+                "reasons": [],
+            }
+
+        fm = _mlg_features(row)
+        stats = model.get("stats") or {}
+
+        weights = {
+            "symbol": 0.26,
+            "direction": 0.08,
+            "hour": 0.08,
+            "session": 0.08,
+            "score_bin": 0.13,
+            "rr_bin": 0.11,
+            "entry_dist_bin": 0.11,
+            "htf_loc": 0.06,
+            "htf_bias": 0.04,
+            "liq_ctx": 0.03,
+            "mode": 0.02,
+        }
+
+        weighted_sum = gp * 0.34
+        weight_total = 0.34
+        evidence_n = 0
+        feature_hits = 0
+        reasons = []
+
+        for k, v in fm.items():
+            kk = f"{k}={v}"
+            w, n = stats.get(kk, [0, 0])
+            w, n = int(w or 0), int(n or 0)
+            if n < min_feature_n:
+                continue
+
+            alpha = 12
+            p_smooth = (w + alpha * gp) / (n + alpha)
+            conf = min(1.0, n / 45.0)
+            weight = float(weights.get(k, 0.03)) * conf
+
+            weighted_sum += p_smooth * weight
+            weight_total += weight
+            evidence_n += n
+            feature_hits += 1
+
+            reasons.append({
+                "feature": kk,
+                "win": w,
+                "n": n,
+                "wr": round(w / n, 4) if n else None,
+                "p_smooth": round(p_smooth, 4),
+                "weight": round(weight, 4),
+            })
+
+        p_win = weighted_sum / weight_total if weight_total else gp
+        confidence = min(1.0, evidence_n / 180.0)
+        p_adj = p_win - (0.06 * (1.0 - confidence))
+
+        min_p = _mlg_float_env("ML_GATE_MIN_P_WIN", 0.74)
+        min_conf = _mlg_float_env("ML_GATE_MIN_CONFIDENCE", 0.20)
+        block_low_conf = _mlg_bool("ML_GATE_BLOCK_LOW_CONFIDENCE", False)
+
+        if confidence < min_conf and block_low_conf:
+            ok = False
+            decision = "ML_BLOCK_LOW_CONFIDENCE"
+            reason = "ml_gate_low_confidence"
+        elif p_adj < min_p:
+            ok = False
+            decision = "ML_BLOCK_LOW_PWIN"
+            reason = "ml_gate_pwin_below_threshold"
+        else:
+            ok = True
+            decision = "ML_PASS"
+            reason = "ml_gate_pass"
+
+        return {
+            "ok": ok,
+            "decision": decision,
+            "reason": reason,
+            "p_win": round(p_win, 4),
+            "p_win_adj": round(p_adj, 4),
+            "confidence": round(confidence, 4),
+            "min_p_win": min_p,
+            "min_confidence": min_conf,
+            "train_rows": global_n,
+            "global_win": global_w,
+            "global_loss": global_n - global_w,
+            "global_wr": round(gp, 4),
+            "feature_hits": feature_hits,
+            "features": fm,
+            "reasons": sorted(reasons, key=lambda x: x.get("weight", 0), reverse=True)[:8],
+            "model_built_at_utc": model.get("built_at_utc"),
+        }
+
+    def _mlg_append_prediction(payload, pred):
+        try:
+            rec = {
+                "event_type": "ML_GATE_PREDICTION_V0",
+                "created_at_utc": globals().get("utc_now_iso", lambda: _mlg_datetime.now(_mlg_timezone.utc).isoformat())(),
+                "signal_key": _mlg_signal_key(payload),
+                "symbol": _mlg_norm_symbol(_mlg_pick(payload, "symbol", "pair")),
+                "direction": _mlg_direction(payload),
+                "prediction": pred,
+            }
+            path = _mlg_path("ML_PREDICTIONS_LOG", "logs/ml_predictions.jsonl")
+            if "append_jsonl" in globals():
+                append_jsonl(path, rec)
+            else:
+                with _mlg_Path(path).open("a") as f:
+                    f.write(_mlg_json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
+
+    def _mlg_block_guard(guard, pred):
+        g = dict(guard or {})
+        g["ok"] = False
+        g["action"] = str(_mlg_os.getenv("ML_GATE_ACTION", "NO_TRADE"))
+        g["reason"] = str(pred.get("decision") or "ML_GATE_BLOCK")
+        g["ml_gate"] = pred
+        try:
+            if "_night_append_event" in globals():
+                _night_append_event({
+                    "event_type": "ML_GATE_BLOCK",
+                    "reason": g.get("reason"),
+                    "symbol": g.get("symbol"),
+                    "direction": g.get("direction"),
+                    "ml_gate": pred,
+                })
+        except Exception:
+            pass
+        return g
+
+    if "_night_guard_payload" in globals() and not globals().get("_ML_GATE_PATCHED"):
+        _ML_GATE_ORIG_NIGHT_GUARD_PAYLOAD = _night_guard_payload
+
+        def _night_guard_payload(p):
+            g = _ML_GATE_ORIG_NIGHT_GUARD_PAYLOAD(p)
+
+            if not _mlg_bool("ML_GATE_ENABLED", False):
+                return g
+
+            if not isinstance(g, dict):
+                return g
+
+            # Kalau freshness/hard-pre-entry guard sudah fail, jangan override.
+            if not bool(g.get("ok")):
+                try:
+                    g["ml_gate_checked"] = False
+                    g["ml_gate_skip_reason"] = "base_guard_failed"
+                except Exception:
+                    pass
+                return g
+
+            pred = _mlg_predict(p or {})
+            try:
+                g["ml_gate"] = pred
+                g["ml_gate_checked"] = True
+            except Exception:
+                pass
+
+            _mlg_append_prediction(p or {}, pred)
+
+            mode = str(_mlg_os.getenv("ML_GATE_MODE", "LIVE_BLOCK")).strip().upper()
+            if mode == "SHADOW":
+                return g
+
+            if not bool(pred.get("ok")):
+                return _mlg_block_guard(g, pred)
+
+            return g
+
+        globals()["_ML_GATE_PATCHED"] = True
+        print("[ml_gate] scorecard gate patched")
+except Exception as _mlg_e:
+    try:
+        print("[ml_gate] patch failed", str(_mlg_e))
+    except Exception:
+        pass
+
+
+
+# === ML_GATE_SKLEARN_V1_PATCH_20260613 ===
+# Prefer sklearn predict_proba model for ML Gate.
+# Falls back to scorecard gate if model/dependency is unavailable.
+try:
+    import os as _sk_os
+    import math as _sk_math
+    from pathlib import Path as _sk_Path
+    from datetime import datetime as _sk_datetime, timezone as _sk_timezone
+
+    _SK_MODEL_CACHE = {
+        "loaded_at": 0,
+        "obj": None,
+        "path": None,
+    }
+
+    def _sk_safe_float(x, default=-1.0):
+        try:
+            if x is None or str(x).strip() == "":
+                return default
+            v = float(str(x))
+            return v if _sk_math.isfinite(v) else default
+        except Exception:
+            return default
+
+    def _sk_features(row):
+        # Reuse helper functions from scorecard patch when available.
+        h = _mlg_hour(row) if "_mlg_hour" in globals() else -1
+
+        score = _mlg_pick(row, "score", "score_total", "priority_score", "smc_score") if "_mlg_pick" in globals() else (row or {}).get("score")
+        rr = _mlg_pick(row, "rr", "rr_tp1", "rr_to_tp1", "rrTp2", "rr_min") if "_mlg_pick" in globals() else (row or {}).get("rr")
+        entry_dist = _mlg_pick(row, "entryDistPct", "entry_dist_pct", "entry_dist_from_price_pct", "distToZonePct") if "_mlg_pick" in globals() else (row or {}).get("entry_dist_pct")
+        htf_loc = _mlg_pick(row, "htfLoc", "htf_location", "location") if "_mlg_pick" in globals() else None
+        htf_bias = _mlg_pick(row, "htfBias", "htf_bias", "bias") if "_mlg_pick" in globals() else None
+        liq_ctx = _mlg_pick(row, "liqCtx", "liq_ctx", "ctx") if "_mlg_pick" in globals() else None
+        mode = _mlg_pick(row, "mode", "state", "status") if "_mlg_pick" in globals() else None
+
+        symbol = _mlg_norm_symbol(_mlg_pick(row, "symbol", "pair")) if "_mlg_norm_symbol" in globals() and "_mlg_pick" in globals() else str((row or {}).get("symbol") or "").upper()
+        direction = _mlg_direction(row) if "_mlg_direction" in globals() else str((row or {}).get("direction") or "").upper()
+        session = _mlg_session(h) if "_mlg_session" in globals() else "UNK"
+
+        return {
+            "symbol": symbol or "UNK",
+            "direction": direction or "UNK",
+            "hour": float(h if h is not None else -1),
+            "session": session,
+            "score": _sk_safe_float(score, -1.0),
+            "rr": _sk_safe_float(rr, -1.0),
+            "entry_dist": _sk_safe_float(entry_dist, -1.0),
+            "htf_loc": str(htf_loc or "UNK"),
+            "htf_bias": str(htf_bias or "UNK"),
+            "liq_ctx": str(liq_ctx or "UNK"),
+            "mode": str(mode or "UNK"),
+        }
+
+    def _sk_model_obj():
+        import time as _sk_time
+        import joblib as _sk_joblib
+
+        ttl = int(_sk_os.getenv("ML_GATE_SKLEARN_CACHE_TTL_SEC", "300"))
+        path = _sk_Path(_sk_os.getenv("ML_GATE_MODEL_PATH", "artifacts/ml_gate_sklearn_v1.joblib"))
+
+        now = _sk_time.time()
+        if (
+            _SK_MODEL_CACHE.get("obj") is not None
+            and _SK_MODEL_CACHE.get("path") == str(path)
+            and now - float(_SK_MODEL_CACHE.get("loaded_at") or 0) < ttl
+        ):
+            return _SK_MODEL_CACHE["obj"]
+
+        obj = _sk_joblib.load(path)
+        _SK_MODEL_CACHE["obj"] = obj
+        _SK_MODEL_CACHE["path"] = str(path)
+        _SK_MODEL_CACHE["loaded_at"] = now
+        return obj
+
+    def _sk_predict(row):
+        obj = _sk_model_obj()
+        model = obj.get("model")
+        version = obj.get("model_version", "sklearn_unknown")
+        metrics = obj.get("metrics", {})
+
+        x = _sk_features(row)
+        probs = model.predict_proba([x])[0]
+        classes = list(model.named_steps["clf"].classes_)
+        pos_idx = classes.index(1)
+        p_win = float(probs[pos_idx])
+
+        min_p = float(_sk_os.getenv("ML_GATE_MIN_P_WIN", str(obj.get("threshold", 0.74))))
+        confidence = round(abs(p_win - 0.50) * 2.0, 4)
+
+        if p_win >= min_p:
+            ok = True
+            decision = "ML_PASS"
+            reason = "sklearn_gate_pass"
+        else:
+            ok = False
+            decision = "ML_BLOCK_LOW_PWIN"
+            reason = "sklearn_gate_pwin_below_threshold"
+
+        return {
+            "ok": ok,
+            "decision": decision,
+            "reason": reason,
+            "model_version": version,
+            "p_win": round(p_win, 4),
+            "p_win_adj": round(p_win, 4),
+            "confidence": confidence,
+            "min_p_win": min_p,
+            "features": x,
+            "metrics": metrics,
+        }
+
+    if "_mlg_predict" in globals() and not globals().get("_ML_GATE_SKLEARN_PATCHED"):
+        _MLG_SCORECARD_PREDICT_ORIG = _mlg_predict
+
+        def _mlg_predict(row):
+            model_mode = str(_sk_os.getenv("ML_GATE_MODEL", "SCORECARD_V0")).upper().strip()
+            if model_mode == "SKLEARN_V1":
+                try:
+                    return _sk_predict(row or {})
+                except Exception as e:
+                    # fail open to scorecard, not to order directly
+                    try:
+                        print("[ml_gate_sklearn] fallback_to_scorecard", str(e))
+                    except Exception:
+                        pass
+                    return _MLG_SCORECARD_PREDICT_ORIG(row or {})
+            return _MLG_SCORECARD_PREDICT_ORIG(row or {})
+
+        globals()["_ML_GATE_SKLEARN_PATCHED"] = True
+        print("[ml_gate_sklearn] sklearn v1 gate patched")
+except Exception as _sk_e:
+    try:
+        print("[ml_gate_sklearn] patch failed", str(_sk_e))
+    except Exception:
+        pass
+
+
+
+# === ML_GATE_SKLEARN_V2_LIVE_FEATURES_20260613 ===
+try:
+    import os as _v2_os
+    import re as _v2_re
+    import math as _v2_math
+    from datetime import datetime as _v2_datetime, timezone as _v2_timezone, timedelta as _v2_timedelta
+
+    _V2_WIB = _v2_timezone(_v2_timedelta(hours=7))
+
+    def _v2_fnum(x, default=-1.0):
+        try:
+            if x is None:
+                return default
+            if isinstance(x, (int, float)):
+                v = float(x)
+                return v if _v2_math.isfinite(v) else default
+            ss = str(x).strip()
+            if not ss:
+                return default
+            nums = _v2_re.findall(r'-?\d+(?:\.\d+)?', ss)
+            if len(nums) >= 2 and "-" in ss:
+                vals = [float(a) for a in nums[:2]]
+                return sum(vals) / len(vals)
+            v = float(ss.replace(",", ""))
+            return v if _v2_math.isfinite(v) else default
+        except Exception:
+            return default
+
+    def _v2_range_lo_hi(x):
+        try:
+            if x is None:
+                return None, None
+            if isinstance(x, (int, float)):
+                v = float(x)
+                return v, v
+            ss = str(x).strip()
+            nums = _v2_re.findall(r'-?\d+(?:\.\d+)?', ss)
+            if len(nums) >= 2:
+                return float(nums[0]), float(nums[1])
+            if len(nums) == 1:
+                v = float(nums[0])
+                return v, v
+        except Exception:
+            pass
+        return None, None
+
+    def _v2_norm_symbol(x):
+        return str(x or "").upper().replace("BINANCE:", "").replace(".P", "")
+
+    def _v2_norm_dir(x):
+        d = str(x or "").upper()
+        if d in ("LONG", "BUY"):
+            return "LONG"
+        if d in ("SHORT", "SELL"):
+            return "SHORT"
+        return d or "UNK"
+
+    def _v2_cat(x):
+        if x in (None, "", -1, -1.0):
+            return "UNK"
+        return str(x)
+
+    def _v2_parse_wib(s):
+        if not s:
+            return None
+        ss = str(s).replace(" WIB", "").replace("T", " ").split("+")[0]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return _v2_datetime.strptime(ss[:26], fmt).replace(tzinfo=_V2_WIB)
+            except Exception:
+                pass
+        return None
+
+    def _v2_patch_phase(signal_time):
+        dt = _v2_parse_wib(signal_time)
+        if not dt:
+            return "UNKNOWN"
+        phases = [
+            ("PRE_LATENCY_PATCH", "2026-06-10 22:49:27"),
+            ("PRE_NIGHT_GUARD", "2026-06-11 00:36:16"),
+            ("PRE_HARD_GUARD", "2026-06-13 16:42:59"),
+            ("PRE_SKLEARN_GATE", "2026-06-13 21:28:04"),
+        ]
+        for name, cutoff in phases:
+            c = _v2_parse_wib(cutoff)
+            if c and dt < c:
+                return name
+        return "AFTER_SKLEARN_GATE"
+
+    def _v2_age_bars(signal_time, event_time, tf_min=5.0):
+        a = _v2_parse_wib(signal_time)
+        b = _v2_parse_wib(event_time)
+        if not a or not b:
+            return -1.0
+        return round(max(0.0, (a - b).total_seconds() / 60.0) / tf_min, 3)
+
+    def _v2_pick(row, *keys):
+        if row is None or not isinstance(row, dict):
+            return None
+        objs = [row]
+        for nested in ("payload", "plan", "locked_plan", "trade_plan", "meta", "htf", "liq"):
+            if isinstance(row.get(nested), dict):
+                objs.append(row[nested])
+        if isinstance(row.get("plan"), dict):
+            objs.append(row["plan"])
+
+        for k in keys:
+            for obj in objs:
+                if isinstance(obj, dict) and obj.get(k) not in (None, ""):
+                    return obj.get(k)
+        return None
+
+    def _v2_payload(row):
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict):
+            return row["payload"]
+        if isinstance(row, dict):
+            return row
+        return {}
+
+    def _v2_smc_features(row):
+        p = _v2_payload(row)
+
+        htf = p.get("htf_summary") if isinstance(p.get("htf_summary"), dict) else {}
+        liq = p.get("liquidity") if isinstance(p.get("liquidity"), dict) else {}
+        smc = p.get("smc_context") if isinstance(p.get("smc_context"), dict) else {}
+
+        sweep = smc.get("sweep") if isinstance(smc.get("sweep"), dict) else {}
+        reclaim = smc.get("reclaim") if isinstance(smc.get("reclaim"), dict) else {}
+        fvg = smc.get("fvg") if isinstance(smc.get("fvg"), dict) else {}
+        poi = smc.get("poi") if isinstance(smc.get("poi"), dict) else {}
+        ob = smc.get("ob") if isinstance(smc.get("ob"), dict) else {}
+
+        direction = _v2_norm_dir(_v2_pick(row, "direction", "dir"))
+        symbol = _v2_norm_symbol(_v2_pick(row, "symbol", "pair"))
+
+        entry = _v2_fnum(_v2_pick(row, "entry_mid", "entry"), None)
+        entry_lo = _v2_fnum(_v2_pick(row, "entry_lo"), None)
+        entry_hi = _v2_fnum(_v2_pick(row, "entry_hi"), None)
+
+        if entry is None:
+            lo, hi = _v2_range_lo_hi(_v2_pick(row, "entry_zone", "entry"))
+            if lo is not None and hi is not None:
+                entry = (lo + hi) / 2.0
+                entry_lo, entry_hi = lo, hi
+
+        sl = _v2_fnum(_v2_pick(row, "sl", "invalid"), None)
+        tp1 = _v2_fnum(_v2_pick(row, "tp1", "raw_tp1"), None)
+        tp2 = _v2_fnum(_v2_pick(row, "tp2", "raw_tp2"), None)
+        tp3 = _v2_fnum(_v2_pick(row, "tp3", "raw_tp3"), None)
+
+        x = {}
+
+        x["symbol_norm"] = symbol or "UNK"
+        x["direction_norm"] = direction or "UNK"
+        x["priority"] = _v2_cat(_v2_pick(row, "priority"))
+        x["mode"] = _v2_cat(_v2_pick(row, "mode"))
+        x["source_mode"] = _v2_cat(_v2_pick(row, "source_mode"))
+        x["execution_decision"] = _v2_cat(_v2_pick(row, "execution_decision"))
+        x["reject_gate"] = _v2_cat(_v2_pick(row, "reject_gate"))
+
+        x["htf_dir"] = _v2_cat(htf.get("htf_dir") or htf.get("dir"))
+        x["htf_bias"] = _v2_cat(htf.get("bias"))
+        x["htf_location"] = _v2_cat(htf.get("location"))
+        x["htf_dol"] = _v2_cat(htf.get("dol"))
+        x["liq_ctx"] = _v2_cat(liq.get("ctx"))
+
+        x["sweep_tag"] = _v2_cat(_v2_pick(row, "sweep_tag") or sweep.get("tag"))
+        x["reclaim_mode"] = _v2_cat(_v2_pick(row, "reclaim_mode") or reclaim.get("mode"))
+        x["fvg_type"] = _v2_cat(fvg.get("type") or poi.get("type"))
+        x["ob_type"] = _v2_cat(ob.get("type"))
+
+        signal_time = _v2_pick(row, "signal_time_wib", "confirmed_ts_wib")
+        x["patch_phase"] = _v2_patch_phase(signal_time)
+
+        x["score"] = _v2_fnum(_v2_pick(row, "score"), -1.0)
+
+        if entry and sl and tp1 and abs(sl - entry) > 0:
+            risk = abs(sl - entry)
+            x["rr_to_tp1"] = round(abs(tp1 - entry) / risk, 6)
+            x["sl_dist_pct"] = round(risk / entry * 100.0, 6)
+            x["tp1_dist_pct"] = round(abs(tp1 - entry) / entry * 100.0, 6)
+            x["rr_to_tp2"] = round(abs(tp2 - entry) / risk, 6) if tp2 else -1.0
+            x["tp2_dist_pct"] = round(abs(tp2 - entry) / entry * 100.0, 6) if tp2 else -1.0
+            x["rr_to_tp3"] = round(abs(tp3 - entry) / risk, 6) if tp3 else -1.0
+            x["tp3_dist_pct"] = round(abs(tp3 - entry) / entry * 100.0, 6) if tp3 else -1.0
+        else:
+            x["rr_to_tp1"] = _v2_fnum(_v2_pick(row, "rr_to_tp1", "rr", "rr_tp1"), -1.0)
+            x["rr_to_tp2"] = _v2_fnum(_v2_pick(row, "rr_to_tp2", "rrTp2"), -1.0)
+            x["rr_to_tp3"] = _v2_fnum(_v2_pick(row, "rr_to_tp3"), -1.0)
+            x["sl_dist_pct"] = _v2_fnum(_v2_pick(row, "sl_dist_pct"), -1.0)
+            x["tp1_dist_pct"] = _v2_fnum(_v2_pick(row, "tp1_dist_pct"), -1.0)
+            x["tp2_dist_pct"] = _v2_fnum(_v2_pick(row, "tp2_dist_pct"), -1.0)
+            x["tp3_dist_pct"] = _v2_fnum(_v2_pick(row, "tp3_dist_pct"), -1.0)
+
+        x["entry_zone_width_pct"] = (
+            round(abs(entry_hi - entry_lo) / entry * 100.0, 6)
+            if entry and entry_lo is not None and entry_hi is not None
+            else _v2_fnum(_v2_pick(row, "entry_zone_width_pct"), -1.0)
+        )
+
+        x["liq_dist_to_zone_pct"] = _v2_fnum(liq.get("dist_to_zone_pct") or _v2_pick(row, "liq_dist_to_zone_pct"), -1.0)
+        x["sweep_age_bars_5m"] = _v2_age_bars(signal_time, _v2_pick(row, "sweep_ts_wib") or sweep.get("ts_wib"))
+        x["reclaim_age_bars_5m"] = _v2_age_bars(signal_time, _v2_pick(row, "reclaim_ts_wib") or reclaim.get("ts_wib"))
+        x["fvg_age_bars_5m"] = _v2_age_bars(signal_time, _v2_pick(row, "fvg_ts_wib"))
+
+        fvg_lo = _v2_fnum(_v2_pick(row, "fvg_lo") or fvg.get("bot") or poi.get("lo"), None)
+        fvg_hi = _v2_fnum(_v2_pick(row, "fvg_hi") or fvg.get("top") or poi.get("hi"), None)
+
+        x["fvg_size_pct"] = (
+            round(abs(fvg_hi - fvg_lo) / entry * 100.0, 6)
+            if entry and fvg_lo is not None and fvg_hi is not None
+            else _v2_fnum(_v2_pick(row, "fvg_size_pct"), -1.0)
+        )
+
+        ob_lo = _v2_fnum(ob.get("lo"), None)
+        ob_hi = _v2_fnum(ob.get("hi"), None)
+
+        x["ob_size_pct"] = (
+            round(abs(ob_hi - ob_lo) / entry * 100.0, 6)
+            if entry and ob_lo is not None and ob_hi is not None
+            else _v2_fnum(_v2_pick(row, "ob_size_pct"), -1.0)
+        )
+
+        rr = x.get("rr_to_tp1", -1.0)
+        slp = x.get("sl_dist_pct", -1.0)
+        fvgp = x.get("fvg_size_pct", -1.0)
+
+        x["rr_bucket"] = "rr<0.7" if rr < 0.7 else "0.7-0.9" if rr < 0.9 else "0.9-1.2" if rr < 1.2 else "1.2+"
+        x["sl_bucket"] = "sl<0.15" if slp < 0.15 else "0.15-0.35" if slp < 0.35 else "0.35-0.70" if slp < 0.70 else "0.70+"
+        x["fvg_bucket"] = "fvgNA" if fvgp < 0 else "fvg<0.10" if fvgp < 0.10 else "0.10-0.30" if fvgp < 0.30 else "0.30+"
+
+        return x
+
+    if "_sk_predict" in globals():
+        def _sk_features(row):
+            return _v2_smc_features(row or {})
+
+    if "_mlg_predict" in globals() and "_sk_predict" in globals() and not globals().get("_ML_GATE_SKLEARN_V2_ALIAS_PATCHED"):
+        _MLG_PREDICT_BEFORE_V2_ALIAS = _mlg_predict
+
+        def _mlg_predict(row):
+            mode = str(_v2_os.getenv("ML_GATE_MODEL", "SCORECARD_V0")).upper().strip()
+            if mode in ("SKLEARN", "SKLEARN_V1", "SKLEARN_V2"):
+                try:
+                    return _sk_predict(row or {})
+                except Exception as e:
+                    try:
+                        print("[ml_gate_sklearn_v2] fallback", str(e))
+                    except Exception:
+                        pass
+                    return _MLG_PREDICT_BEFORE_V2_ALIAS(row or {})
+            return _MLG_PREDICT_BEFORE_V2_ALIAS(row or {})
+
+        globals()["_ML_GATE_SKLEARN_V2_ALIAS_PATCHED"] = True
+        print("[ml_gate_sklearn_v2] live features v2 patched")
+except Exception as _v2_e:
+    try:
+        print("[ml_gate_sklearn_v2] patch failed", str(_v2_e))
+    except Exception:
+        pass
+
+
+# === FIX_BASE_EVENT_ALIAS_20260623 ===
+# Some patched live/bridge code calls base_event(), while older helper is named v010_base_event().
+# Keep this alias global so runtime bridge logging does not crash before order decision.
+try:
+    base_event
+except NameError:
+    try:
+        base_event = v010_base_event
+    except NameError:
+        def base_event(symbol: str = "", action: str = "", reason: str = "") -> dict:
+            from datetime import datetime, timezone
+            return {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol or ""),
+                "event_type": str(action or "BASE_EVENT"),
+                "reason": str(reason or ""),
+            }
+
+
+# === FIX_BASE_EVENT_COMPAT_DICT_CALLABLE_20260623 ===
+# Compatibility shim:
+# - some code calls base_event(symbol, action, reason)
+# - some code mutates base_event["key"] = value
+# This object supports both so bridge logging cannot kill execution.
+class _BaseEventCompat(dict):
+    def __call__(self, symbol: str = "", action: str = "", reason: str = "") -> dict:
+        try:
+            return v010_base_event(symbol, action, reason)
+        except Exception:
+            from datetime import datetime, timezone
+            return {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol or ""),
+                "event_type": str(action or "BASE_EVENT"),
+                "reason": str(reason or ""),
+            }
+
+    def __setitem__(self, key, value):
+        try:
+            if "created_at_utc" not in self:
+                from datetime import datetime, timezone
+                dict.__setitem__(self, "created_at_utc", datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+        dict.__setitem__(self, key, value)
+
+try:
+    base_event = _BaseEventCompat()
+except Exception:
+    pass
+

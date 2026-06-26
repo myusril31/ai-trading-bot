@@ -1,0 +1,38 @@
+{
+  "ok": true,
+  "label_version": "outcome_labeler_v1",
+  "created_at_utc": "2026-06-24T18:41:39.068118+00:00",
+  "out_jsonl": "logs/outcome_labels_v1.jsonl",
+  "rows": 206,
+  "trainable_label_rows": 201,
+  "wins": 87,
+  "losses": 114,
+  "ambiguous": 5,
+  "matched_trade_rows": 186,
+  "unmatched_rows": 20,
+  "status_counts": {
+    "CLOSED_LOSS": 114,
+    "CLOSED_WIN": 87,
+    "CLOSED_AMBIGUOUS": 5
+  },
+  "source_counts": {
+    "tp_lifecycle_cleanup_inference_v1": 206
+  },
+  "current14": [
+    "ADAUSDT",
+    "AVAXUSDT",
+    "BCHUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "HYPEUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "PAXGUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "UNIUSDT",
+    "XRPUSDT",
+    "ZECUSDT"
+  ],
+  "note": "Conservative local inference from TP_LIFECYCLE_POSITION_CLOSED_CLEANUP. SL cleanup => TP hit win; TP cleanup => SL hit loss; both/unknown => not trainable."
+}

@@ -1,0 +1,1178 @@
+import json
+import os
+import time
+import hmac
+import hashlib
+import urllib.parse
+import requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict
+
+
+APP_VERSION = "v0.7-testnet-order-test-client"
+
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
+
+SIGNALS_LOG = LOG_DIR / "signals.jsonl"
+DECISIONS_LOG = LOG_DIR / "decisions.jsonl"
+PAPER_STATE_FILE = STATE_DIR / "paper_state.json"
+PAPER_EVENTS_LOG = LOG_DIR / "paper_events.jsonl"
+EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
+EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
+
+WIB = ZoneInfo("Asia/Jakarta")
+LOCK = Lock()
+
+app = FastAPI(title="AI Trading VPS Bot", version=APP_VERSION)
+
+
+class SignalPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    signal_id: Optional[str] = None
+    signal_key: Optional[str] = None
+    key_type: Optional[str] = None
+
+    symbol: Optional[str] = None
+    pair: Optional[str] = None
+
+    direction: Optional[str] = None
+    dir: Optional[str] = None
+
+    status: Optional[str] = None
+    state: Optional[str] = None
+
+    priority: Optional[str] = None
+    score: Optional[float] = None
+
+    entry_lo: Optional[float] = None
+    entry_hi: Optional[float] = None
+    entry_mid: Optional[float] = None
+
+    signal_time_wib: Optional[str] = None
+    run_ts_wib: Optional[str] = None
+    confirmed_ts_wib: Optional[str] = None
+
+class PaperClosePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    signal_key: str
+    outcome: Optional[str] = "CLOSED_MANUAL"
+    close_reason: Optional[str] = "MANUAL_CLOSE"
+    close_price: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class PaperCloseAllPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    outcome: Optional[str] = "CLOSED_MANUAL"
+    close_reason: Optional[str] = "MANUAL_CLOSE_ALL"
+    close_price: Optional[float] = None
+    notes: Optional[str] = None
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
+
+
+def wib_now_iso() -> str:
+    return datetime.now(WIB).isoformat()
+
+
+def ensure_dirs() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    ensure_dirs()
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def normalize_pair(x: Any) -> str:
+    return str(x or "").strip().upper()
+
+
+def csv_set(name: str) -> set[str]:
+    raw = os.getenv(name, "")
+    return {
+        normalize_pair(x)
+        for x in raw.split(",")
+        if normalize_pair(x)
+    }
+
+
+def get_mode() -> str:
+    mode = (os.getenv("BOT_MODE") or os.getenv("MODE") or "RECEIVED_ONLY").strip().upper()
+    if mode not in ("RECEIVED_ONLY", "RECEIVER_ONLY", "PAPER"):
+        return "RECEIVED_ONLY"
+    if mode == "RECEIVER_ONLY":
+        return "RECEIVED_ONLY"
+    return mode
+
+
+def verify_secret(x_signal_secret: Optional[str], x_webhook_secret: Optional[str]) -> None:
+    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if not expected:
+        return
+
+    got = (x_signal_secret or x_webhook_secret or "").strip()
+    if got != expected:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+
+def payload_to_dict(payload: SignalPayload) -> Dict[str, Any]:
+    return payload.model_dump(mode="json")
+
+
+def signal_key_of(p: Dict[str, Any]) -> str:
+    return str(
+        p.get("signal_key")
+        or p.get("signal_id")
+        or ""
+    ).strip()
+
+
+def pair_of(p: Dict[str, Any]) -> str:
+    return normalize_pair(p.get("pair") or p.get("symbol"))
+
+
+def direction_of(p: Dict[str, Any]) -> str:
+    return str(p.get("direction") or p.get("dir") or "").strip()
+
+
+def status_of(p: Dict[str, Any]) -> str:
+    return str(p.get("status") or p.get("state") or "").strip().upper()
+
+
+def default_state() -> Dict[str, Any]:
+    return {
+        "seen_signal_keys": [],
+        "accepted_by_pair": {},
+        "open_paper_positions": [],
+	"closed_paper_positions": [],
+        "daily_stop_active": False,
+	"daily_counters": {
+	    "date_wib": "",
+	    "accepted_count": 0,
+	    "rejected_count": 0,
+	    "accepted_by_pair": {},
+	    "rejected_by_gate": {},
+	},
+        "updated_at_utc": utc_now_iso(),
+    }
+
+
+def load_state() -> Dict[str, Any]:
+    ensure_dirs()
+    if not PAPER_STATE_FILE.exists():
+        return default_state()
+
+    try:
+        with PAPER_STATE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return default_state()
+        base = default_state()
+        base.update(data)
+        return base
+    except Exception:
+        return default_state()
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    ensure_dirs()
+    state["updated_at_utc"] = utc_now_iso()
+
+    # avoid unlimited growth
+    keys = state.get("seen_signal_keys") or []
+    if len(keys) > 5000:
+        state["seen_signal_keys"] = keys[-5000:]
+
+    tmp = PAPER_STATE_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    tmp.replace(PAPER_STATE_FILE)
+
+
+def parse_iso_utc(s: Any) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        text = str(s).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_wib_time(s: str) -> Optional[datetime]:
+    s = str(s or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=WIB)
+        except Exception:
+            pass
+    return None
+
+
+def is_calendar_blackout_active() -> tuple[bool, str]:
+    if not env_bool("CALENDAR_GATE_ENABLED", False):
+        return False, "calendar_gate_disabled"
+
+    raw = os.getenv("CALENDAR_BLACKOUT_WIB", "").strip()
+    if not raw:
+        return False, "no_blackout_window_configured"
+
+    now = datetime.now(WIB)
+
+    # Format:
+    # 2026-05-14 19:00..2026-05-14 21:00;2026-05-15 19:30..2026-05-15 20:30
+    windows = [x.strip() for x in raw.split(";") if x.strip()]
+    for w in windows:
+        if ".." in w:
+            a, b = w.split("..", 1)
+        elif " - " in w:
+            a, b = w.split(" - ", 1)
+        else:
+            continue
+
+        start = parse_wib_time(a)
+        end = parse_wib_time(b)
+
+        if not start or not end:
+            continue
+
+        if start <= now <= end:
+            return True, f"calendar_blackout_active:{start.isoformat()}..{end.isoformat()}"
+
+    return False, "calendar_clear"
+
+
+def daily_stop_active(state: Dict[str, Any]) -> tuple[bool, str]:
+    if env_bool("DAILY_STOP_ACTIVE", False):
+        return True, "daily_stop_active_env"
+
+    if bool(state.get("daily_stop_active")):
+        return True, "daily_stop_active_state"
+
+    return False, "daily_stop_clear"
+
+
+def open_paper_count(state: Dict[str, Any]) -> int:
+    positions = state.get("open_paper_positions") or []
+    return sum(1 for p in positions if str(p.get("status", "OPEN")).upper() == "OPEN")
+
+
+def cooldown_active(state: Dict[str, Any], pair: str) -> tuple[bool, str]:
+    cd_min = env_int("COOLDOWN_PAIR_MIN", 90)
+    accepted_by_pair = state.get("accepted_by_pair") or {}
+
+    last_iso = accepted_by_pair.get(pair)
+    last_dt = parse_iso_utc(last_iso)
+
+    if not last_dt:
+        return False, "cooldown_clear_no_prior_accept"
+
+    elapsed = utc_now() - last_dt
+    cd = timedelta(minutes=cd_min)
+
+    if elapsed < cd:
+        remain = cd - elapsed
+        remain_min = max(1, int(remain.total_seconds() // 60))
+        return True, f"cooldown_active_pair_{cd_min}m_remaining_{remain_min}m"
+
+    return False, "cooldown_clear"
+
+
+def make_reject(reason: str, gate: str) -> Dict[str, Any]:
+    return {
+        "decision": "REJECT",
+        "reason": reason,
+        "gate": gate,
+    }
+
+def current_wib_date() -> str:
+    return datetime.now(WIB).strftime("%Y-%m-%d")
+
+
+def ensure_daily_counters(state: Dict[str, Any]) -> Dict[str, Any]:
+    today = current_wib_date()
+    dc = state.get("daily_counters") or {}
+
+    if dc.get("date_wib") != today:
+        dc = {
+            "date_wib": today,
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "accepted_by_pair": {},
+            "rejected_by_gate": {},
+        }
+
+    state["daily_counters"] = dc
+    return dc
+
+
+def kill_switch_active() -> tuple[bool, str]:
+    if env_bool("KILL_SWITCH", False):
+        return True, "kill_switch_active"
+    return False, "kill_switch_clear"
+
+
+def daily_max_trades_active(state: Dict[str, Any]) -> tuple[bool, str]:
+    dc = ensure_daily_counters(state)
+    max_trades = env_int("MAX_TRADES_PER_DAY", 5)
+    accepted = int(dc.get("accepted_count") or 0)
+
+    if max_trades > 0 and accepted >= max_trades:
+        return True, f"daily_max_trades_reached:{accepted}/{max_trades}"
+
+    return False, "daily_max_trades_clear"
+
+
+def increment_accept_counter(state: Dict[str, Any], pair: str) -> None:
+    dc = ensure_daily_counters(state)
+
+    dc["accepted_count"] = int(dc.get("accepted_count") or 0) + 1
+
+    by_pair = dc.get("accepted_by_pair") or {}
+    by_pair[pair] = int(by_pair.get(pair) or 0) + 1
+    dc["accepted_by_pair"] = by_pair
+
+    state["daily_counters"] = dc
+
+
+def increment_reject_counter(state: Dict[str, Any], gate: str) -> None:
+    dc = ensure_daily_counters(state)
+
+    dc["rejected_count"] = int(dc.get("rejected_count") or 0) + 1
+
+    by_gate = dc.get("rejected_by_gate") or {}
+    gate_key = str(gate or "unknown_gate")
+    by_gate[gate_key] = int(by_gate.get(gate_key) or 0) + 1
+    dc["rejected_by_gate"] = by_gate
+
+    state["daily_counters"] = dc
+
+
+def paper_decide(p: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    signal_key = signal_key_of(p)
+    pair = pair_of(p)
+    status = status_of(p)
+
+    seen = set(state.get("seen_signal_keys") or [])
+
+    # 1) duplicate signal_key
+    if not signal_key:
+        return make_reject("missing_signal_key", "duplicate_check")
+
+    if signal_key in seen:
+        return make_reject("duplicate_signal_key", "duplicate_check")
+
+    # 2) status must be CONFIRMED
+    if status != "CONFIRMED":
+        return make_reject(f"status_not_confirmed:{status or 'EMPTY'}", "status_gate")
+
+    # 3) allowlist
+    allowlist_enabled = env_bool("PAIR_ALLOWLIST_ENABLED", True)
+    allowlist = csv_set("PAIR_ALLOWLIST")
+    if allowlist_enabled:
+        if not allowlist:
+            return make_reject("pair_allowlist_empty", "allowlist_gate")
+        if pair not in allowlist:
+            return make_reject(f"pair_not_allowlisted:{pair}", "allowlist_gate")
+
+    # 4A) kill switch
+    ks_on, ks_reason = kill_switch_active()
+    if ks_on:
+        return make_reject(ks_reason, "kill_switch_gate")
+
+    # 4B) daily max trades
+    dm_on, dm_reason = daily_max_trades_active(state)
+    if dm_on:
+        return make_reject(dm_reason, "daily_max_trades_gate")
+
+    # 4) cooldown pair
+    cd_on, cd_reason = cooldown_active(state, pair)
+    if cd_on:
+        return make_reject(cd_reason, "cooldown_gate")
+
+    # 5) max open paper position
+    max_open = env_int("MAX_OPEN_PAPER_POSITIONS", 1)
+    cur_open = open_paper_count(state)
+    if cur_open >= max_open:
+        return make_reject(f"max_open_paper_positions_reached:{cur_open}/{max_open}", "max_open_gate")
+
+    # 6) calendar blackout
+    cal_on, cal_reason = is_calendar_blackout_active()
+    if cal_on:
+        return make_reject(cal_reason, "calendar_gate")
+
+    # 7) daily stop
+    ds_on, ds_reason = daily_stop_active(state)
+    if ds_on:
+        return make_reject(ds_reason, "daily_stop_gate")
+
+    # 8) accept
+    return {
+        "decision": "ACCEPT",
+        "reason": "all_paper_gates_pass",
+        "gate": "paper_gate",
+    }
+
+
+def apply_decision_to_state(p: Dict[str, Any], decision: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    signal_key = signal_key_of(p)
+    pair = pair_of(p)
+
+    if signal_key:
+        keys = state.get("seen_signal_keys") or []
+        if signal_key not in keys:
+            keys.append(signal_key)
+        state["seen_signal_keys"] = keys
+
+    if decision.get("decision") == "REJECT":
+        increment_reject_counter(state, decision.get("gate") or "unknown_gate")
+
+    if decision.get("decision") == "ACCEPT":
+        now_iso = utc_now_iso()
+        increment_accept_counter(state, pair)
+        accepted_by_pair = state.get("accepted_by_pair") or {}
+        accepted_by_pair[pair] = now_iso
+        state["accepted_by_pair"] = accepted_by_pair
+
+        positions = state.get("open_paper_positions") or []
+        positions.append({
+            "signal_key": signal_key,
+            "pair": pair,
+            "direction": direction_of(p),
+            "status": "OPEN",
+            "accepted_at_utc": now_iso,
+            "entry_mid": p.get("entry_mid"),
+            "sl": p.get("sl") or p.get("invalid"),
+            "tp1": p.get("tp1"),
+            "tp2": p.get("tp2"),
+            "tp3": p.get("tp3"),
+        })
+        state["open_paper_positions"] = positions
+        handle_execution_after_accept(p)
+
+    return state
+
+
+def build_signal_log(p: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "received_at_utc": utc_now_iso(),
+        "received_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+        "decision": "RECEIVED_ONLY" if get_mode() == "RECEIVED_ONLY" else "PAPER_EVAL",
+        "reason": "raw_signal_logged",
+        "signal_id": p.get("signal_id") or p.get("signal_key"),
+        "signal_key": p.get("signal_key") or p.get("signal_id"),
+        "pair": p.get("pair") or p.get("symbol"),
+        "direction": p.get("direction") or p.get("dir"),
+        "status": p.get("status") or p.get("state"),
+        "payload": p,
+    }
+
+def binance_testnet_keys_present() -> tuple[bool, str]:
+    api_key = str(os.getenv("BINANCE_TESTNET_API_KEY", "")).strip()
+    api_secret = str(os.getenv("BINANCE_TESTNET_API_SECRET", "")).strip()
+
+    if not api_key:
+        return False, "missing_binance_testnet_api_key"
+    if not api_secret:
+        return False, "missing_binance_testnet_api_secret"
+
+    return True, "binance_testnet_keys_present"
+
+
+def binance_testnet_signed_request(method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    if binance_env() != "TESTNET":
+        return {"ok": False, "reason": "binance_env_not_testnet"}
+
+    api_key = str(os.getenv("BINANCE_TESTNET_API_KEY", "")).strip()
+    api_secret = str(os.getenv("BINANCE_TESTNET_API_SECRET", "")).strip()
+    base_url = str(os.getenv("BINANCE_FUTURES_TESTNET_BASE_URL", "https://demo-fapi.binance.com")).strip()
+
+    if not api_key:
+        return {"ok": False, "reason": "missing_binance_testnet_api_key"}
+    if not api_secret:
+        return {"ok": False, "reason": "missing_binance_testnet_api_secret"}
+
+    payload = dict(params or {})
+    payload["timestamp"] = int(time.time() * 1000)
+    payload["recvWindow"] = int(payload.get("recvWindow") or 5000)
+
+    query = urllib.parse.urlencode(payload, doseq=True)
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    signed_query = query + "&signature=" + signature
+    url = base_url.rstrip("/") + path
+
+    headers = {
+        "X-MBX-APIKEY": api_key
+    }
+
+    try:
+        if method.upper() == "POST":
+            resp = requests.post(url, headers=headers, data=signed_query, timeout=10)
+        elif method.upper() == "GET":
+            resp = requests.get(url + "?" + signed_query, headers=headers, timeout=10)
+        else:
+            return {"ok": False, "reason": f"unsupported_method:{method}"}
+
+        text = resp.text
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": text}
+
+        return {
+            "ok": 200 <= resp.status_code < 300,
+            "http_status": resp.status_code,
+            "body": body,
+            "path": path,
+            "method": method.upper(),
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "binance_request_exception",
+            "error": str(e),
+            "path": path,
+            "method": method.upper(),
+        }
+
+
+def binance_order_test(plan: Dict[str, Any]) -> Dict[str, Any]:
+    if binance_env() != "TESTNET":
+        return {"ok": False, "reason": "binance_env_not_testnet"}
+
+    if not env_bool("ORDER_TEST_ENDPOINT_ONLY", True):
+        return {"ok": False, "reason": "order_test_endpoint_only_required"}
+
+    symbol = str(plan.get("symbol") or "").strip().upper()
+    side = str(plan.get("entry_side") or "").strip().upper()
+
+    # v0.7 uses tiny fixed quantity only for /order/test parameter validation.
+    # It does NOT submit to matching engine.
+    quantity = str(plan.get("quantity") or "0.001")
+
+    if not symbol:
+        return {"ok": False, "reason": "missing_symbol"}
+    if side not in ("BUY", "SELL"):
+        return {"ok": False, "reason": f"invalid_side:{side}"}
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": quantity,
+    }
+
+    return binance_testnet_signed_request("POST", "/fapi/v1/order/test", params)
+
+def execution_mode() -> str:
+    return str(os.getenv("EXECUTION_MODE", "DISABLED")).strip().upper()
+
+
+def binance_env() -> str:
+    return str(os.getenv("BINANCE_ENV", "TESTNET")).strip().upper()
+
+
+def pair_to_binance_symbol(pair: str) -> str:
+    s = str(pair or "").strip().upper()
+    s = s.replace("BINANCE:", "")
+    s = s.replace(".P", "")
+    return s
+
+
+def testnet_allowed_symbols() -> set[str]:
+    raw = os.getenv("TESTNET_ALLOWED_SYMBOLS", "")
+    return {x.strip().upper() for x in raw.split(",") if x.strip()}
+
+
+def build_execution_plan(p: Dict[str, Any]) -> Dict[str, Any]:
+    pair = pair_of(p)
+    symbol = pair_to_binance_symbol(pair)
+    direction = direction_of(p)
+
+    entry_mid = p.get("entry_mid")
+    sl = p.get("sl") or p.get("invalid")
+    tp1 = p.get("tp1")
+    tp2 = p.get("tp2")
+    tp3 = p.get("tp3")
+
+    side = "BUY" if direction == "Long" else "SELL"
+    exit_side = "SELL" if direction == "Long" else "BUY"
+
+    return {
+        "plan_id": f"PLAN|{signal_key_of(p)}",
+        "created_at_utc": utc_now_iso(),
+        "app_version": APP_VERSION,
+        "execution_mode": execution_mode(),
+        "binance_env": binance_env(),
+        "signal_key": signal_key_of(p),
+        "pair": pair,
+        "symbol": symbol,
+        "direction": direction,
+        "entry_type": "MARKET",
+        "entry_side": side,
+        "exit_side": exit_side,
+        "entry_mid": entry_mid,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "leverage": env_int("DEFAULT_LEVERAGE", 2),
+        "margin_type": "ISOLATED",
+        "quantity": None,
+        "notional_usdt_cap": env_int("TESTNET_MAX_NOTIONAL_USDT", 50),
+        "risk_usdt": env_int("TESTNET_RISK_USDT_PER_TRADE", 5),
+        "payload": p,
+    }
+
+
+def validate_execution_plan(plan: Dict[str, Any]) -> tuple[bool, str]:
+    mode = execution_mode()
+
+    if mode == "DISABLED":
+        return False, "execution_mode_disabled"
+
+    if binance_env() != "TESTNET":
+        return False, "binance_env_not_testnet"
+
+    if env_bool("TESTNET_KILL_SWITCH", False):
+        return False, "testnet_kill_switch_active"
+
+    if mode != "TESTNET_DRY_RUN":
+        if not env_bool("ENABLE_TESTNET_ORDERS", False):
+            return False, "enable_testnet_orders_false"
+
+    if env_bool("ORDER_REQUIRE_SL", True) and not plan.get("sl"):
+        return False, "missing_sl"
+
+    if env_bool("ORDER_REQUIRE_TP", True) and not (plan.get("tp1") or plan.get("tp2") or plan.get("tp3")):
+        return False, "missing_tp"
+
+    allowed = testnet_allowed_symbols()
+    if allowed and plan.get("symbol") not in allowed:
+        return False, f"symbol_not_allowed_for_testnet:{plan.get('symbol')}"
+
+    if env_bool("ISOLATED_MARGIN_ONLY", True) and plan.get("margin_type") != "ISOLATED":
+        return False, "isolated_margin_required"
+
+    return True, "execution_plan_valid"
+
+
+def handle_execution_after_accept(p: Dict[str, Any]) -> Dict[str, Any]:
+    plan = build_execution_plan(p)
+    ok, reason = validate_execution_plan(plan)
+
+    event = {
+        "event_at_utc": utc_now_iso(),
+        "event_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "execution_mode": execution_mode(),
+        "binance_env": binance_env(),
+        "signal_key": signal_key_of(p),
+        "pair": pair_of(p),
+        "symbol": plan.get("symbol"),
+        "decision": "BUILT_ONLY" if ok else "SKIPPED",
+        "reason": reason,
+        "plan": plan,
+    }
+
+    append_jsonl(EXECUTION_EVENTS_LOG, event)
+
+    if ok:
+        append_jsonl(EXECUTION_PLANS_LOG, plan)
+
+    return event
+
+def build_decision_log(p: Dict[str, Any], decision: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "decision_at_utc": utc_now_iso(),
+        "decision_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+
+        "decision": decision.get("decision"),
+        "reason": decision.get("reason"),
+        "gate": decision.get("gate"),
+
+        "signal_key": signal_key_of(p),
+        "signal_id": p.get("signal_id") or p.get("signal_key"),
+        "pair": pair_of(p),
+        "direction": direction_of(p),
+        "status": status_of(p),
+        "priority": p.get("priority"),
+        "score": p.get("score"),
+
+        "entry_mid": p.get("entry_mid"),
+        "signal_time_wib": p.get("signal_time_wib"),
+        "run_ts_wib": p.get("run_ts_wib"),
+        "confirmed_ts_wib": p.get("confirmed_ts_wib"),
+
+        "state_snapshot": {
+            "open_paper_positions": open_paper_count(state),
+            "seen_signal_keys_count": len(state.get("seen_signal_keys") or []),
+        },
+
+        "payload": p,
+    }
+
+
+
+def normalize_close_status(outcome: Any) -> str:
+    raw = str(outcome or "").strip().upper()
+
+    mapping = {
+        "TP1": "CLOSED_TP1",
+        "TP2": "CLOSED_TP2",
+        "TP3": "CLOSED_TP3",
+        "SL": "CLOSED_SL",
+        "BE": "CLOSED_BE",
+        "MANUAL": "CLOSED_MANUAL",
+        "CLOSE": "CLOSED_MANUAL",
+        "CLOSED": "CLOSED_MANUAL",
+        "EXPIRE": "EXPIRED",
+        "EXPIRED": "EXPIRED",
+    }
+
+    if raw in mapping:
+        return mapping[raw]
+
+    allowed = {
+        "OPEN",
+        "CLOSED_TP1",
+        "CLOSED_TP2",
+        "CLOSED_TP3",
+        "CLOSED_SL",
+        "CLOSED_BE",
+        "CLOSED_MANUAL",
+        "EXPIRED",
+    }
+
+    if raw in allowed:
+        return raw
+
+    return "CLOSED_MANUAL"
+
+
+def append_paper_event(event_type: str, position: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> None:
+    extra = extra or {}
+    event = {
+        "event_at_utc": utc_now_iso(),
+        "event_at_wib": wib_now_iso(),
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+        "event_type": event_type,
+        "signal_key": position.get("signal_key"),
+        "pair": position.get("pair"),
+        "direction": position.get("direction"),
+        "status": position.get("status"),
+        "entry_mid": position.get("entry_mid"),
+        "sl": position.get("sl"),
+        "tp1": position.get("tp1"),
+        "tp2": position.get("tp2"),
+        "tp3": position.get("tp3"),
+        "position": position,
+    }
+    event.update(extra)
+    append_jsonl(PAPER_EVENTS_LOG, event)
+
+def close_one_position_in_state(
+    state: Dict[str, Any],
+    signal_key: str,
+    outcome: str = "CLOSED_MANUAL",
+    close_reason: str = "MANUAL_CLOSE",
+    close_price: Optional[float] = None,
+    notes: Optional[str] = None,
+) -> Dict[str, Any]:
+    signal_key = str(signal_key or "").strip()
+    if not signal_key:
+        return {"ok": False, "reason": "missing_signal_key"}
+
+    positions = state.get("open_paper_positions") or []
+    remaining = []
+    target = None
+
+    for pos in positions:
+        if (
+            not target
+            and str(pos.get("signal_key") or "").strip() == signal_key
+            and str(pos.get("status", "OPEN")).upper() == "OPEN"
+        ):
+            target = dict(pos)
+        else:
+            remaining.append(pos)
+
+    if not target:
+        return {
+            "ok": False,
+            "reason": "open_position_not_found",
+            "signal_key": signal_key,
+        }
+
+    closed_at_utc = utc_now_iso()
+    close_status = normalize_close_status(outcome)
+
+    target["status"] = close_status
+    target["closed_at_utc"] = closed_at_utc
+    target["closed_at_wib"] = datetime.now(WIB).isoformat()
+    target["close_reason"] = close_reason or "MANUAL_CLOSE"
+    target["close_outcome"] = outcome or close_status
+    target["close_price"] = close_price
+    target["notes"] = notes or ""
+
+    state["open_paper_positions"] = remaining
+
+    closed = state.get("closed_paper_positions") or []
+    closed.append(target)
+    if len(closed) > 1000:
+        closed = closed[-1000:]
+    state["closed_paper_positions"] = closed
+
+    append_paper_event(
+        "PAPER_POSITION_CLOSED",
+        target,
+        {
+            "close_reason": target["close_reason"],
+            "close_outcome": target["close_outcome"],
+            "close_price": close_price,
+        },
+    )
+
+    return {
+        "ok": True,
+        "reason": "paper_position_closed",
+        "closed_position": target,
+        "open_paper_positions": open_paper_count(state),
+        "closed_paper_positions": len(state.get("closed_paper_positions") or []),
+    }
+
+def close_all_positions_in_state(
+    state: Dict[str, Any],
+    outcome: str = "CLOSED_MANUAL",
+    close_reason: str = "MANUAL_CLOSE_ALL",
+    close_price: Optional[float] = None,
+    notes: Optional[str] = None,
+) -> Dict[str, Any]:
+    positions = state.get("open_paper_positions") or []
+    if not positions:
+        return {
+            "ok": True,
+            "reason": "no_open_positions",
+            "closed_count": 0,
+            "open_paper_positions": 0,
+        }
+
+    closed_now = []
+    remaining = []
+
+    for pos0 in positions:
+        pos = dict(pos0)
+        if str(pos.get("status", "OPEN")).upper() != "OPEN":
+            remaining.append(pos)
+            continue
+
+        close_status = normalize_close_status(outcome)
+
+        pos["status"] = close_status
+        pos["closed_at_utc"] = utc_now_iso()
+        pos["closed_at_wib"] = datetime.now(WIB).isoformat()
+        pos["close_reason"] = close_reason or "MANUAL_CLOSE_ALL"
+        pos["close_outcome"] = outcome or close_status
+        pos["close_price"] = close_price
+        pos["notes"] = notes or ""
+
+        closed_now.append(pos)
+
+        append_paper_event(
+            "PAPER_POSITION_CLOSED",
+            pos,
+            {
+                "close_reason": pos["close_reason"],
+                "close_outcome": pos["close_outcome"],
+                "close_price": close_price,
+            },
+        )
+
+    closed = state.get("closed_paper_positions") or []
+    closed.extend(closed_now)
+    if len(closed) > 1000:
+        closed = closed[-1000:]
+
+    state["open_paper_positions"] = remaining
+    state["closed_paper_positions"] = closed
+
+    return {
+        "ok": True,
+        "reason": "paper_positions_closed_all",
+        "closed_count": len(closed_now),
+        "open_paper_positions": open_paper_count(state),
+        "closed_positions": closed_now,
+    }
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+        "time_utc": utc_now_iso(),
+    }
+
+
+@app.post("/webhook/signal")
+def webhook_signal(
+    payload: SignalPayload,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    p = payload_to_dict(payload)
+    mode = get_mode()
+
+    with LOCK:
+        append_jsonl(SIGNALS_LOG, build_signal_log(p))
+
+        state = load_state()
+
+        if mode == "RECEIVED_ONLY":
+            decision = {
+                "decision": "RECEIVED_ONLY",
+                "reason": "receiver_only_logger_mode_no_paper_gate_no_execution",
+                "gate": "mode_gate",
+            }
+            append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+
+            return {
+                "ok": True,
+                "decision": "RECEIVED_ONLY",
+                "reason": "v0.3 logger mode, no execution",
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+            }
+
+        # PAPER mode: accept/reject only. No Binance execution.
+        decision = paper_decide(p, state)
+        state = apply_decision_to_state(p, decision, state)
+        save_state(state)
+
+        append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+
+        return {
+            "ok": True,
+            "decision": decision["decision"],
+            "reason": decision["reason"],
+            "gate": decision["gate"],
+            "signal_id": p.get("signal_id") or p.get("signal_key"),
+        }
+
+
+@app.get("/paper/state")
+def paper_state(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    state = load_state()
+    return {
+        "ok": True,
+        "mode": get_mode(),
+        "open_paper_positions": open_paper_count(state),
+        "seen_signal_keys_count": len(state.get("seen_signal_keys") or []),
+        "state": state,
+    }
+
+
+@app.post("/paper/reset")
+def paper_reset(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    state = default_state()
+    save_state(state)
+
+    return {
+        "ok": True,
+        "reason": "paper_state_reset",
+        "mode": get_mode(),
+    }
+
+@app.get("/paper/positions")
+def paper_positions(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    state = load_state()
+    open_positions = [
+        p for p in (state.get("open_paper_positions") or [])
+        if str(p.get("status", "OPEN")).upper() == "OPEN"
+    ]
+    closed_positions = state.get("closed_paper_positions") or []
+
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+        "open_paper_positions": len(open_positions),
+        "closed_paper_positions": len(closed_positions),
+        "positions": open_positions,
+        "closed_recent": closed_positions[-20:],
+    }
+
+@app.post("/paper/close")
+def paper_close(
+    req: PaperClosePayload,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    with LOCK:
+        state = load_state()
+        res = close_one_position_in_state(
+            state=state,
+            signal_key=req.signal_key,
+            outcome=req.outcome or "CLOSED_MANUAL",
+            close_reason=req.close_reason or "MANUAL_CLOSE",
+            close_price=req.close_price,
+            notes=req.notes,
+        )
+
+        if res.get("ok"):
+            save_state(state)
+
+        return res
+
+@app.post("/paper/close-all")
+def paper_close_all(
+    req: Optional[PaperCloseAllPayload] = None,
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    req = req or PaperCloseAllPayload()
+
+    with LOCK:
+        state = load_state()
+        res = close_all_positions_in_state(
+            state=state,
+            outcome=req.outcome or "CLOSED_MANUAL",
+            close_reason=req.close_reason or "MANUAL_CLOSE_ALL",
+            close_price=req.close_price,
+            notes=req.notes,
+        )
+        save_state(state)
+        return res
+
+@app.get("/risk/daily")
+def risk_daily(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    state = load_state()
+    dc = ensure_daily_counters(state)
+
+    max_trades = env_int("MAX_TRADES_PER_DAY", 5)
+    accepted = int(dc.get("accepted_count") or 0)
+    remaining = max(0, max_trades - accepted) if max_trades > 0 else 999999
+
+    ds_on, ds_reason = daily_stop_active(state)
+    ks_on, ks_reason = kill_switch_active()
+
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "mode": get_mode(),
+        "date_wib": dc.get("date_wib"),
+        "max_trades_per_day": max_trades,
+        "accepted_count": accepted,
+        "rejected_count": int(dc.get("rejected_count") or 0),
+        "remaining_trades": remaining,
+        "accepted_by_pair": dc.get("accepted_by_pair") or {},
+        "rejected_by_gate": dc.get("rejected_by_gate") or {},
+        "kill_switch": ks_on,
+        "kill_switch_reason": ks_reason,
+        "daily_stop_active": ds_on,
+        "daily_stop_reason": ds_reason,
+    }
+
+@app.post("/risk/reset-daily")
+def risk_reset_daily(
+    x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> Dict[str, Any]:
+    verify_secret(x_signal_secret, x_webhook_secret)
+
+    with LOCK:
+        state = load_state()
+        today = current_wib_date()
+
+        state["daily_counters"] = {
+            "date_wib": today,
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "accepted_by_pair": {},
+            "rejected_by_gate": {},
+        }
+
+        save_state(state)
+
+        return {
+            "ok": True,
+            "reason": "daily_counters_reset",
+            "mode": get_mode(),
+            "date_wib": today,
+            "daily_counters": state["daily_counters"],
+        }

@@ -1,0 +1,139 @@
+{
+  "ok": true,
+  "version": "ml_dataset_v4_outcome_join_v1",
+  "created_at_utc": "2026-06-24T18:56:14.352653+00:00",
+  "out_jsonl": "logs/ml_dataset_v4_outcome_join_v1.jsonl",
+  "rows": 149,
+  "wins": 65,
+  "losses": 84,
+  "symbols": [
+    "ADAUSDT",
+    "AVAXUSDT",
+    "BCHUSDT",
+    "ETHUSDT",
+    "HYPEUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "PAXGUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "UNIUSDT",
+    "XRPUSDT",
+    "ZECUSDT"
+  ],
+  "symbol_count": 13,
+  "feature_source_counts": {
+    "v4_current14": 106,
+    "v3_feature_join": 43
+  },
+  "unmatched_outcome_labels": 32,
+  "unmatched_sample": [
+    {
+      "signal_key": "HYPEUSDT|LONG|1780621200000",
+      "symbol": "HYPEUSDT",
+      "closed_at_utc": "2026-06-05T02:44:35.414705+00:00"
+    },
+    {
+      "signal_key": "HYPEUSDT|SHORT|1781046900000",
+      "symbol": "HYPEUSDT",
+      "closed_at_utc": "2026-06-10T00:33:18.358253+00:00"
+    },
+    {
+      "signal_key": "LINKUSDT|SHORT|1781194500000",
+      "symbol": "LINKUSDT",
+      "closed_at_utc": "2026-06-11T17:03:21.896473+00:00"
+    },
+    {
+      "signal_key": "BCHUSDT|SHORT|1781210700000",
+      "symbol": "BCHUSDT",
+      "closed_at_utc": "2026-06-11T21:23:26.802516+00:00"
+    },
+    {
+      "signal_key": "SUIUSDT|SHORT|1781209800000",
+      "symbol": "SUIUSDT",
+      "closed_at_utc": "2026-06-11T23:12:26.441705+00:00"
+    },
+    {
+      "signal_key": "ZECUSDT|SHORT|1781218800000",
+      "symbol": "ZECUSDT",
+      "closed_at_utc": "2026-06-11T23:52:12.514812+00:00"
+    },
+    {
+      "signal_key": "ETHUSDT|SHORT|1781214300000",
+      "symbol": "ETHUSDT",
+      "closed_at_utc": "2026-06-12T01:23:37.270585+00:00"
+    },
+    {
+      "signal_key": "LINKUSDT|SHORT|1781221500000",
+      "symbol": "LINKUSDT",
+      "closed_at_utc": "2026-06-12T01:27:47.133544+00:00"
+    },
+    {
+      "signal_key": "ADAUSDT|SHORT|1781219700000",
+      "symbol": "ADAUSDT",
+      "closed_at_utc": "2026-06-12T04:16:41.533585+00:00"
+    },
+    {
+      "signal_key": "BCHUSDT|SHORT|1781233200000",
+      "symbol": "BCHUSDT",
+      "closed_at_utc": "2026-06-12T04:24:35.990076+00:00"
+    },
+    {
+      "signal_key": "AVAXUSDT|SHORT|1781235000000",
+      "symbol": "AVAXUSDT",
+      "closed_at_utc": "2026-06-12T04:31:46.413753+00:00"
+    },
+    {
+      "signal_key": "LINKUSDT|SHORT|1781236800000",
+      "symbol": "LINKUSDT",
+      "closed_at_utc": "2026-06-12T05:12:22.447016+00:00"
+    },
+    {
+      "signal_key": "LTCUSDT|SHORT|1781240400000",
+      "symbol": "LTCUSDT",
+      "closed_at_utc": "2026-06-12T05:38:04.734244+00:00"
+    },
+    {
+      "signal_key": "AVAXUSDT|SHORT|1781241300000",
+      "symbol": "AVAXUSDT",
+      "closed_at_utc": "2026-06-12T06:10:41.388891+00:00"
+    },
+    {
+      "signal_key": "XRPUSDT|SHORT|1781233200000",
+      "symbol": "XRPUSDT",
+      "closed_at_utc": "2026-06-12T06:21:25.934576+00:00"
+    },
+    {
+      "signal_key": "SUIUSDT|SHORT|1781245800000",
+      "symbol": "SUIUSDT",
+      "closed_at_utc": "2026-06-12T08:18:23.991329+00:00"
+    },
+    {
+      "signal_key": "LTCUSDT|SHORT|1781264700000",
+      "symbol": "LTCUSDT",
+      "closed_at_utc": "2026-06-12T12:25:25.990259+00:00"
+    },
+    {
+      "signal_key": "BCHUSDT|SHORT|1781267400000",
+      "symbol": "BCHUSDT",
+      "closed_at_utc": "2026-06-12T13:28:26.771489+00:00"
+    },
+    {
+      "signal_key": "LTCUSDT|SHORT|1781324100000",
+      "symbol": "LTCUSDT",
+      "closed_at_utc": "2026-06-13T05:30:24.791692+00:00"
+    },
+    {
+      "signal_key": "ETHUSDT|SHORT|1781332200000",
+      "symbol": "ETHUSDT",
+      "closed_at_utc": "2026-06-13T06:56:34.071912+00:00"
+    }
+  ],
+  "promotion_ready": false,
+  "promotion_blockers": [
+    "below_500_matched_trainable_labels",
+    "cleanup_inferred_labels_not_binance_order_history_confirmed",
+    "walk_forward_validation_not_run"
+  ],
+  "note": "Outcome-joined dataset for report-only/challenger shadow. Do not promote live model from this file alone."
+}
