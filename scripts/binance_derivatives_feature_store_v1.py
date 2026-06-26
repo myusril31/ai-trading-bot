@@ -18,6 +18,34 @@ REPORTS.mkdir(exist_ok=True)
 
 OUT_JSONL = LOGS / "feature_store_binance_derivatives_v1.jsonl"
 OUT_REPORT = REPORTS / "feature_store_binance_derivatives_v1_report.json"
+OUT_LIQ_WS_JSONL = LOGS / "feature_store_binance_liquidations_v1.jsonl"
+
+# === READ_LIQUIDATION_WS_FEATURES_20260627 ===
+def read_latest_liq_ws_features(symbol, max_age_sec=20 * 60):
+    if not OUT_LIQ_WS_JSONL.exists():
+        return None
+    now_ts = datetime.now(timezone.utc).timestamp()
+    latest = None
+    try:
+        with OUT_LIQ_WS_JSONL.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if str(r.get("symbol") or "").upper() != symbol:
+                    continue
+                ts = r.get("created_at_utc")
+                try:
+                    t = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+                except Exception:
+                    continue
+                if now_ts - t <= max_age_sec:
+                    latest = r
+    except Exception:
+        return None
+    return latest
+
 
 DEFAULT_SYMBOLS = [
     "ADAUSDT", "AVAXUSDT", "BCHUSDT", "BTCUSDT", "ETHUSDT",
@@ -235,30 +263,35 @@ def compute_symbol(symbol):
     except Exception as e:
         errors.append(f"top_pos:{str(e)[:120]}")
 
-    liqs, liq_ok, liq_err = fetch_liquidations_optional(symbol, minutes=15)
-    long_liq = 0.0
-    short_liq = 0.0
-    liq_count = 0
-    for x in liqs:
-        qty = to_float(x.get("origQty") or x.get("executedQty"), 0.0) or 0.0
-        px = to_float(x.get("price") or x.get("avgPrice"), 0.0) or 0.0
-        notional = qty * px
-        side = str(x.get("side") or "").upper()
-        # Binance forced order side is the forced close order side.
-        # SELL usually closes/liquidates longs, BUY usually closes/liquidates shorts.
-        if side == "SELL":
-            long_liq += notional
-        elif side == "BUY":
-            short_liq += notional
-        liq_count += 1
-
-    row["deriv_liq_fetch_ok"] = liq_ok
-    row["deriv_liq_fetch_error"] = liq_err
-    row["deriv_liq_long_notional_15m"] = long_liq
-    row["deriv_liq_short_notional_15m"] = short_liq
-    row["deriv_liq_total_notional_15m"] = long_liq + short_liq
-    row["deriv_liq_order_count_15m"] = liq_count
-    row["deriv_liq_imbalance_15m"] = safe_div((short_liq - long_liq), (short_liq + long_liq), 0.0)
+    # === USE_LIQUIDATION_WS_FEATURES_20260627 ===
+    liq_ws = read_latest_liq_ws_features(symbol)
+    if liq_ws:
+        row["deriv_liq_fetch_ok"] = True
+        row["deriv_liq_fetch_error"] = None
+        row["deriv_liq_source"] = "binance_force_order_ws_v1"
+        row["deriv_liq_long_notional_1m"] = liq_ws.get("liq_long_notional_1m")
+        row["deriv_liq_short_notional_1m"] = liq_ws.get("liq_short_notional_1m")
+        row["deriv_liq_total_notional_1m"] = liq_ws.get("liq_total_notional_1m")
+        row["deriv_liq_imbalance_1m"] = liq_ws.get("liq_imbalance_1m")
+        row["deriv_liq_long_notional_5m"] = liq_ws.get("liq_long_notional_5m")
+        row["deriv_liq_short_notional_5m"] = liq_ws.get("liq_short_notional_5m")
+        row["deriv_liq_total_notional_5m"] = liq_ws.get("liq_total_notional_5m")
+        row["deriv_liq_imbalance_5m"] = liq_ws.get("liq_imbalance_5m")
+        row["deriv_liq_long_notional_15m"] = liq_ws.get("liq_long_notional_15m")
+        row["deriv_liq_short_notional_15m"] = liq_ws.get("liq_short_notional_15m")
+        row["deriv_liq_total_notional_15m"] = liq_ws.get("liq_total_notional_15m")
+        row["deriv_liq_order_count_15m"] = liq_ws.get("liq_count_15m")
+        row["deriv_liq_largest_notional_15m"] = liq_ws.get("liq_largest_notional_15m")
+        row["deriv_liq_imbalance_15m"] = liq_ws.get("liq_imbalance_15m")
+    else:
+        row["deriv_liq_fetch_ok"] = False
+        row["deriv_liq_fetch_error"] = "liq_ws_feature_missing_or_stale"
+        row["deriv_liq_source"] = "missing"
+        row["deriv_liq_long_notional_15m"] = None
+        row["deriv_liq_short_notional_15m"] = None
+        row["deriv_liq_total_notional_15m"] = None
+        row["deriv_liq_order_count_15m"] = None
+        row["deriv_liq_imbalance_15m"] = None
 
     # Conservative SMC-compatible derived scores, not live gates.
     funding_z = row.get("deriv_global_ls_z_24h") or 0.0
