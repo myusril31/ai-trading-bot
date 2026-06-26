@@ -5607,6 +5607,90 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
 
 def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(payload or {})
+
+    # === LIVE_ENTRY_CONFLUENCE_GATE_BRIDGE_20260627 ===
+    # LIVE HARD GATE:
+    # SMC signal must pass derivatives + macro + quant confluence before any order is sent.
+    # This gate only blocks/allows. It never changes TP, SL, sizing, leverage, or margin.
+    try:
+        from app.live_entry_confluence_gate_v1 import evaluate_live_entry_confluence_gate_v1
+        _entry_conf = evaluate_live_entry_confluence_gate_v1(p)
+    except Exception as _entry_conf_e:
+        _fail_closed = str(os.getenv("LIVE_ENTRY_CONFLUENCE_FAIL_CLOSED", "true")).lower() in ("1", "true", "yes", "on")
+        _entry_conf = {
+            "ok": False,
+            "decision": "BLOCK" if _fail_closed else "ALLOW",
+            "allow": False if _fail_closed else True,
+            "gate": "live_entry_confluence_gate_v1",
+            "reason": "entry_confluence_gate_error",
+            "error": str(_entry_conf_e)[:240],
+        }
+
+    p["live_entry_confluence_gate_v1"] = _entry_conf
+
+    # === LIVE_RR12_PLAN_LOCK_BRIDGE_20260627 ===
+    # After SMC + derivatives + macro + quant confluence allows the setup,
+    # lock the final live plan:
+    #   SL = validated structural SMC SL
+    #   TP = single full target @ RR_TARGET_R, default 1.2R
+    # This never changes sizing, leverage, margin, or risk_usdt.
+    if str((_entry_conf or {}).get("decision") or "").upper() != "BLOCK":
+        try:
+            from app.live_rr12_plan_lock_v1 import apply_live_rr12_plan_lock_v1
+            _rr12_lock = apply_live_rr12_plan_lock_v1(p)
+        except Exception as _rr12_e:
+            _rr12_lock = {
+                "ok": False,
+                "decision": "BLOCK",
+                "allow": False,
+                "gate": "live_rr12_plan_lock_v1",
+                "reason": "rr12_plan_lock_error",
+                "error": str(_rr12_e)[:240],
+            }
+
+        p["live_rr12_plan_lock_v1"] = _rr12_lock
+
+        if str((_rr12_lock or {}).get("decision") or "").upper() == "BLOCK":
+            return {
+                "ok": True,
+                "decision": "NO_TRADE",
+                "reason": (_rr12_lock or {}).get("reason") or "live_rr12_plan_lock_block",
+                "gate": "live_rr12_plan_lock_v1",
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+                "symbol": p.get("symbol"),
+                "direction": p.get("direction") or p.get("dir") or p.get("side"),
+                "execution_mode": execution_mode(),
+                "live_entry_confluence_gate_v1": _entry_conf,
+                "live_rr12_plan_lock_v1": _rr12_lock,
+            }
+
+        if isinstance((_rr12_lock or {}).get("payload"), dict):
+            p = dict((_rr12_lock or {}).get("payload") or p)
+
+        # If existing RR rewrite helper exists in this app version, let it enforce
+        # the already-existing SINGLE_FULL quantity behavior too.
+        try:
+            _rr_rewrite_fn = globals().get("apply_rr_single_target_rewrite")
+            if callable(_rr_rewrite_fn):
+                _rr_rewrite_out = _rr_rewrite_fn(p)
+                if isinstance(_rr_rewrite_out, dict):
+                    p = _rr_rewrite_out
+        except Exception as _rr_rewrite_e:
+            p["rr_single_target_rewrite_error"] = str(_rr_rewrite_e)[:240]
+
+    if str((_entry_conf or {}).get("decision") or "").upper() == "BLOCK":
+        return {
+            "ok": True,
+            "decision": "NO_TRADE",
+            "reason": (_entry_conf or {}).get("reason") or "live_entry_confluence_gate_block",
+            "gate": "live_entry_confluence_gate_v1",
+            "signal_id": p.get("signal_id") or p.get("signal_key"),
+            "symbol": p.get("symbol"),
+            "direction": p.get("direction") or p.get("dir") or p.get("side"),
+            "execution_mode": execution_mode(),
+            "live_entry_confluence_gate_v1": _entry_conf,
+        }
+
     p["signal_source"] = "VPS_SMC"
     p["source"] = "VPS_SMC"
     p["source_mode"] = "VPS_SMC_PRIMARY"
