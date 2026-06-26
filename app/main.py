@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 
 import app.vps_smc as vps_smc
 import app.quant_engine as quant_engine
+from app.position_manager import PositionManagerDeps, create_router as create_position_manager_router
 
 
 APP_VERSION = "v0.25-p0-vps-smc-primary-execution-bridge"
@@ -10725,3 +10726,19 @@ try:
 except Exception:
     pass
 
+
+
+
+# === POSITION_MANAGER_V026 ===
+# Position-management endpoints live in app/position_manager.py so they can be
+# maintained without changing the VPS SMC entry strategy.
+app.include_router(create_position_manager_router(PositionManagerDeps(
+    auth_ok=v010_auth_ok,
+    normalize_symbol=v010_normalize_symbol,
+    utc_now_iso=utc_now_iso,
+    binance_env=binance_env,
+    execution_mode=execution_mode,
+    safety_summary=v014_safety_summary,
+    reconcile_state=v014_reconcile_state,
+    append_event=lambda event: append_jsonl(EXECUTION_EVENTS_LOG, event),
+)))
