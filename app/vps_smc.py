@@ -1573,6 +1573,123 @@ def build_stageb_confirmation(
             out["stageb_confirm_reason"] = "reclaim_missing"
             return out
 
+        # === SMC_MINIMAL_REQUIRED_20260627 ===
+        # New architecture:
+        # SMC hard minimum = sweep + reclaim + structural SL + entry sanity.
+        # Displacement/FVG/OB/retest are quality context only, not hard blockers.
+        # Final ALLOW/BLOCK stays downstream in deriv + macro + quant confluence gate.
+        if _env_bool("VPS_SMC_MINIMAL_REQUIRED_ENABLED", False):
+            latest_candle = stageb_candles[-1] if stageb_candles else {}
+            entry_raw = latest_candle.get("c") or latest_candle.get("close")
+            latest_t = latest_candle.get("t") or latest_candle.get("time") or reclaim.get("reclaim_t")
+
+            try:
+                entry_ref = float(entry_raw)
+                sweep_extreme_f = float(sweep_extreme)
+            except Exception:
+                out["stageb_status"] = "WATCH"
+                out["stageb_state_machine"] = "IDLE"
+                out["stageb_confirm_reason"] = "minimal_entry_sanity_failed"
+                out["stageb_invalid_reason"] = "minimal_entry_sanity_failed"
+                return out
+
+            buffer_pct = _env_float("VPS_SMC_INVALID_BUFFER_PCT", 0.08) + _env_float("VPS_SMC_FEES_BUFFER_PCT", 0.03)
+            buffer_mult = buffer_pct / 100.0
+            sl_ref = sweep_extreme_f * (1 - buffer_mult) if direction == "LONG" else sweep_extreme_f * (1 + buffer_mult)
+            risk_ref = (entry_ref - sl_ref) if direction == "LONG" else (sl_ref - entry_ref)
+
+            if risk_ref <= 0:
+                out["stageb_status"] = "WATCH"
+                out["stageb_state_machine"] = "IDLE"
+                out["stageb_confirm_reason"] = "minimal_structural_sl_invalid"
+                out["stageb_invalid_reason"] = "minimal_structural_sl_invalid"
+                return out
+
+            # Soft quality probes. These do NOT block confirmation.
+            disp = _semi_find_displacement_after(stageb_candles, direction, reclaim.get("reclaim_t"), max_disp)
+            poi = {"has_fvg": False, "reason": "minimal_mode_optional_not_found"}
+            ob = {"has_ob": False, "reason": "minimal_mode_optional_not_found"}
+            selected_poi = {}
+
+            if isinstance(disp, dict) and disp.get("has_displacement"):
+                poi = _semi_find_fvg_after(stageb_candles, direction, disp.get("displacement_t"), fvg_lookback)
+                if ob_enabled:
+                    ob = _semi_find_ob_before_displacement(
+                        stageb_candles,
+                        direction,
+                        disp.get("displacement_idx"),
+                        ob_lookback,
+                        ob_min_body_atr,
+                    )
+                selected_poi = _semi_select_poi(poi, ob)
+
+            # If no FVG/OB quality POI exists, use current structure reference as synthetic POI.
+            # This keeps _build_plan_and_score compatible without making FVG/OB mandatory.
+            if not selected_poi.get("selected_poi_type"):
+                band_pct = _env_float("VPS_SMC_MINIMAL_ENTRY_BAND_PCT", 0.02) / 100.0
+                band = max(abs(entry_ref) * band_pct, 1e-12)
+                selected_poi = {
+                    "selected_poi_type": "SMC_MINIMAL",
+                    "selected_poi_lo": entry_ref - band,
+                    "selected_poi_hi": entry_ref + band,
+                    "selected_poi_mid": entry_ref,
+                    "selected_poi_t": latest_t,
+                    "selected_poi_t_wib": _bucket_ms_to_wib_text(latest_t) if latest_t else None,
+                    "selected_poi_reason": "minimal_sweep_reclaim_entry_reference",
+                    "selected_fvg_reason": (poi or {}).get("selected_fvg_reason") or (poi or {}).get("reason"),
+                    "selected_ob_reason": (ob or {}).get("reason"),
+                }
+
+            out["stageb_displacement"] = disp or out["stageb_displacement"]
+            out["stageb_fvg_poi"] = poi or out["stageb_fvg_poi"]
+            out["stageb_ob_poi"] = ob or out["stageb_ob_poi"]
+            out.update(selected_poi)
+
+            confirmed_t = reclaim.get("reclaim_t") or latest_t
+            out["stageb_status"] = "CONFIRMED"
+            out["stageb_state_machine"] = "CONFIRMED"
+            out["confirmed_t"] = confirmed_t
+            out["confirmed_t_wib"] = _bucket_ms_to_wib_text(confirmed_t) if confirmed_t else None
+            out["stageb_confirm_reason"] = "minimal_sweep_reclaim_structural_sl_entry_sane"
+            out["smc_minimal_required_enabled"] = True
+            out["smc_minimal_required"] = {
+                "sweep": True,
+                "reclaim": True,
+                "structural_sl": True,
+                "entry_sanity": True,
+                "entry_ref": entry_ref,
+                "sl_ref": sl_ref,
+                "risk_ref": risk_ref,
+            }
+            out["smc_quality_optional"] = {
+                "displacement": bool((disp or {}).get("has_displacement")),
+                "fvg": bool((poi or {}).get("has_fvg")),
+                "ob": bool((ob or {}).get("has_ob")),
+                "selected_poi_type": selected_poi.get("selected_poi_type"),
+            }
+
+            st = {
+                "state": "CONFIRMED",
+                "direction": direction,
+                "sweep_t": sweep_t,
+                "sweep_level": sweep_level,
+                "sweep_extreme": sweep_extreme,
+                "reclaim": reclaim,
+                "reclaim_t": reclaim.get("reclaim_t"),
+                "displacement": disp,
+                "poi": poi,
+                "ob": ob,
+                "selected_poi": selected_poi,
+                "confirmed_t": confirmed_t,
+                "minimal_required": out["smc_minimal_required"],
+                "quality_optional": out["smc_quality_optional"],
+                "created_at_utc": _utc_now_iso(),
+                "updated_at_utc": _utc_now_iso(),
+            }
+            states[symbol] = st
+            _persist_semi_states()
+            return out
+
         st = {
             "state": "WAIT_DISPLACEMENT",
             "direction": direction,

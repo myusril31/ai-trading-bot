@@ -47,6 +47,12 @@ BASE = {
     "VPS_SMC_FEES_BUFFER_PCT": "0.03",
     "VPS_SMC_RR_MIN_TP2": "0.95",
 
+    # ===== minimal SMC + confluence architecture =====
+    # SMC confirms only minimum structure: sweep + reclaim + structural SL + entry sanity.
+    # FVG/OB/displacement/retest become quality context; deriv/macro/quant final-gate live entry.
+    "VPS_SMC_MINIMAL_REQUIRED_ENABLED": "true",
+    "VPS_SMC_MINIMAL_ENTRY_BAND_PCT": "0.02",
+
     # Candle store retention: keep enough 4H history for HTF structure.
     "BINANCE_CANDLE_RETENTION_DAYS": "90",
     "BINANCE_CANDLE_BOOTSTRAP_LIMIT": "500",
