@@ -38,6 +38,10 @@ PAPER_EVENTS_LOG = LOG_DIR / "paper_events.jsonl"
 PAPER_PERFORMANCE_LOG = LOG_DIR / "paper_performance.jsonl"
 EXECUTION_PLANS_LOG = LOG_DIR / "execution_plans.jsonl"
 EXECUTION_EVENTS_LOG = LOG_DIR / "execution_events.jsonl"
+MANAGER_DECISIONS_LOG = LOG_DIR / "manager_decisions.jsonl"
+MANAGER_ACTIONS_LOG = LOG_DIR / "manager_actions.jsonl"
+MANAGER_ERRORS_LOG = LOG_DIR / "manager_errors.jsonl"
+MANAGER_HOURLY_REPORTS_LOG = LOG_DIR / "manager_hourly_reports.jsonl"
 EXECUTION_SUMMARY_LOG = LOG_DIR / "execution_summary.jsonl"
 TP_LIFECYCLE_STATE_FILE = STATE_DIR / "tp_lifecycle_state.json"
 ML_SHADOW_SIGNALS_LOG = LOG_DIR / "ml_shadow_signals.jsonl"
@@ -7988,18 +7992,9 @@ async def v013_testnet_lifecycle_check(request: Request):
 
 
 
-@app.post("/testnet/tp-lifecycle-check")
-async def v017_testnet_tp_lifecycle_check(request: Request):
-    if not v010_auth_ok(request):
-        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
-
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    symbol = v010_normalize_symbol(payload.get("symbol") or payload.get("pair") or "")
-    signal_key = str(payload.get("signal_key") or payload.get("signal_id") or "").strip()
+def v017_tp_lifecycle_check_core(symbol: str, signal_key: str) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    signal_key = str(signal_key or "").strip()
     if not symbol or not signal_key:
         return {"ok": False, "reason": "missing_symbol_or_signal_key"}
 
@@ -8140,6 +8135,337 @@ async def v017_testnet_tp_lifecycle_check(request: Request):
     v014_execution_summary_write(signal_key, {"symbol": symbol, "lifecycle_state": str(row.get("lifecycle_stage") or stage), "tp_lifecycle_stage": str(row.get("lifecycle_stage") or stage), "notes": action_taken if action_taken != "NONE" else (reason or "NONE")})
 
     return {"ok": True, "symbol": symbol, "signal_key": signal_key, "positionAmt": str(position_amt), "initial_qty": str(row.get("initial_qty") or ""), "remaining_qty": str(abs_pos), "detected_event": detected_event, "action_taken": action_taken, "reason": reason or None, "old_sl_cancel_ok": old_sl_cancel_ok, "new_sl_algo_id": new_sl_algo_id, "new_sl_client_algo_id": new_sl_client_algo_id, "new_sl_price": new_sl_price, "cleanup_count": len(cleanup_results), "cleanup_results": cleanup_results, "lifecycle_stage": str(row.get("lifecycle_stage") or stage)}
+
+
+def pm_live_guarded_reduce_only_action(symbol: str, action: str, signal_key: str = "") -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    action = str(action or "").strip().upper()
+    signal_key = str(signal_key or symbol or "PM").strip()
+    if action not in ("REDUCE_50", "CLOSE_FULL", "EMERGENCY_CLOSE"):
+        return {"ok": False, "reason": f"unsupported_pm_action:{action}", "symbol": symbol, "action": action}
+    if execution_mode() != "LIVE_SMALL_CAPITAL" or binance_env() != "LIVE":
+        return {"ok": False, "reason": "live_guarded_action_requires_live_small_capital_live_env", "symbol": symbol, "action": action}
+
+    snap = live_get_position_snapshot(symbol)
+    if not snap.get("ok"):
+        return {"ok": False, "reason": snap.get("reason") or "position_snapshot_failed", "symbol": symbol, "action": action, "snapshot": snap}
+    position = snap.get("position") or {}
+    try:
+        position_amt = Decimal(str(position.get("positionAmt") or "0"))
+    except Exception:
+        return {"ok": False, "reason": "invalid_position_amt", "symbol": symbol, "action": action, "position": position}
+    if position_amt == Decimal("0"):
+        return {"ok": False, "reason": "no_open_position", "symbol": symbol, "action": action, "positionAmt": str(position_amt)}
+
+    abs_qty = abs(position_amt)
+    reduce_qty = abs_qty / Decimal("2") if action == "REDUCE_50" else abs_qty
+    if reduce_qty <= Decimal("0"):
+        return {"ok": False, "reason": "invalid_reduce_qty", "symbol": symbol, "action": action, "positionAmt": str(position_amt)}
+    try:
+        filters = live_entry_symbol_filters(symbol)
+        step = Decimal(str(filters.get("stepSize") or filters.get("step_size") or "0"))
+        if step > 0:
+            reduce_qty = (reduce_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+    except Exception:
+        filters = {}
+    if reduce_qty <= Decimal("0"):
+        return {"ok": False, "reason": "reduce_qty_below_step_size", "symbol": symbol, "action": action, "positionAmt": str(position_amt)}
+
+    side = "SELL" if position_amt > 0 else "BUY"
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": _live_plain_decimal(reduce_qty),
+        "reduceOnly": "true",
+        "newClientOrderId": _live_client_order_id("PMV027", signal_key, action),
+    }
+    res = live_place_order(params)
+    event = {
+        "event_at_utc": utc_now_iso(),
+        "event_at_wib": wib_now_iso(),
+        "action": "POSITION_MANAGER_LIVE_GUARDED_ACTION",
+        "symbol": symbol,
+        "signal_key": signal_key or None,
+        "manager_action": action,
+        "positionAmt": str(position_amt),
+        "side": side,
+        "quantity": params["quantity"],
+        "order_ok": bool(res.get("ok")),
+        "order_reason": res.get("reason"),
+    }
+    append_jsonl(EXECUTION_EVENTS_LOG, event)
+    append_jsonl(MANAGER_ACTIONS_LOG if res.get("ok") else MANAGER_ERRORS_LOG, event)
+    return {"ok": bool(res.get("ok")), "reason": res.get("reason"), "symbol": symbol, "action": action, "positionAmt": str(position_amt), "side": side, "quantity": params["quantity"], "order": res}
+
+
+PM_ACTION_STATE_FILE = STATE_DIR / "position_manager_actions.json"
+
+
+def pm_live_open_positions() -> Dict[str, Any]:
+    if execution_mode() != "LIVE_SMALL_CAPITAL" or binance_env() != "LIVE":
+        return {"ok": True, "reason": "not_live_guarded_env", "positions": []}
+    res = live_signed_request("GET", "/fapi/v2/positionRisk", {})
+    if not res.get("ok"):
+        return {"ok": False, "reason": res.get("reason") or "live_position_risk_failed", "positions": [], "raw": res}
+    rows = res.get("body") if isinstance(res.get("body"), list) else []
+    positions = []
+    for row in rows:
+        try:
+            amt = Decimal(str(row.get("positionAmt") or "0"))
+        except Exception:
+            amt = Decimal("0")
+        if amt != Decimal("0"):
+            positions.append({"symbol": str(row.get("symbol") or "").upper(), "positionAmt": str(amt), "entryPrice": row.get("entryPrice"), "raw": row})
+    return {"ok": True, "positions": positions, "raw": res}
+
+
+def pm_find_bot_plan(symbol: str) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    rows = v014_open_paper_positions_for_symbol(symbol)
+    for row in rows:
+        direction = str(row.get("direction") or row.get("side") or "").upper()
+        if direction in ("BUY", "LONG"):
+            direction = "LONG"
+        elif direction in ("SELL", "SHORT"):
+            direction = "SHORT"
+        if direction in ("LONG", "SHORT"):
+            return {"ok": True, "source": "open_paper_positions", "symbol": symbol, "direction": direction, "signal_key": row.get("signal_key"), "plan": row}
+    state = v017_load_tp_state()
+    for signal_key, row in (state.get("signals") or {}).items():
+        if v010_normalize_symbol(row.get("symbol") or "") != symbol:
+            continue
+        stage = str(row.get("lifecycle_stage") or "").upper()
+        direction = str(row.get("direction") or "").upper()
+        if direction in ("LONG", "SHORT") and stage not in ("", "POSITION_CLOSED_CLEAN", "NEEDS_REVIEW", "ENTRY_FAILED"):
+            return {"ok": True, "source": "tp_lifecycle_state", "symbol": symbol, "direction": direction, "signal_key": signal_key, "plan": row}
+    return {"ok": False, "reason": "matching_open_bot_plan_not_found", "symbol": symbol}
+
+
+def _pm_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _pm_closes(symbol: str, interval: str = "1m", limit: int = 260) -> List[float]:
+    rows = _pm_rows(symbol, interval, limit)
+    return [float(x.get("close")) for x in rows if _pm_float(x.get("close")) is not None]
+
+
+def _pm_rows(symbol: str, interval: str = "1m", limit: int = 260) -> List[Dict[str, Any]]:
+    rows = market_load_candles(v010_normalize_symbol(symbol), interval)
+    return sorted(rows, key=lambda x: int(x.get("open_time_ms") or 0))[-limit:]
+
+
+def _pm_ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period
+    for val in values[period:]:
+        ema = val * k + ema * (1.0 - k)
+    return ema
+
+
+def _pm_rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) <= period:
+        return None
+    gains = []
+    losses = []
+    for prev, cur in zip(values[-period - 1:-1], values[-period:]):
+        diff = cur - prev
+        gains.append(max(diff, 0.0))
+        losses.append(abs(min(diff, 0.0)))
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + ((sum(gains) / period) / avg_loss)))
+
+
+def pm_manager_score(symbol: str, recon: Dict[str, Any], bot_plan: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    rows = _pm_rows(symbol, "1m", 260)
+    closes = [float(x.get("close")) for x in rows if _pm_float(x.get("close")) is not None]
+    highs = [float(x.get("high")) for x in rows if _pm_float(x.get("high")) is not None]
+    lows = [float(x.get("low")) for x in rows if _pm_float(x.get("low")) is not None]
+    volumes = [float(x.get("volume") or x.get("quote_volume") or 0.0) for x in rows if _pm_float(x.get("volume") or x.get("quote_volume") or 0.0) is not None]
+    btc = _pm_closes("BTCUSDT", "1m", 260)
+    score = 0.0
+    missing = []
+    details: Dict[str, Any] = {}
+    if len(closes) < 60:
+        missing.append("candles")
+    else:
+        ema20 = _pm_ema(closes, 20); ema50 = _pm_ema(closes, 50); ema200 = _pm_ema(closes, 200)
+        rsi = _pm_rsi(closes)
+        macd_fast = _pm_ema(closes, 12); macd_slow = _pm_ema(closes, 26)
+        macd_hist = (macd_fast - macd_slow) if macd_fast is not None and macd_slow is not None else None
+        returns = [(b / a - 1.0) for a, b in zip(closes[-31:-1], closes[-30:]) if a]
+        ret_now = (closes[-1] / closes[-21] - 1.0) if len(closes) >= 21 and closes[-21] else 0.0
+        mean = sum(returns) / len(returns) if returns else 0.0
+        var = sum((x - mean) ** 2 for x in returns) / len(returns) if returns else 0.0
+        z = (ret_now - mean) / (var ** 0.5) if var > 0 else 0.0
+        btc_ret_1h = (btc[-1] / btc[-61] - 1.0) if len(btc) >= 61 and btc[-61] else None
+        pair_ret_1h = (closes[-1] / closes[-61] - 1.0) if len(closes) >= 61 and closes[-61] else None
+        rel_btc = (pair_ret_1h - btc_ret_1h) if pair_ret_1h is not None and btc_ret_1h is not None else None
+        tr_values = []
+        for i in range(max(1, len(closes) - 20), len(closes)):
+            prev_close = closes[i - 1]
+            high = highs[i] if i < len(highs) else closes[i]
+            low = lows[i] if i < len(lows) else closes[i]
+            tr_values.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        atr = (sum(tr_values) / len(tr_values)) if tr_values else None
+        atr_counter_move = abs(closes[-1] - max(closes[-20:])) / atr if atr and closes[-1] < max(closes[-20:]) else 0.0
+        vol_sma20 = (sum(volumes[-20:]) / min(20, len(volumes))) if volumes else None
+        volume_ratio = (volumes[-1] / vol_sma20) if vol_sma20 else None
+        entry = _pm_float((bot_plan.get("plan") or {}).get("entry_price") or (bot_plan.get("plan") or {}).get("entry") or (bot_plan.get("plan") or {}).get("entry_mid"))
+        mfe_giveback = None
+        if entry and len(closes) >= 20:
+            if str(bot_plan.get("direction") or "").upper() == "SHORT":
+                mfe = max(0.0, entry - min(closes[-60:]))
+                giveback = closes[-1] - min(closes[-60:])
+            else:
+                mfe = max(0.0, max(closes[-60:]) - entry)
+                giveback = max(closes[-60:]) - closes[-1]
+            mfe_giveback = (giveback / mfe) if mfe > 0 else None
+        alt_returns = []
+        for alt in ("ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"):
+            alt_closes = _pm_closes(alt, "1m", 70)
+            if len(alt_closes) >= 61 and alt_closes[-61]:
+                alt_returns.append(alt_closes[-1] / alt_closes[-61] - 1.0)
+        alt_avg = (sum(alt_returns) / len(alt_returns)) if alt_returns else None
+        alt_breadth = (len([x for x in alt_returns if x > 0]) / len(alt_returns)) if alt_returns else None
+        rel_alt = (pair_ret_1h - alt_avg) if pair_ret_1h is not None and alt_avg is not None else None
+        btcdom = _pm_closes("BTCDOMUSDT", "1m", 70)
+        btcdom_ret_1h = (btcdom[-1] / btcdom[-61] - 1.0) if len(btcdom) >= 61 and btcdom[-61] else None
+        direction = str(bot_plan.get("direction") or "").upper()
+        adverse_long = 0.0
+        adverse_short = 0.0
+        if ema20 and ema50 and ema200:
+            adverse_long += 15.0 if closes[-1] < ema20 else 0.0
+            adverse_long += 15.0 if ema20 < ema50 else 0.0
+            adverse_long += 10.0 if ema50 < ema200 else 0.0
+            adverse_short += 15.0 if closes[-1] > ema20 else 0.0
+            adverse_short += 15.0 if ema20 > ema50 else 0.0
+            adverse_short += 10.0 if ema50 > ema200 else 0.0
+        else:
+            missing.append("ema200")
+        if rsi is not None:
+            adverse_long += 10.0 if rsi < 45 else 0.0
+            adverse_long += 10.0 if rsi < 35 else 0.0
+            adverse_short += 10.0 if rsi > 55 else 0.0
+            adverse_short += 10.0 if rsi > 65 else 0.0
+        else:
+            missing.append("rsi")
+        if macd_hist is not None:
+            adverse_long += 10.0 if macd_hist < 0 else 0.0
+            adverse_short += 10.0 if macd_hist > 0 else 0.0
+        else:
+            missing.append("macd")
+        adverse_long += min(20.0, abs(min(z, 0.0)) * 8.0)
+        adverse_short += min(20.0, max(z, 0.0) * 8.0)
+        if rel_btc is not None:
+            adverse_long += min(10.0, abs(rel_btc) * 500.0) if rel_btc < 0 else 0.0
+            adverse_short += min(10.0, rel_btc * 500.0) if rel_btc > 0 else 0.0
+        if rel_alt is not None:
+            adverse_long += min(8.0, abs(rel_alt) * 400.0) if rel_alt < 0 else 0.0
+            adverse_short += min(8.0, rel_alt * 400.0) if rel_alt > 0 else 0.0
+        if volume_ratio is not None and volume_ratio > 1.5:
+            adverse_long += 5.0 if ret_now < 0 else 0.0
+            adverse_short += 5.0 if ret_now > 0 else 0.0
+        if mfe_giveback is not None and mfe_giveback > 0.5:
+            if direction == "SHORT":
+                adverse_short += 8.0
+            else:
+                adverse_long += 8.0
+        score = max(0.0, min(100.0, adverse_short if direction == "SHORT" else adverse_long))
+        if not alt_returns:
+            missing.append("alt_basket")
+        if btcdom_ret_1h is None:
+            missing.append("btcdom")
+        details.update({"ema20": ema20, "ema50": ema50, "ema200": ema200, "rsi": rsi, "macd_histogram": macd_hist, "return_zscore": z, "btc_return_1h": btc_ret_1h, "btc_return_4h": ((btc[-1] / btc[-241] - 1.0) if len(btc) >= 241 and btc[-241] else None), "pair_relative_strength_vs_btc": rel_btc, "vwap_approx": (sum(closes[-60:]) / min(60, len(closes))), "session_vwap_approx": (sum(closes[-240:]) / min(240, len(closes))), "atr_counter_move": atr_counter_move, "volume_ratio_sma20": volume_ratio, "mfe_giveback": mfe_giveback, "alt_basket_breadth": alt_breadth, "pair_relative_strength_vs_alt_basket": rel_alt, "btcdom_return_1h": btcdom_ret_1h, "funding_rate": None, "open_interest": None, "taker_ratio": None, "fred_context": None})
+    confidence = max(0.0, 1.0 - (len(missing) * 0.08))
+    protect_th = env_float("PM_PROTECT_THRESHOLD", env_float("PM_PROTECT_SCORE", 50.0))
+    reduce_th = env_float("PM_REDUCE_THRESHOLD", env_float("PM_REDUCE_SCORE", 72.0))
+    close_th = env_float("PM_CLOSE_FULL_THRESHOLD", env_float("PM_CLOSE_SCORE", 85.0)) + (10.0 if missing else 0.0)
+    emergency_th = env_float("PM_EMERGENCY_THRESHOLD", env_float("PM_EMERGENCY_SCORE", 92.0)) + (10.0 if missing else 0.0)
+    if score >= emergency_th:
+        verdict = "EMERGENCY_CLOSE"
+    elif score >= close_th:
+        verdict = "CLOSE_FULL"
+    elif score >= reduce_th:
+        verdict = "REDUCE_50"
+    elif score >= protect_th:
+        verdict = "PROTECT_ONLY"
+    else:
+        verdict = "HOLD_PLAN"
+    return {"ok": True, "symbol": symbol, "score": round(score, 4), "confidence": round(confidence, 4), "missing_context": missing, "verdict": verdict, "verdict_action": verdict, "thresholds": {"protect": protect_th, "reduce": reduce_th, "close": close_th, "emergency": emergency_th}, "features": details}
+
+
+def pm_action_budget_guard(symbol: str, action: str) -> Dict[str, Any]:
+    state = load_json_file(PM_ACTION_STATE_FILE, {})
+    today = utc_now_iso()[:10]
+    symbol_key = v010_normalize_symbol(symbol)
+    rows = [r for r in (state.get("actions") or []) if isinstance(r, dict)]
+    per_pos = [r for r in rows if r.get("symbol") == symbol_key]
+    today_rows = [r for r in rows if str(r.get("event_at_utc") or "")[:10] == today]
+    cooldown_min = env_float("PM_ACTION_COOLDOWN_PER_POSITION_MIN", 60.0)
+    if per_pos:
+        last = str(per_pos[-1].get("event_at_utc") or "")
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() / 60.0
+            if elapsed < cooldown_min:
+                return {"ok": False, "reason": "pm_action_cooldown_active", "cooldown_min": cooldown_min}
+        except Exception:
+            pass
+    if len(per_pos) >= env_int("PM_MAX_ACTIONS_PER_POSITION", 2):
+        return {"ok": False, "reason": "pm_max_actions_per_position_reached"}
+    if action in ("CLOSE_FULL", "EMERGENCY_CLOSE") and len([r for r in today_rows if r.get("action") in ("CLOSE_FULL", "EMERGENCY_CLOSE")]) >= env_int("PM_MAX_MANAGER_CLOSES_PER_DAY", 2):
+        return {"ok": False, "reason": "pm_max_manager_closes_per_day_reached"}
+    if action == "REDUCE_50" and len([r for r in today_rows if r.get("action") == "REDUCE_50"]) >= env_int("PM_MAX_REDUCES_PER_DAY", 3):
+        return {"ok": False, "reason": "pm_max_reduces_per_day_reached"}
+    return {"ok": True}
+
+
+def pm_action_budget_record(symbol: str, action: str, result: Dict[str, Any]) -> None:
+    state = load_json_file(PM_ACTION_STATE_FILE, {})
+    rows = state.get("actions") if isinstance(state.get("actions"), list) else []
+    rows.append({"event_at_utc": utc_now_iso(), "symbol": v010_normalize_symbol(symbol), "action": action, "ok": bool((result.get("live_action_result") or {}).get("ok"))})
+    save_json_file(PM_ACTION_STATE_FILE, {"actions": rows[-1000:]})
+    append_jsonl(MANAGER_ACTIONS_LOG, rows[-1])
+
+
+def pm_record_manager_decision(decision: Dict[str, Any]) -> None:
+    append_jsonl(MANAGER_DECISIONS_LOG, {"event_at_utc": utc_now_iso(), **(decision or {})})
+
+
+def pm_send_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    fn = globals().get("send_telegram_message")
+    if not callable(fn) or not (env_bool("PM_REPORT_TELEGRAM_ENABLED", False) or env_bool("PM_SEND_REPORT_ENABLED", False)):
+        result = {"ok": True, "decision": "REPORT_PREVIEW_ONLY", "reason": "telegram_disabled_or_unavailable"}
+        append_jsonl(MANAGER_HOURLY_REPORTS_LOG, {"event_at_utc": utc_now_iso(), "report": report, "send_result": result})
+        return result
+    text = f"PM report {report.get('symbol') or '-'} decision={(report.get('reconcile') or {}).get('mismatch_state')} safe={(report.get('safety_summary') or {}).get('safe_to_continue')}"
+    res = fn(text)
+    result = {"ok": True, "decision": "REPORT_SENT", "telegram_result": res}
+    append_jsonl(MANAGER_HOURLY_REPORTS_LOG, {"event_at_utc": utc_now_iso(), "report": report, "send_result": result})
+    return result
+
+@app.post("/testnet/tp-lifecycle-check")
+async def v017_testnet_tp_lifecycle_check(request: Request):
+    if not v010_auth_ok(request):
+        return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    symbol = v010_normalize_symbol(payload.get("symbol") or payload.get("pair") or "")
+    signal_key = str(payload.get("signal_key") or payload.get("signal_id") or "").strip()
+    return v017_tp_lifecycle_check_core(symbol, signal_key)
 
 @app.get("/testnet/execution-summary")
 def v014_execution_summary(request: Request, signal_key: str = ""):
@@ -10741,4 +11067,14 @@ app.include_router(create_position_manager_router(PositionManagerDeps(
     safety_summary=v014_safety_summary,
     reconcile_state=v014_reconcile_state,
     append_event=lambda event: append_jsonl(EXECUTION_EVENTS_LOG, event),
+    cancel_stale_algo_orders=v013_cancel_stale_algo_orders,
+    tp_lifecycle_tick=v017_tp_lifecycle_check_core,
+    live_guarded_action=pm_live_guarded_reduce_only_action,
+    send_report=pm_send_report,
+    list_open_positions=pm_live_open_positions,
+    find_bot_plan=pm_find_bot_plan,
+    manager_score=pm_manager_score,
+    record_decision=pm_record_manager_decision,
+    action_budget_guard=pm_action_budget_guard,
+    action_budget_record=pm_action_budget_record,
 )))
