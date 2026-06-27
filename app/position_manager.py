@@ -202,6 +202,19 @@ def _build_tick_response(symbol: str, signal_key: str, safety: JsonDict, recon: 
     }
 
 
+def _sanitize_positions_result(positions_res: JsonDict) -> JsonDict:
+    """Remove raw exchange payloads from run-once responses."""
+    if not isinstance(positions_res, dict):
+        return {"ok": False, "reason": "invalid_positions_result", "positions": []}
+    clean = dict(positions_res)
+    clean.pop("raw", None)
+    clean["positions"] = [
+        {k: v for k, v in row.items() if k != "raw"} if isinstance(row, dict) else row
+        for row in (clean.get("positions") or [])
+    ]
+    return clean
+
+
 def create_router(deps: PositionManagerDeps) -> APIRouter:
     router = APIRouter(prefix="/position-manager", tags=["position-manager"])
 
@@ -362,13 +375,7 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
             return response
 
         positions_res = deps.list_open_positions() if callable(deps.list_open_positions) else {"ok": False, "reason": "list_open_positions_callback_missing", "positions": []}
-        if isinstance(positions_res, dict):
-        results = []
-        for pos in positions:
-            if not isinstance(pos, dict):
-                continue
-            pos_symbol = deps.normalize_symbol(pos.get("symbol") or "")
-            if not pos_symbol:
+        positions_res = _sanitize_positions_result(positions_res)
                 continue
             item_payload = dict(payload)
             item_payload["symbol"] = pos_symbol
