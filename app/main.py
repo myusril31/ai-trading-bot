@@ -8220,26 +8220,242 @@ def pm_live_open_positions() -> Dict[str, Any]:
     return {"ok": True, "positions": positions, "raw": res}
 
 
+
+def _pm_norm_plan_direction(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if raw in ("BUY", "LONG"):
+        return "LONG"
+    if raw in ("SELL", "SHORT"):
+        return "SHORT"
+    return ""
+
+
+def _pm_smc_client_prefix(client_id: Any) -> str:
+    s = str(client_id or "").strip()
+    if not s.startswith("SMC_"):
+        return ""
+    parts = s.split("_")
+    if len(parts) >= 2 and parts[1]:
+        return f"SMC_{parts[1]}"
+    return ""
+
+
+def _pm_event_client_ids(event: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+
+    entry_params = event.get("entry_params") if isinstance(event.get("entry_params"), dict) else {}
+    ids.append(str(entry_params.get("newClientOrderId") or entry_params.get("clientOrderId") or ""))
+
+    entry_result = event.get("entry_result") if isinstance(event.get("entry_result"), dict) else {}
+    entry_body = entry_result.get("body") if isinstance(entry_result.get("body"), dict) else {}
+    ids.append(str(entry_body.get("clientOrderId") or ""))
+
+    for item in event.get("protective_results") or []:
+        if not isinstance(item, dict):
+            continue
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        body = result.get("body") if isinstance(result.get("body"), dict) else {}
+        req = result.get("request_params") if isinstance(result.get("request_params"), dict) else {}
+
+        ids.append(str(params.get("newClientOrderId") or params.get("clientAlgoId") or ""))
+        ids.append(str(body.get("clientAlgoId") or body.get("clientOrderId") or ""))
+        ids.append(str(req.get("clientAlgoId") or req.get("newClientOrderId") or ""))
+
+    return [x for x in ids if x]
+
+
+def _pm_recent_jsonl(path: Path, max_lines: int = 5000) -> List[Dict[str, Any]]:
+    import json
+    from collections import deque
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            lines = deque(fh, maxlen=max_lines)
+    except Exception:
+        return rows
+
+    for line in reversed(lines):
+        line = str(line or "").strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+
+    return rows
+
+
+def _pm_active_smc_prefixes(symbol: str) -> List[str]:
+    prefixes = set()
+    try:
+        res = v013_fetch_open_algo_orders(symbol)
+        orders = res.get("orders") or []
+    except Exception:
+        orders = []
+
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        for key in ("clientAlgoId", "clientOrderId", "origClientOrderId"):
+            prefix = _pm_smc_client_prefix(order.get(key))
+            if prefix:
+                prefixes.add(prefix)
+
+    return sorted(prefixes)
+
+
+def _pm_find_bot_plan_from_execution_events(symbol: str) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    active_prefixes = set(_pm_active_smc_prefixes(symbol))
+
+    for event in _pm_recent_jsonl(EXECUTION_EVENTS_LOG, max_lines=8000):
+        event_symbol = v010_normalize_symbol(
+            event.get("symbol")
+            or (event.get("plan") or {}).get("symbol")
+            or ((event.get("plan") or {}).get("payload") or {}).get("symbol")
+            or ""
+        )
+        if event_symbol != symbol:
+            continue
+
+        decision = str(event.get("decision") or "").upper()
+        action = str(event.get("action") or "").upper()
+        if decision != "LIVE_ORDER_PLACED" and action != "LIVE_SMALL_CAPITAL_EXECUTE":
+            continue
+
+        if event.get("protection_ok") is False:
+            continue
+
+        event_prefixes = {_pm_smc_client_prefix(x) for x in _pm_event_client_ids(event)}
+        event_prefixes.discard("")
+
+        # If current open protective orders expose SMC_xxx, require the execution event to match it.
+        # This avoids adopting an old closed trade just because the symbol matches. Humanity survives one more if-statement.
+        if active_prefixes and not (active_prefixes & event_prefixes):
+            continue
+
+        plan = event.get("plan") if isinstance(event.get("plan"), dict) else {}
+        payload = plan.get("payload") if isinstance(plan.get("payload"), dict) else {}
+
+        direction = _pm_norm_plan_direction(
+            plan.get("direction")
+            or payload.get("direction")
+            or event.get("direction")
+        )
+        if direction not in ("LONG", "SHORT"):
+            continue
+
+        signal_key = str(
+            event.get("signal_key")
+            or plan.get("signal_key")
+            or payload.get("signal_key")
+            or payload.get("signal_id")
+            or ""
+        ).strip()
+
+        entry = (
+            plan.get("actual_entry_price")
+            or plan.get("entry_price")
+            or plan.get("entry_mid")
+            or payload.get("entry")
+            or payload.get("entry_mid")
+            or ((event.get("entry_fill_result") or {}).get("entryPrice") if isinstance(event.get("entry_fill_result"), dict) else None)
+        )
+        sl = plan.get("sl") or payload.get("sl")
+        tp1 = plan.get("tp1") or payload.get("tp1")
+        qty = (
+            plan.get("quantity")
+            or plan.get("tp1_qty")
+            or payload.get("quantity")
+            or ((event.get("entry_params") or {}).get("quantity") if isinstance(event.get("entry_params"), dict) else None)
+        )
+
+        adopted_plan = dict(plan)
+        adopted_plan.update({
+            "symbol": symbol,
+            "direction": direction,
+            "signal_key": signal_key,
+            "entry_price": entry,
+            "entry": entry,
+            "entry_mid": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "quantity": qty,
+            "source": "execution_events_log",
+            "source_event_at_utc": event.get("event_at_utc"),
+            "source_decision": decision or action,
+            "active_smc_prefixes": sorted(active_prefixes),
+            "matched_event_prefixes": sorted(event_prefixes),
+        })
+
+        return {
+            "ok": True,
+            "source": "execution_events_log",
+            "symbol": symbol,
+            "direction": direction,
+            "signal_key": signal_key,
+            "entry_price": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "quantity": qty,
+            "plan": adopted_plan,
+        }
+
+    return {
+        "ok": False,
+        "reason": "matching_execution_event_plan_not_found",
+        "symbol": symbol,
+        "active_smc_prefixes": sorted(active_prefixes),
+    }
+
+
 def pm_find_bot_plan(symbol: str) -> Dict[str, Any]:
     symbol = v010_normalize_symbol(symbol)
+
     rows = v014_open_paper_positions_for_symbol(symbol)
     for row in rows:
-        direction = str(row.get("direction") or row.get("side") or "").upper()
-        if direction in ("BUY", "LONG"):
-            direction = "LONG"
-        elif direction in ("SELL", "SHORT"):
-            direction = "SHORT"
+        direction = _pm_norm_plan_direction(row.get("direction") or row.get("side"))
         if direction in ("LONG", "SHORT"):
-            return {"ok": True, "source": "open_paper_positions", "symbol": symbol, "direction": direction, "signal_key": row.get("signal_key"), "plan": row}
+            return {
+                "ok": True,
+                "source": "open_paper_positions",
+                "symbol": symbol,
+                "direction": direction,
+                "signal_key": row.get("signal_key"),
+                "plan": row,
+            }
+
     state = v017_load_tp_state()
     for signal_key, row in (state.get("signals") or {}).items():
         if v010_normalize_symbol(row.get("symbol") or "") != symbol:
             continue
         stage = str(row.get("lifecycle_stage") or "").upper()
-        direction = str(row.get("direction") or "").upper()
+        direction = _pm_norm_plan_direction(row.get("direction"))
         if direction in ("LONG", "SHORT") and stage not in ("", "POSITION_CLOSED_CLEAN", "NEEDS_REVIEW", "ENTRY_FAILED"):
-            return {"ok": True, "source": "tp_lifecycle_state", "symbol": symbol, "direction": direction, "signal_key": signal_key, "plan": row}
-    return {"ok": False, "reason": "matching_open_bot_plan_not_found", "symbol": symbol}
+            return {
+                "ok": True,
+                "source": "tp_lifecycle_state",
+                "symbol": symbol,
+                "direction": direction,
+                "signal_key": signal_key,
+                "plan": row,
+            }
+
+    fallback = _pm_find_bot_plan_from_execution_events(symbol)
+    if fallback.get("ok"):
+        return fallback
+
+    return {
+        "ok": False,
+        "reason": "matching_open_bot_plan_not_found",
+        "symbol": symbol,
+        "fallback": fallback,
+    }
 
 
 def _pm_float(x: Any) -> Optional[float]:
