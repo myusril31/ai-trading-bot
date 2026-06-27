@@ -2438,12 +2438,25 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     # It is a binary structure gate: sweep + reclaim + structural SL + entry sanity.
     # FVG/OB/displacement/retest are logged as context only and DO NOT affect score.
     stageb_conf = result.get("stageb_confirmation") or {}
+
+    # Minimal mode means SMC is binary structure gate only.
+    # This must also cover already_confirmed persisted states, not only fresh confirmations.
+    minimal_mode_enabled = _env_bool("VPS_SMC_MINIMAL_REQUIRED_ENABLED", False)
+    stage_state = str(stageb_conf.get("stageb_state_machine") or result.get("stageb_state_machine") or "").upper()
+    shadow_state = str(result.get("shadow_state") or result.get("state") or "").upper()
+    selected_poi_type = str(stageb_conf.get("selected_poi_type") or result.get("selected_poi_type") or "").upper()
+    confirm_reason = str(stageb_conf.get("stageb_confirm_reason") or result.get("stageb_confirm_reason") or "")
+
     minimal_active = bool(
-        _env_bool("VPS_SMC_MINIMAL_REQUIRED_ENABLED", False)
+        minimal_mode_enabled
         and (
             stageb_conf.get("smc_minimal_required_enabled")
-            or stageb_conf.get("stageb_confirm_reason") == "minimal_sweep_reclaim_structural_sl_entry_sane"
+            or confirm_reason == "minimal_sweep_reclaim_structural_sl_entry_sane"
+            or confirm_reason == "already_confirmed"
             or bool(stageb_conf.get("smc_minimal_required"))
+            or stage_state == "CONFIRMED"
+            or shadow_state == "CONFIRMED"
+            or selected_poi_type == "SMC_MINIMAL"
         )
     )
 
