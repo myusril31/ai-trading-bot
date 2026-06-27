@@ -382,6 +382,13 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
         deps.append_event(event)
         return response
 
+    @router.post("/send-report")
+    async def send_report(request: Request) -> JsonDict:
+        if not deps.auth_ok(request):
+            return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+        payload = await _payload(request)
+        ctx = _context(payload)
+        report = {
             "ok": bool(ctx.get("recon", {}).get("ok")) if ctx.get("symbol") else False,
             "version_scope": "v0.27_live_guarded_wip",
             "symbol": ctx.get("symbol") or None,
@@ -390,8 +397,18 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
             "reconcile": ctx.get("recon"),
             "timestamp_utc": deps.utc_now_iso(),
         }
-        send_result = deps.send_report(report) if callable(deps.send_report) else {"ok": True, "decision": "REPORT_PREVIEW", "reason": "send_report_callback_not_configured"}
-        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_SEND_REPORT", "symbol": report.get("symbol"), "signal_key": report.get("signal_key"), "send_result": send_result}
+        send_result = deps.send_report(report) if callable(deps.send_report) else {
+            "ok": True,
+            "decision": "REPORT_PREVIEW",
+            "reason": "send_report_callback_not_configured",
+        }
+        event = {
+            "event_at_utc": deps.utc_now_iso(),
+            "action": "POSITION_MANAGER_SEND_REPORT",
+            "symbol": report.get("symbol"),
+            "signal_key": report.get("signal_key"),
+            "send_result": send_result,
+        }
         deps.append_event(event)
         return {"ok": bool(send_result.get("ok")), "report": report, "send_result": send_result}
 
@@ -403,15 +420,22 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
         symbol = _payload_symbol(payload, deps)
         if symbol:
             response = _run(payload, preview_only=False)
-            event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_RUN_ONCE", "response": response}
+            event = {
+                "event_at_utc": deps.utc_now_iso(),
+                "action": "POSITION_MANAGER_RUN_ONCE",
+                "response": response,
+            }
             deps.append_event(event)
             return response
 
         response = _run_all_open_positions(payload)
-        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_RUN_ONCE", "open_positions": response.get("open_positions"), "actions": response.get("actions")}
+        event = {
+            "event_at_utc": deps.utc_now_iso(),
+            "action": "POSITION_MANAGER_RUN_ONCE",
+            "open_positions": response.get("open_positions"),
+            "actions": response.get("actions"),
+        }
         deps.append_event(event)
         return response
-
-
 
     return router
