@@ -2433,36 +2433,59 @@ def _build_plan_and_score(result: Dict[str, Any]) -> tuple[str, Optional[Dict[st
     if rr_tp2 < _env_float("VPS_SMC_RR_MIN_TP2", 1.50):
         return "INVALID_PLAN", None, {"score": 0, "priority": "C", "risk_mult": 0.5, "reasons": ["rr_below_min"]}, "invalid_plan"
     plan = {"entry_lo": entry_lo, "entry_hi": entry_hi, "entry_mid": entry_mid, "sl": sl, "invalid": sl, "tp1": float(tp1), "tp2": float(tp2), "tp3": (float(tp3) if tp3 is not None else None), "rr_tp2": rr_tp2}
-    score = 60
-    reasons: List[str] = ["base_60"]
-    htf_bias = str(htf_gate.get("htf_bias") or "MIXED").upper()
-    htf_structure = str(htf_gate.get("htf_structure") or "UNKNOWN").upper()
-    if str(htf_gate.get("htf_gate_status") or "") == "PASS":
-        score += 10; reasons.append("+10_htf_pass")
-    if (direction == "LONG" and htf_bias == "BULLISH") or (direction == "SHORT" and htf_bias == "BEARISH"):
-        score += 5; reasons.append("+5_htf_bias_align")
-    elif htf_bias == "MIXED" and htf_structure == "RANGE":
-        score += 5; reasons.append("+5_mixed_range")
-    elif (direction == "LONG" and htf_bias == "BEARISH") or (direction == "SHORT" and htf_bias == "BULLISH"):
-        score -= 10; reasons.append("-10_htf_bias_conflict")
-    if str(result.get("liq_gate_status") or "") == "PASS":
-        score += 10; reasons.append("+10_liq_pass")
-    elif str(result.get("liq_gate_status") or "") == "BLOCK":
-        score -= 10; reasons.append("-10_liq_block")
-    if ((result.get("stageb_confirmation") or {}).get("stageb_reclaim") or {}).get("has_reclaim"):
-        score += 10; reasons.append("+10_reclaim")
-    if ((result.get("stageb_confirmation") or {}).get("stageb_displacement") or {}).get("has_displacement"):
-        score += 10; reasons.append("+10_displacement")
-    if ((result.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {}).get("has_fvg"):
-        score += 10; reasons.append("+10_fvg")
-    if rr_tp2 >= 1.5:
-        score += 5; reasons.append("+5_rr_ge_1_5")
-    if rr_tp2 < 1.0:
-        score -= 10; reasons.append("-10_rr_lt_1_0")
-    s15 = str(result.get("structure_15m") or "UNKNOWN").upper()
-    if (direction == "LONG" and s15 == "UP") or (direction == "SHORT" and s15 == "DOWN"):
-        score += 5; reasons.append("+5_structure_align")
-    score = max(0, min(100, score))
+    # === SMC_MINIMAL_BINARY_SCORE_20260627 ===
+    # Minimal SMC is NOT a confidence score.
+    # It is a binary structure gate: sweep + reclaim + structural SL + entry sanity.
+    # FVG/OB/displacement/retest are logged as context only and DO NOT affect score.
+    stageb_conf = result.get("stageb_confirmation") or {}
+    minimal_active = bool(
+        _env_bool("VPS_SMC_MINIMAL_REQUIRED_ENABLED", False)
+        and (
+            stageb_conf.get("smc_minimal_required_enabled")
+            or stageb_conf.get("stageb_confirm_reason") == "minimal_sweep_reclaim_structural_sl_entry_sane"
+            or bool(stageb_conf.get("smc_minimal_required"))
+        )
+    )
+
+    if minimal_active:
+        score = round(float(_env_float("VPS_SMC_MINIMAL_PASS_SCORE", _env_float("VPS_SMC_SCORE_MIN", 70.0))), 1)
+        reasons: List[str] = [
+            "minimal_required_binary_pass",
+            "score_is_legacy_compat_only",
+            "optional_smc_quality_not_scored",
+            "final_decision_by_deriv_macro_quant_confluence",
+        ]
+    else:
+        score = 60
+        reasons: List[str] = ["base_60"]
+        htf_bias = str(htf_gate.get("htf_bias") or "MIXED").upper()
+        htf_structure = str(htf_gate.get("htf_structure") or "UNKNOWN").upper()
+        if str(htf_gate.get("htf_gate_status") or "") == "PASS":
+            score += 10; reasons.append("+10_htf_pass")
+        if (direction == "LONG" and htf_bias == "BULLISH") or (direction == "SHORT" and htf_bias == "BEARISH"):
+            score += 5; reasons.append("+5_htf_bias_align")
+        elif htf_bias == "MIXED" and htf_structure == "RANGE":
+            score += 5; reasons.append("+5_mixed_range")
+        elif (direction == "LONG" and htf_bias == "BEARISH") or (direction == "SHORT" and htf_bias == "BULLISH"):
+            score -= 10; reasons.append("-10_htf_bias_conflict")
+        if str(result.get("liq_gate_status") or "") == "PASS":
+            score += 10; reasons.append("+10_liq_pass")
+        elif str(result.get("liq_gate_status") or "") == "BLOCK":
+            score -= 10; reasons.append("-10_liq_block")
+        if ((result.get("stageb_confirmation") or {}).get("stageb_reclaim") or {}).get("has_reclaim"):
+            score += 10; reasons.append("+10_reclaim")
+        if ((result.get("stageb_confirmation") or {}).get("stageb_displacement") or {}).get("has_displacement"):
+            score += 10; reasons.append("+10_displacement")
+        if ((result.get("stageb_confirmation") or {}).get("stageb_fvg_poi") or {}).get("has_fvg"):
+            score += 10; reasons.append("+10_fvg")
+        if rr_tp2 >= 1.5:
+            score += 5; reasons.append("+5_rr_ge_1_5")
+        if rr_tp2 < 1.0:
+            score -= 10; reasons.append("-10_rr_lt_1_0")
+        s15 = str(result.get("structure_15m") or "UNKNOWN").upper()
+        if (direction == "LONG" and s15 == "UP") or (direction == "SHORT" and s15 == "DOWN"):
+            score += 5; reasons.append("+5_structure_align")
+        score = max(0, min(100, score))
     a_min = _env_float("VPS_SMC_PRIORITY_A_MIN", 80.0)
     b_min = _env_float("VPS_SMC_PRIORITY_B_MIN", 70.0)
     priority = "A" if score >= a_min else ("B" if score >= b_min else "C")

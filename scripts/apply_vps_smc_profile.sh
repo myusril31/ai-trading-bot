@@ -52,6 +52,7 @@ BASE = {
     # FVG/OB/displacement/retest become quality context; deriv/macro/quant final-gate live entry.
     "VPS_SMC_MINIMAL_REQUIRED_ENABLED": "true",
     "VPS_SMC_MINIMAL_ENTRY_BAND_PCT": "0.02",
+    "VPS_SMC_MINIMAL_PASS_SCORE": "70",
 
     # Candle store retention: keep enough 4H history for HTF structure.
     "BINANCE_CANDLE_RETENTION_DAYS": "90",
