@@ -131,6 +131,8 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
         decision = _classify_reconcile(recon)
         if decision == "UNKNOWN":
             action = "NEEDS_REVIEW"
+        elif decision == "ACTION_REQUIRED":
+            action = "OPERATOR_REVIEW_REQUIRED"
         elif bool(recon.get("cleanup_required")):
             action = "OPERATOR_REVIEW_REQUIRED"
         else:
