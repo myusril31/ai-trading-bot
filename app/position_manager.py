@@ -382,6 +382,19 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
         deps.append_event(event)
         return response
 
+            "ok": bool(ctx.get("recon", {}).get("ok")) if ctx.get("symbol") else False,
+            "version_scope": "v0.27_live_guarded_wip",
+            "symbol": ctx.get("symbol") or None,
+            "signal_key": ctx.get("signal_key") or None,
+            "safety_summary": ctx.get("safety"),
+            "reconcile": ctx.get("recon"),
+            "timestamp_utc": deps.utc_now_iso(),
+        }
+        send_result = deps.send_report(report) if callable(deps.send_report) else {"ok": True, "decision": "REPORT_PREVIEW", "reason": "send_report_callback_not_configured"}
+        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_SEND_REPORT", "symbol": report.get("symbol"), "signal_key": report.get("signal_key"), "send_result": send_result}
+        deps.append_event(event)
+        return {"ok": bool(send_result.get("ok")), "report": report, "send_result": send_result}
+
     @router.post("/run-once")
     async def run_once(request: Request) -> JsonDict:
         if not deps.auth_ok(request):
@@ -396,20 +409,9 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
 
         response = _run_all_open_positions(payload)
         event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_RUN_ONCE", "open_positions": response.get("open_positions"), "actions": response.get("actions")}
-        payload = await _payload(request)
-        ctx = _context(payload)
-        report = {
-            "ok": bool(ctx.get("recon", {}).get("ok")) if ctx.get("symbol") else False,
-            "version_scope": "v0.27_live_guarded_wip",
-            "symbol": ctx.get("symbol") or None,
-            "signal_key": ctx.get("signal_key") or None,
-            "safety_summary": ctx.get("safety"),
-            "reconcile": ctx.get("recon"),
-            "timestamp_utc": deps.utc_now_iso(),
-        }
-        send_result = deps.send_report(report) if callable(deps.send_report) else {"ok": True, "decision": "REPORT_PREVIEW", "reason": "send_report_callback_not_configured"}
-        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_SEND_REPORT", "symbol": report.get("symbol"), "signal_key": report.get("signal_key"), "send_result": send_result}
         deps.append_event(event)
-        return {"ok": bool(send_result.get("ok")), "report": report, "send_result": send_result}
+        return response
+
+
 
     return router
