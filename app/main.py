@@ -8137,6 +8137,343 @@ def v017_tp_lifecycle_check_core(symbol: str, signal_key: str) -> Dict[str, Any]
     return {"ok": True, "symbol": symbol, "signal_key": signal_key, "positionAmt": str(position_amt), "initial_qty": str(row.get("initial_qty") or ""), "remaining_qty": str(abs_pos), "detected_event": detected_event, "action_taken": action_taken, "reason": reason or None, "old_sl_cancel_ok": old_sl_cancel_ok, "new_sl_algo_id": new_sl_algo_id, "new_sl_client_algo_id": new_sl_client_algo_id, "new_sl_price": new_sl_price, "cleanup_count": len(cleanup_results), "cleanup_results": cleanup_results, "lifecycle_stage": str(row.get("lifecycle_stage") or stage)}
 
 
+
+def _pm_live_algo_orders(symbol: str) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    res = live_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+    body = res.get("body") if isinstance(res.get("body"), list) else []
+    return {
+        "ok": bool(res.get("ok")),
+        "reason": res.get("reason"),
+        "symbol": symbol,
+        "orders": body,
+        "raw": res,
+    }
+
+
+def _pm_live_position_amt(symbol: str) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    res = live_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if not res.get("ok"):
+        return {"ok": False, "reason": res.get("reason") or "position_risk_failed", "symbol": symbol, "raw": res}
+
+    rows = res.get("body") if isinstance(res.get("body"), list) else []
+    row = next((x for x in rows if str(x.get("symbol") or "").upper() == symbol), None)
+    if not row:
+        return {"ok": False, "reason": "position_row_not_found", "symbol": symbol, "raw": res}
+
+    try:
+        amt = Decimal(str(row.get("positionAmt") or "0"))
+    except Exception:
+        return {"ok": False, "reason": "invalid_position_amt", "symbol": symbol, "position": row}
+
+    return {"ok": True, "symbol": symbol, "positionAmt": str(amt), "abs_qty": str(abs(amt)), "position": row}
+
+
+def _pm_order_type(order: Dict[str, Any]) -> str:
+    return str(order.get("orderType") or order.get("type") or "").upper()
+
+
+def _pm_order_qty(order: Dict[str, Any]) -> Decimal:
+    try:
+        return abs(Decimal(str(order.get("quantity") or order.get("origQty") or "0")))
+    except Exception:
+        return Decimal("0")
+
+
+def _pm_order_reduce_only(order: Dict[str, Any]) -> bool:
+    raw = order.get("reduceOnly")
+    return raw is True or str(raw).strip().lower() == "true"
+
+
+def _pm_order_client_id(order: Dict[str, Any]) -> str:
+    return str(order.get("clientAlgoId") or order.get("clientOrderId") or "")
+
+
+def _pm_plain_decimal(value: Decimal) -> str:
+    try:
+        return _live_plain_decimal(value)
+    except Exception:
+        s = format(value.normalize(), "f")
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def _pm_symbol_filters(symbol: str) -> Dict[str, Any]:
+    try:
+        return live_entry_symbol_filters(symbol)
+    except Exception:
+        return {}
+
+
+def _pm_round_qty_to_step(symbol: str, qty: Decimal) -> Decimal:
+    try:
+        filters = _pm_symbol_filters(symbol)
+        step = Decimal(str(filters.get("stepSize") or filters.get("step_size") or "0"))
+        if step > 0:
+            return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+    except Exception:
+        pass
+    return qty
+
+
+def _pm_round_price_to_tick(symbol: str, price: Any) -> str:
+    try:
+        p = Decimal(str(price))
+        filters = _pm_symbol_filters(symbol)
+        tick = Decimal(str(filters.get("tickSize") or filters.get("tick_size") or "0"))
+        if tick > 0:
+            p = (p / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+        return _pm_plain_decimal(p)
+    except Exception:
+        return str(price)
+
+
+def _pm_plan_price(bot_plan: Dict[str, Any], key: str) -> str:
+    plan = bot_plan.get("plan") if isinstance(bot_plan.get("plan"), dict) else {}
+    value = (
+        bot_plan.get(key)
+        or plan.get(key)
+        or ((plan.get("payload") or {}).get(key) if isinstance(plan.get("payload"), dict) else None)
+    )
+    return str(value or "").strip()
+
+
+def _pm_valid_reduce_order_exists(orders: list, order_type: str, qty: Decimal) -> bool:
+    order_type = str(order_type or "").upper()
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if _pm_order_type(order) != order_type:
+            continue
+        if not _pm_order_reduce_only(order):
+            continue
+        if _pm_order_qty(order) == qty:
+            return True
+    return False
+
+
+def _pm_live_cancel_algo_order(symbol: str, order: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = v010_normalize_symbol(symbol)
+    algo_id = order.get("algoId")
+    client_id = order.get("clientAlgoId") or order.get("clientOrderId")
+
+    if algo_id:
+        res = live_signed_request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+        if res.get("ok"):
+            return {"ok": True, "symbol": symbol, "cancel_by": "algoId", "algoId": algo_id, "clientAlgoId": client_id, "raw": res}
+
+    if client_id:
+        res = live_signed_request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "clientAlgoId": client_id})
+        return {"ok": bool(res.get("ok")), "symbol": symbol, "cancel_by": "clientAlgoId", "algoId": algo_id, "clientAlgoId": client_id, "raw": res}
+
+    return {"ok": False, "reason": "missing_algo_id_and_client_algo_id", "symbol": symbol, "order": order}
+
+
+def _pm_live_place_reduce_algo(symbol: str, label: str, side: str, order_type: str, qty: Decimal, trigger_price: str) -> Dict[str, Any]:
+    import time as _time
+
+    symbol = v010_normalize_symbol(symbol)
+    qty_s = _pm_plain_decimal(qty)
+    client_id = f"PMSYNC_{int(_time.time() * 1000) % 1000000000}_{label}"[:36]
+
+    params = {
+        "symbol": symbol,
+        "side": str(side or "").upper(),
+        "type": str(order_type or "").upper(),
+        "quantity": qty_s,
+        "reduceOnly": "true",
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": client_id,
+        "triggerPrice": str(trigger_price),
+        "algoType": "CONDITIONAL",
+        "positionSide": "BOTH",
+        "priceProtect": "false",
+    }
+
+    res = live_signed_request("POST", "/fapi/v1/algoOrder", params)
+    return {
+        "ok": bool(res.get("ok")),
+        "symbol": symbol,
+        "label": label,
+        "clientAlgoId": client_id,
+        "request": params,
+        "raw": res,
+        "reason": res.get("reason"),
+    }
+
+
+def pm_sync_protection_after_live_reduce(symbol: str, action: str, signal_key: str = "") -> Dict[str, Any]:
+    import os as _os
+    import time as _time
+
+    symbol = v010_normalize_symbol(symbol)
+    action = str(action or "").strip().upper()
+    signal_key = str(signal_key or "").strip()
+
+    if action != "REDUCE_50":
+        return {"ok": True, "skipped": True, "reason": "sync_only_after_reduce_50", "symbol": symbol, "action": action}
+
+    enabled = str(_os.getenv("PM_SYNC_PROTECTION_AFTER_REDUCE", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+    if not enabled:
+        return {"ok": True, "skipped": True, "reason": "pm_sync_protection_after_reduce_disabled", "symbol": symbol, "action": action}
+
+    try:
+        delay = float(str(_os.getenv("PM_POST_REDUCE_SYNC_DELAY_SEC", "2.0")).strip() or "2.0")
+    except Exception:
+        delay = 2.0
+    if delay > 0:
+        _time.sleep(min(max(delay, 0.0), 10.0))
+
+    pos = _pm_live_position_amt(symbol)
+    if not pos.get("ok"):
+        return {"ok": False, "reason": "position_after_reduce_fetch_failed", "symbol": symbol, "position_result": pos}
+
+    position_amt = Decimal(str(pos.get("positionAmt") or "0"))
+    remaining_qty = abs(position_amt)
+
+    if remaining_qty == Decimal("0"):
+        return {"ok": True, "symbol": symbol, "positionAmt": str(position_amt), "remaining_qty": "0", "reason": "position_closed_no_protection_sync_needed"}
+
+    remaining_qty = _pm_round_qty_to_step(symbol, remaining_qty)
+    if remaining_qty <= Decimal("0"):
+        return {"ok": False, "reason": "remaining_qty_below_step", "symbol": symbol, "positionAmt": str(position_amt)}
+
+    side = "SELL" if position_amt > 0 else "BUY"
+    bot_plan = pm_find_bot_plan(symbol)
+    sl_price_raw = _pm_plan_price(bot_plan, "sl")
+    tp1_price_raw = _pm_plan_price(bot_plan, "tp1")
+
+    sl_price = _pm_round_price_to_tick(symbol, sl_price_raw) if sl_price_raw else ""
+    tp1_price = _pm_round_price_to_tick(symbol, tp1_price_raw) if tp1_price_raw else ""
+
+    before = _pm_live_algo_orders(symbol)
+    if not before.get("ok"):
+        return {"ok": False, "reason": "open_algo_before_fetch_failed", "symbol": symbol, "open_algo_result": before}
+
+    orders_before = before.get("orders") or []
+    placed = []
+    canceled = []
+    skipped_cancel = []
+
+    has_stop = _pm_valid_reduce_order_exists(orders_before, "STOP_MARKET", remaining_qty)
+    has_tp = _pm_valid_reduce_order_exists(orders_before, "TAKE_PROFIT_MARKET", remaining_qty)
+
+    # Place replacement before canceling old oversize orders. Being naked even for a second is a very human kind of bad idea.
+    if not has_stop and sl_price:
+        placed_stop = _pm_live_place_reduce_algo(symbol, "SL_SYNC", side, "STOP_MARKET", remaining_qty, sl_price)
+        placed.append(placed_stop)
+
+    if not has_tp and tp1_price:
+        placed_tp = _pm_live_place_reduce_algo(symbol, "TP1_SYNC", side, "TAKE_PROFIT_MARKET", remaining_qty, tp1_price)
+        placed.append(placed_tp)
+
+    _time.sleep(0.7)
+
+    after_place = _pm_live_algo_orders(symbol)
+    if not after_place.get("ok"):
+        return {
+            "ok": False,
+            "reason": "open_algo_after_place_fetch_failed",
+            "symbol": symbol,
+            "positionAmt": str(position_amt),
+            "remaining_qty": _pm_plain_decimal(remaining_qty),
+            "placed": placed,
+            "open_algo_result": after_place,
+        }
+
+    orders_after_place = after_place.get("orders") or []
+    valid_stop_after = _pm_valid_reduce_order_exists(orders_after_place, "STOP_MARKET", remaining_qty)
+    valid_tp_after = _pm_valid_reduce_order_exists(orders_after_place, "TAKE_PROFIT_MARKET", remaining_qty)
+
+    for order in orders_after_place:
+        if not isinstance(order, dict):
+            continue
+        typ = _pm_order_type(order)
+        if typ not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            continue
+        if not _pm_order_reduce_only(order):
+            continue
+
+        qty = _pm_order_qty(order)
+        if qty <= remaining_qty:
+            continue
+
+        can_cancel = (typ == "STOP_MARKET" and valid_stop_after) or (typ == "TAKE_PROFIT_MARKET" and valid_tp_after)
+        if not can_cancel:
+            skipped_cancel.append({
+                "clientAlgoId": _pm_order_client_id(order),
+                "algoId": order.get("algoId"),
+                "orderType": typ,
+                "quantity": str(qty),
+                "reason": "no_valid_replacement_order_same_type",
+            })
+            continue
+
+        canceled.append(_pm_live_cancel_algo_order(symbol, order))
+
+    _time.sleep(0.7)
+
+    final = _pm_live_algo_orders(symbol)
+    if not final.get("ok"):
+        return {
+            "ok": False,
+            "reason": "open_algo_final_fetch_failed",
+            "symbol": symbol,
+            "positionAmt": str(position_amt),
+            "remaining_qty": _pm_plain_decimal(remaining_qty),
+            "placed": placed,
+            "canceled": canceled,
+            "skipped_cancel": skipped_cancel,
+            "open_algo_result": final,
+        }
+
+    final_orders = final.get("orders") or []
+    oversized = []
+    final_has_stop = _pm_valid_reduce_order_exists(final_orders, "STOP_MARKET", remaining_qty)
+    final_has_tp = _pm_valid_reduce_order_exists(final_orders, "TAKE_PROFIT_MARKET", remaining_qty)
+
+    for order in final_orders:
+        if not isinstance(order, dict):
+            continue
+        typ = _pm_order_type(order)
+        if typ not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            continue
+        if _pm_order_reduce_only(order) and _pm_order_qty(order) > remaining_qty:
+            oversized.append({
+                "clientAlgoId": _pm_order_client_id(order),
+                "algoId": order.get("algoId"),
+                "orderType": typ,
+                "quantity": str(_pm_order_qty(order)),
+                "triggerPrice": order.get("triggerPrice"),
+            })
+
+    ok = bool(final_has_stop and final_has_tp and not oversized and not any(not x.get("ok") for x in placed + canceled if isinstance(x, dict)))
+
+    result = {
+        "ok": ok,
+        "symbol": symbol,
+        "action": action,
+        "signal_key": signal_key or None,
+        "positionAmt": str(position_amt),
+        "remaining_qty": _pm_plain_decimal(remaining_qty),
+        "side": side,
+        "bot_plan_ok": bool(bot_plan.get("ok")),
+        "sl_price": sl_price or None,
+        "tp1_price": tp1_price or None,
+        "placed": placed,
+        "canceled": canceled,
+        "skipped_cancel": skipped_cancel,
+        "final_has_stop": final_has_stop,
+        "final_has_tp": final_has_tp,
+        "oversized_orders": oversized,
+        "final_open_algo_count": len(final_orders),
+    }
+
+    if not ok:
+        result["reason"] = "post_reduce_protection_sync_incomplete"
+    return result
+
+
 def pm_live_guarded_reduce_only_action(symbol: str, action: str, signal_key: str = "") -> Dict[str, Any]:
     symbol = v010_normalize_symbol(symbol)
     action = str(action or "").strip().upper()
@@ -8181,6 +8518,19 @@ def pm_live_guarded_reduce_only_action(symbol: str, action: str, signal_key: str
         "newClientOrderId": _live_client_order_id("PMV027", signal_key, action),
     }
     res = live_place_order(params)
+
+    post_reduce_sync_result: Dict[str, Any] = {}
+    if bool(res.get("ok")) and action == "REDUCE_50":
+        try:
+            post_reduce_sync_result = pm_sync_protection_after_live_reduce(symbol, action, signal_key)
+        except Exception as e:
+            post_reduce_sync_result = {
+                "ok": False,
+                "reason": f"post_reduce_sync_exception:{type(e).__name__}:{e}",
+                "symbol": symbol,
+                "action": action,
+            }
+
     event = {
         "event_at_utc": utc_now_iso(),
         "event_at_wib": wib_now_iso(),
@@ -8193,10 +8543,24 @@ def pm_live_guarded_reduce_only_action(symbol: str, action: str, signal_key: str
         "quantity": params["quantity"],
         "order_ok": bool(res.get("ok")),
         "order_reason": res.get("reason"),
+        "post_reduce_sync_result": post_reduce_sync_result or None,
     }
     append_jsonl(EXECUTION_EVENTS_LOG, event)
     append_jsonl(MANAGER_ACTIONS_LOG if res.get("ok") else MANAGER_ERRORS_LOG, event)
-    return {"ok": bool(res.get("ok")), "reason": res.get("reason"), "symbol": symbol, "action": action, "positionAmt": str(position_amt), "side": side, "quantity": params["quantity"], "order": res}
+    if res.get("ok") and post_reduce_sync_result and not post_reduce_sync_result.get("ok", True):
+        append_jsonl(MANAGER_ERRORS_LOG, event)
+
+    return {
+        "ok": bool(res.get("ok")),
+        "reason": res.get("reason"),
+        "symbol": symbol,
+        "action": action,
+        "positionAmt": str(position_amt),
+        "side": side,
+        "quantity": params["quantity"],
+        "order": res,
+        "post_reduce_sync_result": post_reduce_sync_result or None,
+    }
 
 
 PM_ACTION_STATE_FILE = STATE_DIR / "position_manager_actions.json"
