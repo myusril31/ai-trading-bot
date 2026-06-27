@@ -362,7 +362,7 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
             return response
 
         positions_res = deps.list_open_positions() if callable(deps.list_open_positions) else {"ok": False, "reason": "list_open_positions_callback_missing", "positions": []}
-        positions = positions_res.get("positions") or []
+        if isinstance(positions_res, dict):
         results = []
         for pos in positions:
             if not isinstance(pos, dict):
