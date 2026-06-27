@@ -288,6 +288,26 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
         response["action_budget"] = budget
         return response
 
+    def _run_all_open_positions(payload: JsonDict) -> JsonDict:
+        positions_res = deps.list_open_positions() if callable(deps.list_open_positions) else {"ok": False, "reason": "list_open_positions_callback_missing", "positions": []}
+        positions_res = _sanitize_positions_result(positions_res)
+        positions = positions_res.get("positions") or []
+        results = []
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            pos_symbol = deps.normalize_symbol(pos.get("symbol") or "")
+            if not pos_symbol:
+                continue
+            item_payload = dict(payload)
+            item_payload["symbol"] = pos_symbol
+            results.append(_run(item_payload, preview_only=False))
+        actions = sum(1 for row in results if row.get("action_executed"))
+        response = {"ok": bool(positions_res.get("ok")), "open_positions": len(positions), "actions": actions, "positions": positions, "results": results, "list_positions": positions_res}
+        if len(positions) == 0 and positions_res.get("ok"):
+            response.update({"ok": True, "open_positions": 0, "actions": 0})
+        return response
+
     @router.get("/status")
     def status(request: Request) -> JsonDict:
         if not deps.auth_ok(request):
@@ -374,24 +394,8 @@ def create_router(deps: PositionManagerDeps) -> APIRouter:
             deps.append_event(event)
             return response
 
-        positions_res = deps.list_open_positions() if callable(deps.list_open_positions) else {"ok": False, "reason": "list_open_positions_callback_missing", "positions": []}
-        positions_res = _sanitize_positions_result(positions_res)
-                continue
-            item_payload = dict(payload)
-            item_payload["symbol"] = pos_symbol
-            results.append(_run(item_payload, preview_only=False))
-        actions = sum(1 for row in results if row.get("action_executed"))
-        response = {"ok": bool(positions_res.get("ok")), "open_positions": len(positions), "actions": actions, "positions": positions, "results": results, "list_positions": positions_res}
-        if len(positions) == 0 and positions_res.get("ok"):
-            response.update({"ok": True, "open_positions": 0, "actions": 0})
-        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_RUN_ONCE", "open_positions": response.get("open_positions"), "actions": actions}
-        deps.append_event(event)
-        return response
-
-    @router.post("/send-report")
-    async def send_report(request: Request) -> JsonDict:
-        if not deps.auth_ok(request):
-            return {"ok": False, "decision": "REJECT", "reason": "unauthorized"}
+        response = _run_all_open_positions(payload)
+        event = {"event_at_utc": deps.utc_now_iso(), "action": "POSITION_MANAGER_RUN_ONCE", "open_positions": response.get("open_positions"), "actions": response.get("actions")}
         payload = await _payload(request)
         ctx = _context(payload)
         report = {
