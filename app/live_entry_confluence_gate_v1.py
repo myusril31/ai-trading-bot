@@ -27,6 +27,9 @@ def env_float(k, default):
     except Exception:
         return float(default)
 
+_env_bool = env_bool
+_env_float = env_float
+
 def to_float(x, default=None):
     try:
         if x is None or x == "":
@@ -179,6 +182,38 @@ def evaluate_live_entry_confluence_gate_v1(payload):
 
     quant_score = extract_quant_score(payload)
     pwin = extract_pwin(payload)
+
+    # === STAT_TECH_CONFLUENCE_BALANCED_20260628 ===
+    source_txt = str(
+        payload.get("signal_source")
+        or payload.get("source")
+        or payload.get("engine")
+        or payload.get("strategy")
+        or ""
+    ).upper()
+
+    is_stat_tech = bool("STAT_TECH" in source_txt)
+    technical_component = to_float(
+        payload.get("technical_component")
+        if payload.get("technical_component") is not None
+        else payload.get("technical_score"),
+        0.0,
+    ) or 0.0
+    technical_component = max(0.0, min(env_float("LIVE_ENTRY_CONFLUENCE_TECH_CAP", 25.0), technical_component))
+
+    if is_stat_tech:
+        stat_status = str(payload.get("status") or "").upper()
+        min_tech = env_float("STAT_TECH_MIN_CANDIDATE_SCORE", 17.0)
+        if stat_status != "CANDIDATE":
+            return final_result("BLOCK", "stat_tech_not_candidate", payload, deriv, macro, None, {
+                "technical": technical_component,
+                "status": stat_status,
+            }, {})
+        if technical_component < min_tech:
+            return final_result("BLOCK", "stat_tech_score_below_min", payload, deriv, macro, None, {
+                "technical": technical_component,
+                "min_technical": min_tech,
+            }, {})
 
     min_quant = env_float("LIVE_ENTRY_CONFLUENCE_MIN_QUANT_SCORE", 60)
     if quant_score is not None and quant_score < min_quant:
@@ -369,14 +404,24 @@ def evaluate_live_entry_confluence_gate_v1(payload):
                 "funding": funding, "oi_chg": oi_chg, "taker_imb": taker_imb, "global_ls": global_ls, "top_ls": top_ls
             }, {})
 
-    score = 50.0
-    components = {
-        "base_smc_confirmed": _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0),
-        "deriv": 0.0,
-        "macro": 0.0,
-        "quant": 0.0,
-        "liq": 0.0,
-    }
+    if is_stat_tech:
+        score = technical_component
+        components = {
+            "technical": technical_component,
+            "deriv": 0.0,
+            "macro": 0.0,
+            "quant": 0.0,
+            "liq": 0.0,
+        }
+    else:
+        score = _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0)
+        components = {
+            "base_smc_confirmed": _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0),
+            "deriv": 0.0,
+            "macro": 0.0,
+            "quant": 0.0,
+            "liq": 0.0,
+        }
 
     if quant_score is not None:
         if quant_score >= 80:
@@ -486,7 +531,10 @@ def evaluate_live_entry_confluence_gate_v1(payload):
     # Existing deriv/quant components from legacy scale are boosted here so final score is
     # driven by deriv + macro + quant, not by SMC base.
     if _env_bool("LIVE_ENTRY_CONFLUENCE_REWEIGHT_MINIMAL_SMC", True):
-        components["base_smc_confirmed"] = _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0)
+        if is_stat_tech:
+            components["technical"] = max(0.0, min(_env_float("LIVE_ENTRY_CONFLUENCE_TECH_CAP", 25.0), float(components.get("technical") or 0.0)))
+        else:
+            components["base_smc_confirmed"] = _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0)
 
         deriv_mult = _env_float("LIVE_ENTRY_CONFLUENCE_DERIV_MULT", 1.45)
         quant_mult = _env_float("LIVE_ENTRY_CONFLUENCE_QUANT_MULT", 2.00)
@@ -502,6 +550,9 @@ def evaluate_live_entry_confluence_gate_v1(payload):
 
     details = {
         "min_score": min_score,
+        "signal_source": source_txt,
+        "is_stat_tech": is_stat_tech,
+        "technical_component": technical_component,
         "deriv_age_sec": deriv_age,
         "macro_age_sec": macro_age,
         "quant_score": quant_score,
