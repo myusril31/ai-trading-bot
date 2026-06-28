@@ -11,6 +11,64 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+# TELEGRAM_MARKET_REPORT_STAT_TECH_JSONL_20260628
+def stat_tech_jsonl_metrics(hours=2):
+    import json
+    from datetime import datetime, timezone, timedelta
+    p = Path("logs/stat_tech_live_bridge_events_v1.jsonl")
+    out = {
+        "stat_tech_tick": 0,
+        "stat_tech_summary": 0,
+        "stat_tech_candidates": 0,
+        "stat_tech_blocked": 0,
+        "stat_tech_allowed": 0,
+        "stat_tech_rr12": 0,
+        "stat_tech_bridge": 0,
+    }
+    if not p.exists():
+        return out
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    def parse_dt(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    try:
+        for line in p.open("r", encoding="utf-8", errors="ignore"):
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            dt = parse_dt(r.get("created_at_utc"))
+            if dt is not None and dt < cutoff:
+                continue
+
+            if r.get("event") == "SUMMARY":
+                out["stat_tech_summary"] += 1
+                out["stat_tech_tick"] += 1
+                continue
+
+            if r.get("symbol"):
+                out["stat_tech_candidates"] += 1
+
+            if r.get("confluence_decision") == "BLOCK":
+                out["stat_tech_blocked"] += 1
+            if r.get("confluence_decision") == "ALLOW":
+                out["stat_tech_allowed"] += 1
+            if r.get("rr12_decision"):
+                out["stat_tech_rr12"] += 1
+            if r.get("bridge_decision"):
+                out["stat_tech_bridge"] += 1
+    except Exception:
+        return out
+
+    return out
+
 from datetime import datetime, timezone, timedelta
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -345,7 +403,7 @@ def status_from(tf_summary, sched, scheduler_active):
         return "WARN", "skip tick seen and no v2 tick yet"
 
     if sched["market_ok"] == 0 or sched["smc_tick_v2"] == 0:
-        return "WARN", "fresh but scheduler scan not observed yet"
+        return "WARN", "fresh; stat-tech loop active, waiting for next signal summary"
 
     return "OK", "fresh + v2 scheduler scanning"
 
@@ -386,12 +444,13 @@ def build_message(hours):
 
     out.append("")
     out.append(f"Scheduler {int(hours)}h v2-aware:")
+    statm = stat_tech_jsonl_metrics(2)
     out.append(f"- MARKET_DATA_OK: {sched['market_ok']}")
     out.append(f"- FULL_OK: {sched['market_full_ok']} | PARTIAL_OK: {sched['market_partial_ok']}")
     out.append(f"- MARKET_DATA_BAD: {sched['market_bad']} | SKIP_TICK: {sched['skip_tick']}")
     out.append(f"- STALE_SKIP_PAIR: {sched['stale_skip_pair']}")
-    out.append(f"- STAT_TECH tick: {sched['smc_tick_v2']}")
-    out.append(f"- STAT_TECH loop summary: {sched['smc_batch_done']}")
+    out.append(f"- STAT_TECH tick: {statm['stat_tech_tick']}")
+    out.append(f"- STAT_TECH loop summary: {statm['stat_tech_summary']}")
     out.append(f"- batch timeout/fail: {sched['smc_batch_timeout']}/{sched['smc_batch_failed']}")
     out.append(f"- old TimeoutExpired: {sched['timeout']}")
     out.append(f"- full-repair: {sched['full_repair']}")
