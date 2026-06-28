@@ -5616,6 +5616,72 @@ def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
     p["source"] = "VPS_SMC"
     p["source_mode"] = "VPS_SMC_PRIMARY"
     p["execution_owner"] = "VPS_SMC"
+    # === LIVE_ENTRY_CONFLUENCE_BRIDGE_FIRST_20260628 ===
+    # VPS SMC minimal is binary only.
+    # Final context scoring must happen here before legacy refresh/recompute/ML blocks.
+    # Flow: SMC minimal PASS -> confluence deriv/macro/quant -> RR12 lock -> legacy execution guards.
+    if env_bool("LIVE_ENTRY_CONFLUENCE_GATE_ENABLED", False):
+        try:
+            from app.live_entry_confluence_gate_v1 import evaluate_live_entry_confluence_gate_v1
+            _entry_conf = evaluate_live_entry_confluence_gate_v1(p)
+        except Exception as _entry_e:
+            _entry_conf = {
+                "ok": False,
+                "decision": "BLOCK",
+                "allow": False,
+                "gate": "live_entry_confluence_gate_v1",
+                "reason": "live_entry_confluence_error",
+                "error": str(_entry_e)[:240],
+            }
+
+        p["live_entry_confluence_gate_v1"] = _entry_conf
+
+        if str((_entry_conf or {}).get("decision") or "").upper() == "BLOCK":
+            return {
+                "ok": True,
+                "decision": "NO_TRADE",
+                "reason": (_entry_conf or {}).get("reason") or "live_entry_confluence_block",
+                "gate": "live_entry_confluence_gate_v1",
+                "signal_id": p.get("signal_id") or p.get("signal_key"),
+                "symbol": p.get("symbol"),
+                "direction": p.get("direction") or p.get("dir") or p.get("side"),
+                "execution_mode": execution_mode(),
+                "live_entry_confluence_gate_v1": _entry_conf,
+            }
+
+        if env_bool("LIVE_RR12_PLAN_LOCK_ENABLED", True):
+            try:
+                from app.live_rr12_plan_lock_v1 import apply_live_rr12_plan_lock_v1
+                _rr12_lock = apply_live_rr12_plan_lock_v1(p)
+            except Exception as _rr12_e:
+                _rr12_lock = {
+                    "ok": False,
+                    "decision": "BLOCK",
+                    "allow": False,
+                    "gate": "live_rr12_plan_lock_v1",
+                    "reason": "rr12_plan_lock_error",
+                    "error": str(_rr12_e)[:240],
+                }
+
+            p["live_rr12_plan_lock_v1"] = _rr12_lock
+
+            if str((_rr12_lock or {}).get("decision") or "").upper() == "BLOCK":
+                return {
+                    "ok": True,
+                    "decision": "NO_TRADE",
+                    "reason": (_rr12_lock or {}).get("reason") or "live_rr12_plan_lock_block",
+                    "gate": "live_rr12_plan_lock_v1",
+                    "signal_id": p.get("signal_id") or p.get("signal_key"),
+                    "symbol": p.get("symbol"),
+                    "direction": p.get("direction") or p.get("dir") or p.get("side"),
+                    "execution_mode": execution_mode(),
+                    "live_entry_confluence_gate_v1": _entry_conf,
+                    "live_rr12_plan_lock_v1": _rr12_lock,
+                }
+
+            if isinstance((_rr12_lock or {}).get("payload"), dict):
+                p = dict((_rr12_lock or {}).get("payload") or p)
+
     if not (
         ("plan_sanity_ok" in p)
         and ("tp_normalized" in p)
