@@ -18,6 +18,277 @@ ROOT = APP_ROOT
 LOG_PATH = ROOT / "logs" / "stat_tech_live_bridge_events_v1.jsonl"
 STATE_PATH = ROOT / "state" / "stat_tech_live_loop_state_v1.json"
 
+
+
+# === STAT_TECH_HISTORY_QUANT_PRIOR_V1_20260629 ===
+def _stq_to_float(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _stq_norm_text(v):
+    return str(v or "").strip().upper()
+
+
+def _stq_label_win(row):
+    # Flexible label extraction from v4/v3/outcome joined rows.
+    for k in ("label_win", "outcome_binary", "win", "is_win"):
+        if k in row:
+            v = row.get(k)
+            if isinstance(v, bool):
+                return 1 if v else 0
+            try:
+                if str(v).strip() != "":
+                    return 1 if int(float(v)) == 1 else 0
+            except Exception:
+                pass
+
+    status = _stq_norm_text(row.get("outcome_status") or row.get("status"))
+    target = _stq_norm_text(row.get("label_target") or row.get("first_hit") or row.get("target"))
+
+    if status in ("CLOSED_WIN", "WIN", "TP", "TP1", "TP2", "TP3"):
+        return 1
+    if status in ("CLOSED_LOSS", "LOSS", "SL"):
+        return 0
+    if target in ("TP1", "TP2", "TP3"):
+        return 1
+    if target == "SL":
+        return 0
+    return None
+
+
+def _stq_setup(row):
+    return _stq_norm_text(row.get("setup_type") or row.get("setup") or row.get("mode"))
+
+
+def _stq_symbol(row):
+    return _stq_norm_text(row.get("symbol") or row.get("pair")).replace("BINANCE:", "").replace(".P", "")
+
+
+def _stq_direction(row):
+    d = _stq_norm_text(row.get("direction") or row.get("dir") or row.get("side"))
+    if d in ("BUY", "LONG"):
+        return "LONG"
+    if d in ("SELL", "SHORT"):
+        return "SHORT"
+    return d
+
+
+def _stq_score_bin(v):
+    x = _stq_to_float(v)
+    if x is None:
+        return "NA"
+    lo = int(x // 5) * 5
+    return f"{lo}-{lo+4}"
+
+
+_STAT_QUANT_CACHE = {"loaded_at": 0.0, "rows": [], "stats": {}}
+
+
+def _stq_dataset_paths():
+    import os
+    from pathlib import Path
+
+    raw = str(os.getenv("STAT_TECH_QUANT_PRIOR_DATASET", "")).strip()
+    paths = []
+    if raw:
+        paths.append(Path(raw))
+
+    paths.extend([
+        Path(os.getenv("LOG_DIR", "logs")) / "ml_dataset_v4_current14_candidate_join.jsonl",
+        Path(os.getenv("LOG_DIR", "logs")) / "ml_dataset_v4_candidate_join.jsonl",
+        Path(os.getenv("LOG_DIR", "logs")) / "ml_dataset_v4_outcome_join_v1.jsonl",
+    ])
+    return paths
+
+
+def _stq_load_rows():
+    import json
+    import time
+    import os
+
+    ttl = int(float(os.getenv("STAT_TECH_QUANT_PRIOR_CACHE_TTL_SEC", "300") or "300"))
+    now = time.time()
+    if _STAT_QUANT_CACHE.get("rows") and now - float(_STAT_QUANT_CACHE.get("loaded_at") or 0) <= ttl:
+        return _STAT_QUANT_CACHE["rows"]
+
+    rows = []
+    seen = set()
+    for p in _stq_dataset_paths():
+        try:
+            if not p.exists():
+                continue
+            for line in p.open("r", encoding="utf-8", errors="ignore"):
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(r, dict):
+                    continue
+                y = _stq_label_win(r)
+                if y is None:
+                    continue
+                sym = _stq_symbol(r)
+                direction = _stq_direction(r)
+                setup = _stq_setup(r)
+                key = str(r.get("signal_key") or r.get("signal_id") or "")
+                dedupe = key or f"{sym}|{direction}|{setup}|{len(rows)}"
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                rows.append(r)
+        except Exception:
+            continue
+
+    _STAT_QUANT_CACHE["loaded_at"] = now
+    _STAT_QUANT_CACHE["rows"] = rows
+    return rows
+
+
+def _stq_bucket_add(stats, key, y):
+    if not key:
+        return
+    d = stats.setdefault(key, {"n": 0, "wins": 0})
+    d["n"] += 1
+    d["wins"] += int(y)
+
+
+def _stq_build_stats(rows):
+    stats = {}
+    for r in rows:
+        y = _stq_label_win(r)
+        if y is None:
+            continue
+
+        sym = _stq_symbol(r)
+        direction = _stq_direction(r)
+        setup = _stq_setup(r)
+        regime = _stq_norm_text(r.get("regime"))
+        score_bin = _stq_score_bin(r.get("technical_score") or r.get("score"))
+
+        _stq_bucket_add(stats, "GLOBAL", y)
+        _stq_bucket_add(stats, f"SYM|{sym}", y)
+        _stq_bucket_add(stats, f"DIR|{direction}", y)
+        _stq_bucket_add(stats, f"SETUP|{setup}", y)
+        _stq_bucket_add(stats, f"REGIME|{regime}", y)
+        _stq_bucket_add(stats, f"SCOREBIN|{score_bin}", y)
+        _stq_bucket_add(stats, f"SYM_DIR|{sym}|{direction}", y)
+        _stq_bucket_add(stats, f"DIR_SETUP|{direction}|{setup}", y)
+        _stq_bucket_add(stats, f"SYM_SETUP|{sym}|{setup}", y)
+        _stq_bucket_add(stats, f"SYM_DIR_SETUP|{sym}|{direction}|{setup}", y)
+        _stq_bucket_add(stats, f"DIR_SETUP_SCOREBIN|{direction}|{setup}|{score_bin}", y)
+
+    return stats
+
+
+def _stq_stats():
+    rows = _stq_load_rows()
+    stats = _stq_build_stats(rows)
+    return rows, stats
+
+
+def _stat_tech_history_quant(payload):
+    import os
+
+    enabled = str(os.getenv("STAT_TECH_QUANT_PRIOR_ENABLED", "true")).strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return {"ok": False, "reason": "stat_quant_disabled"}
+
+    rows, stats = _stq_stats()
+    global_stat = stats.get("GLOBAL") or {"n": 0, "wins": 0}
+    if int(global_stat.get("n") or 0) <= 0:
+        return {"ok": False, "reason": "no_labeled_history"}
+
+    prior_wr = float(os.getenv("STAT_TECH_QUANT_PRIOR_WR", "0.60") or "0.60")
+    alpha = float(os.getenv("STAT_TECH_QUANT_PRIOR_ALPHA", "20") or "20")
+    min_n = int(float(os.getenv("STAT_TECH_QUANT_PRIOR_MIN_N", "8") or "8"))
+    min_emit = float(os.getenv("LIVE_ENTRY_CONFLUENCE_MIN_QUANT_SCORE", "60") or "60")
+
+    sym = _stq_symbol(payload)
+    direction = _stq_direction(payload)
+    setup = _stq_setup(payload)
+    regime = _stq_norm_text(payload.get("regime"))
+    score_bin = _stq_score_bin(payload.get("technical_score") or payload.get("score"))
+
+    candidates = [
+        ("SYM_DIR_SETUP", f"SYM_DIR_SETUP|{sym}|{direction}|{setup}"),
+        ("DIR_SETUP_SCOREBIN", f"DIR_SETUP_SCOREBIN|{direction}|{setup}|{score_bin}"),
+        ("SYM_DIR", f"SYM_DIR|{sym}|{direction}"),
+        ("DIR_SETUP", f"DIR_SETUP|{direction}|{setup}"),
+        ("SYM_SETUP", f"SYM_SETUP|{sym}|{setup}"),
+        ("SETUP", f"SETUP|{setup}"),
+        ("SCOREBIN", f"SCOREBIN|{score_bin}"),
+        ("REGIME", f"REGIME|{regime}"),
+        ("DIR", f"DIR|{direction}"),
+        ("SYM", f"SYM|{sym}"),
+        ("GLOBAL", "GLOBAL"),
+    ]
+
+    picked_name = "GLOBAL"
+    picked_key = "GLOBAL"
+    picked = global_stat
+
+    for name, key in candidates:
+        st = stats.get(key)
+        if not st:
+            continue
+        if int(st.get("n") or 0) >= min_n or name == "GLOBAL":
+            picked_name = name
+            picked_key = key
+            picked = st
+            break
+
+    n = int(picked.get("n") or 0)
+    wins = int(picked.get("wins") or 0)
+    raw_wr = (wins / n) if n > 0 else prior_wr
+    smooth_wr = (wins + prior_wr * alpha) / (n + alpha) if n > 0 else prior_wr
+    raw_score = round(max(0.0, min(100.0, smooth_wr * 100.0)), 1)
+
+    return {
+        "ok": True,
+        "source": "STAT_TECH_HISTORY_PRIOR_V1",
+        "basis": picked_name,
+        "key": picked_key,
+        "n": n,
+        "wins": wins,
+        "raw_wr": round(raw_wr, 4),
+        "smoothed_wr": round(smooth_wr, 4),
+        "raw_score": raw_score,
+        "emit_quant_score": bool(raw_score >= min_emit),
+        "min_emit": min_emit,
+        "global_n": int(global_stat.get("n") or 0),
+        "global_wins": int(global_stat.get("wins") or 0),
+    }
+
+
+def _inject_stat_tech_quant_prior(payload):
+    try:
+        if _stq_norm_text(payload.get("signal_source") or payload.get("source") or payload.get("engine")).find("STAT_TECH") < 0:
+            return payload
+        q = _stat_tech_history_quant(payload)
+        payload["stat_quant"] = q
+        if q.get("ok"):
+            payload["stat_quant_score_raw"] = q.get("raw_score")
+            payload["stat_quant_source"] = q.get("source")
+            payload["stat_quant_basis"] = q.get("basis")
+            payload["stat_quant_n"] = q.get("n")
+            payload["stat_quant_wins"] = q.get("wins")
+            # IMPORTANT:
+            # Current confluence hard-blocks when quant_score exists but below min_quant.
+            # So only emit quant_score when it is eligible to be a positive booster.
+            if q.get("emit_quant_score"):
+                payload["quant_score"] = q.get("raw_score")
+                payload["core_quant_score"] = q.get("raw_score")
+        return payload
+    except Exception as e:
+        payload["stat_quant"] = {"ok": False, "reason": f"exception:{e}"}
+        return payload
+
+
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -125,7 +396,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = dict(r)
+        payload = _inject_stat_tech_quant_prior(dict(r))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"

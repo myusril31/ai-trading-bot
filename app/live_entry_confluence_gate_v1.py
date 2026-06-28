@@ -100,7 +100,7 @@ def direction_of(payload):
     return d
 
 def extract_quant_score(payload):
-    for k in ("score", "priority", "quant_score", "core_quant_score", "smc_score"):
+    for k in ("quant_score", "core_quant_score", "stat_quant_score", "smc_score", "score"):
         v = to_float(payload.get(k))
         if v is not None:
             return v
