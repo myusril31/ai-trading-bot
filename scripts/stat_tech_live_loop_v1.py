@@ -83,7 +83,8 @@ def run_once():
     from app.live_rr12_plan_lock_v1 import apply_live_rr12_plan_lock_v1
 
     live_enabled = env_bool("STAT_TECH_LIVE_ENABLED", False)
-    cooldown_sec = env_float("STAT_TECH_COOLDOWN_MIN", 90.0) * 60.0
+    # STAT_TECH_NO_EXTRA_THROTTLE_PARITY_20260628
+    cooldown_sec = env_float("STAT_TECH_COOLDOWN_MIN", 0.0) * 60.0
     now = ts_now()
 
     state = load_state()
