@@ -1,3 +1,5 @@
+# TELEGRAM_MARKET_REPORT_STAT_TECH_PRIMARY_20260628
+# MARKET_HEALTH_REPORT_STAT_TECH_PRIMARY_20260628
 #!/usr/bin/env python3
 import argparse
 import json
@@ -207,7 +209,7 @@ def sh(cmd):
         return f"ERR:{type(e).__name__}:{e}"
 
 def service_status():
-    return sh(["systemctl", "is-active", "vps-smc-scheduler-loop.service"])
+    return sh(["systemctl", "is-active", "vps-stat-tech-live-loop.service"])
 
 def bot_status():
     out = sh(["docker", "ps", "--format", "{{.Names}}|{{.Status}}"])
@@ -219,7 +221,7 @@ def bot_status():
 def journal_lines(hours):
     out = sh([
         "journalctl",
-        "-u", "vps-smc-scheduler-loop.service",
+        "-u", "vps-stat-tech-live-loop.service",
         "--since", f"{int(hours)} hours ago",
         "--no-pager",
     ])
@@ -327,7 +329,7 @@ def status_from(tf_summary, sched, scheduler_active):
     warn_now = sum(x["warn"] for x in tf_summary.values())
 
     if scheduler_active != "active":
-        return "BAD", "scheduler inactive"
+        return "BAD", "stat-tech live loop inactive"
 
     if bad_now > 0:
         return "BAD", "current candle stale/bad"
@@ -368,7 +370,7 @@ def build_message(hours):
     out.append(f"Time: {now_wib().strftime('%Y-%m-%d %H:%M:%S WIB')}")
     out.append(f"Pairs: {len(symbols)}")
     out.append(f"Bot: {bot}")
-    out.append(f"Scheduler: {scheduler_active}")
+    out.append(f"STAT_TECH Loop: {scheduler_active}")
     out.append("")
 
     out.append("Freshness:")
@@ -388,8 +390,8 @@ def build_message(hours):
     out.append(f"- FULL_OK: {sched['market_full_ok']} | PARTIAL_OK: {sched['market_partial_ok']}")
     out.append(f"- MARKET_DATA_BAD: {sched['market_bad']} | SKIP_TICK: {sched['skip_tick']}")
     out.append(f"- STALE_SKIP_PAIR: {sched['stale_skip_pair']}")
-    out.append(f"- SMC tick v2: {sched['smc_tick_v2']}")
-    out.append(f"- SMC batch done: {sched['smc_batch_done']}")
+    out.append(f"- STAT_TECH tick: {sched['smc_tick_v2']}")
+    out.append(f"- STAT_TECH loop summary: {sched['smc_batch_done']}")
     out.append(f"- batch timeout/fail: {sched['smc_batch_timeout']}/{sched['smc_batch_failed']}")
     out.append(f"- old TimeoutExpired: {sched['timeout']}")
     out.append(f"- full-repair: {sched['full_repair']}")
@@ -427,7 +429,7 @@ def build_message(hours):
     elif status == "WARN":
         out.append("Action: monitor. Jangan pakai stale pair; partial-batch tetap boleh scan pair fresh.")
     else:
-        out.append("Action: restore market data/bootstrap dulu. Jangan scan/entry dari stale data.")
+        out.append("Action: restore market data/bootstrap dulu. Jangan scan/entry kalau market data stale atau STAT_TECH loop inactive.")
 
     return "\n".join(out)
 
