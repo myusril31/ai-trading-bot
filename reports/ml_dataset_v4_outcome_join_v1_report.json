@@ -1,10 +1,10 @@
 {
   "ok": true,
   "version": "ml_dataset_v4_outcome_join_v1",
-  "created_at_utc": "2026-06-24T18:56:14.352653+00:00",
+  "created_at_utc": "2026-06-28T08:29:28.207562+00:00",
   "out_jsonl": "logs/ml_dataset_v4_outcome_join_v1.jsonl",
-  "rows": 149,
-  "wins": 65,
+  "rows": 151,
+  "wins": 67,
   "losses": 84,
   "symbols": [
     "ADAUSDT",
@@ -23,8 +23,8 @@
   ],
   "symbol_count": 13,
   "feature_source_counts": {
-    "v4_current14": 106,
-    "v3_feature_join": 43
+    "v4_current14": 107,
+    "v3_feature_join": 44
   },
   "unmatched_outcome_labels": 32,
   "unmatched_sample": [

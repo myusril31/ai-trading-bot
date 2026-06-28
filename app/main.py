@@ -1,3 +1,4 @@
+# === SMC_FINAL_PURGE_STAT_TECH_PRIMARY_20260628 ===
 import json
 import os
 import time
@@ -2070,7 +2071,7 @@ def operator_status_payload(symbol: str = "") -> Dict[str, Any]:
         "binance_env": safety.get("binance_env"),
         "signal_source_mode": signal_source_mode(),
         "apps_script_signal_mode": apps_script_signal_mode(),
-        "vps_smc_execution_enabled": env_bool("VPS_SMC_EXECUTION_ENABLED", False),
+        "stat_tech_live_enabled": env_bool("STAT_TECH_LIVE_ENABLED", False),
         "live_trading_enabled": env_bool("LIVE_TRADING_ENABLED", False),
         "live_go_confirm": env_bool("LIVE_GO_CONFIRM", False),
         "safe_to_continue": safety.get("safe_to_continue"),
@@ -2081,7 +2082,7 @@ def operator_status_payload(symbol: str = "") -> Dict[str, Any]:
         "open_algo_count": safety.get("open_algo_count"),
         "scheduler_status": scheduler_status,
         "candle_websocket_status": {"connected": MARKET_WS_CONNECTED, "bootstrap_done": MARKET_BOOTSTRAP_DONE, "last_error": MARKET_LAST_ERROR},
-        "last_vps_smc_error": scheduler_status.get("last_error"),
+        "last_removed_smc_error": scheduler_status.get("last_error"),
         "final_verdict": verdict,
         "reasons": safety.get("reasons") or [],
         "timestamp_utc": safety.get("timestamp_utc"),
@@ -5434,7 +5435,7 @@ def webhook_signal(
     p = payload_to_dict(payload)
     p["signal_source"] = "APPS_SCRIPT"
     p["event_type"] = "SIGNAL_CONFIRMED"
-    if signal_source_mode() == "VPS_SMC_PRIMARY" and apps_script_signal_mode() == "BACKUP_COMPARE_ONLY":
+    if signal_source_mode() == "STAT_TECH_PRIMARY" and apps_script_signal_mode() == "BACKUP_COMPARE_ONLY":
         p["source"] = p.get("source") or "apps_script_inst"
         p["engine"] = p.get("engine") or "INST"
         p["source_mode"] = "BACKUP_COMPARE_ONLY"
@@ -5775,7 +5776,7 @@ def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(payload or {})
     p["signal_source"] = "VPS_SMC"
     p["source"] = "VPS_SMC"
-    p["source_mode"] = "VPS_SMC_PRIMARY"
+    p["source_mode"] = "STAT_TECH_PRIMARY"
     p["execution_owner"] = "VPS_SMC"
     # === LIVE_ENTRY_CONFLUENCE_BRIDGE_FIRST_20260628 ===
     # VPS SMC minimal is binary only.
@@ -7957,7 +7958,7 @@ def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[s
     live_key_detected = live_binance_key_detected()
     signal_mode = signal_source_mode()
     app_mode = apps_script_signal_mode()
-    vps_exec_enabled = env_bool("VPS_SMC_EXECUTION_ENABLED", False)
+    vps_exec_enabled = env_bool("STAT_TECH_LIVE_ENABLED", False)
     competitor_mode = str(os.getenv("VPS_SMC_COMPETITOR_MODE", "")).strip().upper()
 
     if mode in ("LIVE", "PROD", "MAINNET"):
@@ -7972,14 +7973,14 @@ def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[s
             reasons.append("live_trading_not_enabled")
         if not live_key_detected:
             reasons.append("live_key_missing")
-        if signal_mode != "VPS_SMC_PRIMARY":
-            reasons.append("signal_source_mode_not_vps_smc_primary")
+        if signal_mode != "STAT_TECH_PRIMARY":
+            reasons.append("signal_source_mode_not_stat_tech_primary")
         if app_mode != "BACKUP_COMPARE_ONLY":
             reasons.append("apps_script_signal_mode_not_backup_compare_only")
         if not vps_exec_enabled:
-            reasons.append("vps_smc_execution_disabled")
+            reasons.append("stat_tech_live_disabled")
         if competitor_mode != "PRODUCTION_SIGNAL":
-            reasons.append("vps_smc_competitor_mode_not_production_signal")
+            reasons.append("stat_tech_primary_mode_required")
         if env_bool("TESTNET_KILL_SWITCH", False):
             reasons.append("testnet_kill_switch_active")
         if env_bool("EMERGENCY_CLOSE_ENABLED", False):
@@ -7993,7 +7994,7 @@ def v014_safety_summary(symbol: str = "", ignore_signal_key: str = "") -> Dict[s
             and env_bool("LIVE_TRADING_ENABLED", False)
             and env_bool("LIVE_GO_CONFIRM", False)
             and live_key_detected
-            and signal_mode == "VPS_SMC_PRIMARY"
+            and signal_mode == "STAT_TECH_PRIMARY"
             and app_mode == "BACKUP_COMPARE_ONLY"
             and vps_exec_enabled
             and competitor_mode == "PRODUCTION_SIGNAL"
@@ -10777,8 +10778,7 @@ try:
             "symbol": _night_symbol(p),
             "signal_key": p.get("signal_key"),
         }
-
-    vps_smc.register_execution_bridge_handler(_night_guarded_vps_execution_bridge)
+# SMC_FINAL_PURGE_STAT_TECH_PRIMARY_20260628: removed legacy SMC bridge registration
     print("[night_accuracy_fix] guarded VPS execution bridge registered")
 except Exception as _night_exc:
     print(f"[night_accuracy_fix] failed to register guarded bridge: {_night_exc}")
