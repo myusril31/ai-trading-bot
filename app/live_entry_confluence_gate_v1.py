@@ -523,6 +523,35 @@ def evaluate_live_entry_confluence_gate_v1(payload):
         if liq_ok and liq_total > 0 and liq_imb > 0.35:
             components["liq"] += 8
 
+
+    # === STAT_TECH_QUANT_REWEIGHT_NO_ML_20260629 ===
+    # When ML Gate is OFF, STAT_TECH can still provide non-ML statistical quant_score.
+    # The old mapping made quant_score=60 contribute only +6 after multiplier, too weak
+    # for a 70 hard-gate threshold. This maps statistical confidence into a meaningful
+    # but still capped quant bucket.
+    if is_stat_tech and quant_score is not None and env_bool("STAT_TECH_QUANT_REWEIGHT_NO_ML_ENABLED", True):
+        try:
+            q = float(quant_score)
+        except Exception:
+            q = 0.0
+
+        if q >= 85:
+            stat_quant_component = 15.0
+        elif q >= 80:
+            stat_quant_component = 14.0
+        elif q >= 75:
+            stat_quant_component = 12.0
+        elif q >= 70:
+            stat_quant_component = 10.0
+        elif q >= 65:
+            stat_quant_component = 9.0
+        elif q >= 60:
+            stat_quant_component = 8.0
+        else:
+            stat_quant_component = 0.0
+
+        components["quant"] = max(float(components.get("quant") or 0.0), stat_quant_component)
+
     score += components["deriv"] + components["macro"] + components["quant"] + components["liq"]
 
     min_score = env_float("LIVE_ENTRY_CONFLUENCE_MIN_SCORE", 70)
