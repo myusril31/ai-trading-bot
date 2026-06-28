@@ -371,7 +371,7 @@ def evaluate_live_entry_confluence_gate_v1(payload):
 
     score = 50.0
     components = {
-        "base_smc_confirmed": 50.0,
+        "base_smc_confirmed": _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0),
         "deriv": 0.0,
         "macro": 0.0,
         "quant": 0.0,
@@ -481,6 +481,25 @@ def evaluate_live_entry_confluence_gate_v1(payload):
     score += components["deriv"] + components["macro"] + components["quant"] + components["liq"]
 
     min_score = env_float("LIVE_ENTRY_CONFLUENCE_MIN_SCORE", 70)
+    # === LIVE_ENTRY_CONFLUENCE_SMC_BASE20_REWEIGHT_20260628 ===
+    # Minimal SMC is binary gate only. It must not dominate confluence scoring.
+    # Existing deriv/quant components from legacy scale are boosted here so final score is
+    # driven by deriv + macro + quant, not by SMC base.
+    if _env_bool("LIVE_ENTRY_CONFLUENCE_REWEIGHT_MINIMAL_SMC", True):
+        components["base_smc_confirmed"] = _env_float("LIVE_ENTRY_CONFLUENCE_SMC_BASE_SCORE", 20.0)
+
+        deriv_mult = _env_float("LIVE_ENTRY_CONFLUENCE_DERIV_MULT", 1.45)
+        quant_mult = _env_float("LIVE_ENTRY_CONFLUENCE_QUANT_MULT", 2.00)
+        macro_mult = _env_float("LIVE_ENTRY_CONFLUENCE_MACRO_MULT", 1.00)
+        liq_mult = _env_float("LIVE_ENTRY_CONFLUENCE_LIQ_MULT", 1.00)
+
+        components["deriv"] = max(0.0, min(_env_float("LIVE_ENTRY_CONFLUENCE_DERIV_CAP", 35.0), float(components.get("deriv") or 0.0) * deriv_mult))
+        components["quant"] = max(0.0, min(_env_float("LIVE_ENTRY_CONFLUENCE_QUANT_CAP", 30.0), float(components.get("quant") or 0.0) * quant_mult))
+        components["macro"] = max(_env_float("LIVE_ENTRY_CONFLUENCE_MACRO_FLOOR", -15.0), min(_env_float("LIVE_ENTRY_CONFLUENCE_MACRO_CAP", 10.0), float(components.get("macro") or 0.0) * macro_mult))
+        components["liq"] = max(0.0, min(_env_float("LIVE_ENTRY_CONFLUENCE_LIQ_CAP", 10.0), float(components.get("liq") or 0.0) * liq_mult))
+
+        score = round(max(0.0, min(100.0, sum(float(v or 0.0) for v in components.values()))), 1)
+
     details = {
         "min_score": min_score,
         "deriv_age_sec": deriv_age,
