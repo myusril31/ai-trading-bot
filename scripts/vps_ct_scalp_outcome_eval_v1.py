@@ -7,23 +7,20 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-try:
-# === CT_SCALP_SMC_IMPORT_REMOVED_20260628 ===
+# === CT_SCALP_SMC_IMPORT_REMOVED_20260628_FIXED ===
 class _RemovedSmc:
     def __getattr__(self, name):
         def _disabled(*args, **kwargs):
-            return {"ok": False, "disabled": True, "reason": "smc_runtime_removed_stat_tech_primary", "function": name}
+            return {
+                "ok": False,
+                "disabled": True,
+                "reason": "smc_runtime_removed_stat_tech_primary",
+                "replacement": "STAT_TECH_V1",
+                "function": name,
+            }
         return _disabled
 
 smc = _RemovedSmc()
-
-except ModuleNotFoundError:
-    app_dir = ROOT / "app"
-    if str(app_dir) not in sys.path:
-        sys.path.insert(0, str(app_dir))
-    import vps_smc as smc
-
-
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
 REPORT_DIR = ROOT / "reports"
