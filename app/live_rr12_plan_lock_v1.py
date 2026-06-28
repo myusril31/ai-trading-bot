@@ -128,7 +128,7 @@ def apply_live_rr12_plan_lock_v1(payload):
     p["live_rr12_plan_locked"] = True
     p["live_rr12_plan_lock_reason"] = "single_full_tp_1p2r_from_structural_sl"
     p["tp_plan_mode"] = "SINGLE_FULL_1P2R"
-    p["sl_plan_mode"] = "SMC_STRUCTURAL_VALIDATED"
+    p["sl_plan_mode"] = "STAT_TECH_STRUCTURAL_VALIDATED"
 
     p["_live_rr12_plan_lock_result"] = result("ALLOW", "rr12_plan_locked", p, {
         "entry": entry,

@@ -20,8 +20,31 @@ except Exception:
     WebSocketApp = None
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
+# === SMC_RUNTIME_REMOVED_STAT_TECH_PRIMARY_20260628 ===
+class _RemovedVpsSmc:
+    def __getattr__(self, name):
+        def _disabled(*args, **kwargs):
+            if name in ("scheduler_status", "vps_smc_scheduler_status"):
+                return {
+                    "ok": True,
+                    "enabled": False,
+                    "disabled": True,
+                    "reason": "smc_runtime_removed_stat_tech_primary",
+                    "replacement": "STAT_TECH_V1",
+                }
+            if "latest" in name or "signals" in name:
+                return []
+            return {
+                "ok": False,
+                "disabled": True,
+                "reason": "smc_runtime_removed_stat_tech_primary",
+                "replacement": "STAT_TECH_V1",
+                "function": name,
+            }
+        return _disabled
 
-import app.vps_smc as vps_smc
+vps_smc = _RemovedVpsSmc()
+
 import app.quant_engine as quant_engine
 from app.position_manager import PositionManagerDeps, create_router as create_position_manager_router
 
@@ -5471,6 +5494,144 @@ def _process_signal_pipeline(p: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "decision": "RECEIVED_ONLY", "reason": "v0.3 logger mode, no execution", "signal_id": p.get("signal_id") or p.get("signal_key")}
         current_execution_mode = execution_mode()
 
+        # === VPS_SMC_PROCESS_PIPELINE_CONFLUENCE_FIRST_20260628 ===
+        # Safety net: force VPS SMC / minimal SMC candidates through confluence
+        # before legacy refresh/recompute/ML guards can block them silently.
+        _src_txt = str(
+            p.get("source")
+            or p.get("signal_source")
+            or p.get("execution_owner")
+            or p.get("owner")
+            or p.get("engine")
+            or p.get("strategy")
+            or ""
+        ).upper()
+
+        _stageb_txt = str(
+            p.get("stageb_state_machine")
+            or p.get("stageb_status")
+            or p.get("shadow_state")
+            or p.get("status")
+            or ""
+        ).upper()
+
+        _reason_txt = str(
+            p.get("stageb_confirm_reason")
+            or p.get("confirm_reason")
+            or p.get("reason")
+            or ""
+        )
+
+        _is_vps_smc_candidate = bool(
+            "VPS_SMC" in _src_txt
+            or "SMC" in _src_txt
+            or p.get("smc_minimal_required_enabled")
+            or p.get("smc_minimal_required")
+            or p.get("stageb_confirmation")
+            or _stageb_txt == "CONFIRMED"
+            or _reason_txt == "minimal_sweep_reclaim_structural_sl_entry_sane"
+            or str(p.get("selected_poi_type") or "").upper() == "SMC_MINIMAL"
+        )
+
+        if (
+            _is_vps_smc_candidate
+            and env_bool("LIVE_ENTRY_CONFLUENCE_GATE_ENABLED", False)
+            and not isinstance(p.get("live_entry_confluence_gate_v1"), dict)
+        ):
+            try:
+                from app.live_entry_confluence_gate_v1 import evaluate_live_entry_confluence_gate_v1
+                _entry_conf = evaluate_live_entry_confluence_gate_v1(p)
+            except Exception as _entry_e:
+                _entry_conf = {
+                    "ok": False,
+                    "decision": "BLOCK",
+                    "allow": False,
+                    "gate": "live_entry_confluence_gate_v1",
+                    "reason": "live_entry_confluence_error",
+                    "error": str(_entry_e)[:240],
+                }
+
+            p["live_entry_confluence_gate_v1"] = _entry_conf
+
+            if str((_entry_conf or {}).get("decision") or "").upper() == "BLOCK":
+                decision = {
+                    "decision": "NO_TRADE",
+                    "reason": (_entry_conf or {}).get("reason") or "live_entry_confluence_block",
+                    "gate": "live_entry_confluence_gate_v1",
+                }
+                try:
+                    append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+                except Exception:
+                    pass
+
+                response = {
+                    "ok": True,
+                    "decision": "NO_TRADE",
+                    "reason": decision["reason"],
+                    "gate": "live_entry_confluence_gate_v1",
+                    "signal_id": p.get("signal_id") or p.get("signal_key"),
+                    "symbol": p.get("symbol"),
+                    "direction": p.get("direction") or p.get("dir") or p.get("side"),
+                    "execution_mode": current_execution_mode,
+                    "live_entry_confluence_gate_v1": _entry_conf,
+                }
+                try:
+                    fire_and_forget_ml_shadow_log(p, decision, response, state)
+                except Exception:
+                    pass
+                return response
+
+            if (
+                env_bool("LIVE_RR12_PLAN_LOCK_ENABLED", True)
+                and not isinstance(p.get("live_rr12_plan_lock_v1"), dict)
+            ):
+                try:
+                    from app.live_rr12_plan_lock_v1 import apply_live_rr12_plan_lock_v1
+                    _rr12_lock = apply_live_rr12_plan_lock_v1(p)
+                except Exception as _rr12_e:
+                    _rr12_lock = {
+                        "ok": False,
+                        "decision": "BLOCK",
+                        "allow": False,
+                        "gate": "live_rr12_plan_lock_v1",
+                        "reason": "rr12_plan_lock_error",
+                        "error": str(_rr12_e)[:240],
+                    }
+
+                p["live_rr12_plan_lock_v1"] = _rr12_lock
+
+                if str((_rr12_lock or {}).get("decision") or "").upper() == "BLOCK":
+                    decision = {
+                        "decision": "NO_TRADE",
+                        "reason": (_rr12_lock or {}).get("reason") or "live_rr12_plan_lock_block",
+                        "gate": "live_rr12_plan_lock_v1",
+                    }
+                    try:
+                        append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
+                    except Exception:
+                        pass
+
+                    response = {
+                        "ok": True,
+                        "decision": "NO_TRADE",
+                        "reason": decision["reason"],
+                        "gate": "live_rr12_plan_lock_v1",
+                        "signal_id": p.get("signal_id") or p.get("signal_key"),
+                        "symbol": p.get("symbol"),
+                        "direction": p.get("direction") or p.get("dir") or p.get("side"),
+                        "execution_mode": current_execution_mode,
+                        "live_entry_confluence_gate_v1": _entry_conf,
+                        "live_rr12_plan_lock_v1": _rr12_lock,
+                    }
+                    try:
+                        fire_and_forget_ml_shadow_log(p, decision, response, state)
+                    except Exception:
+                        pass
+                    return response
+
+                if isinstance((_rr12_lock or {}).get("payload"), dict):
+                    p.update(dict((_rr12_lock or {}).get("payload") or {}))
+
         if current_execution_mode == "DISABLED":
             decision = {"decision": "REJECT", "reason": "execution_mode_disabled", "gate": "execution_mode_gate"}
             append_jsonl(DECISIONS_LOG, build_decision_log(p, decision, state))
@@ -5689,11 +5850,7 @@ def _vps_execution_bridge(payload: Dict[str, Any]) -> Dict[str, Any]:
     ):
         normalize_tp_plan(p)
     return _process_signal_pipeline(p)
-
-
-vps_smc.register_execution_bridge_handler(_vps_execution_bridge)
-
-
+# SMC_RUNTIME_REMOVED_STAT_TECH_PRIMARY_20260628: SMC bridge registration removed. STAT_TECH_V1 owns live signal path.
 @app.get("/paper/state")
 def paper_state(
     x_signal_secret: Optional[str] = Header(default=None, alias="X-Signal-Secret"),
