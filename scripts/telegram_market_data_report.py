@@ -604,11 +604,23 @@ def build_message(hours):
     symbols = pair_allowlist()
     tf_summary, bad_warn = freshness_report(symbols)
     sched = scheduler_stats(hours)
+    statm = stat_tech_jsonl_metrics(2)
     scheduler_active = service_status()
     bot = bot_status()
 
+    # === REPORT_CONTAINER_CONTEXT_FALLBACK_20260703 ===
+    # When this script is executed inside Docker, systemctl/docker may not exist.
+    # If STAT_TECH logs are progressing, treat loop as alive by log evidence.
+    try:
+        if str(scheduler_active).startswith("ERR:") and int(statm.get("stat_tech_tick") or 0) > 0 and int(statm.get("stat_tech_summary") or 0) > 0:
+            scheduler_active = "active_by_log"
+        if str(bot).strip().lower() in ("not found", "err", "") and int(statm.get("stat_tech_tick") or 0) > 0:
+            bot = "running_by_log"
+    except Exception:
+        pass
+
     bridge = _stat_tech_bridge_pipeline_report_v1(hours)
-    status, reason = status_from(tf_summary, sched, scheduler_active)
+    status, reason = status_from(tf_summary, sched, "active" if scheduler_active == "active_by_log" else scheduler_active)
 
     # Bridge-aware status:
     # - no signal/candidate is OK if market data fresh + loop active
@@ -662,7 +674,6 @@ def build_message(hours):
 
     out.append("")
     out.append(f"Scheduler {int(hours)}h v2-aware:")
-    statm = stat_tech_jsonl_metrics(2)
     out.append(f"- MARKET_DATA_OK: {sched['market_ok']}")
     out.append(f"- FULL_OK: {sched['market_full_ok']} | PARTIAL_OK: {sched['market_partial_ok']}")
     out.append(f"- MARKET_DATA_BAD: {sched['market_bad']} | SKIP_TICK: {sched['skip_tick']}")
