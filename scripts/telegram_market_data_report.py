@@ -411,6 +411,195 @@ def short_line(line, n=190):
     line = re.sub(r"\s+", " ", line).strip()
     return line if len(line) <= n else line[:n-3] + "..."
 
+
+# === STAT_TECH_BRIDGE_PIPELINE_REPORT_V1_20260703 ===
+def _stat_tech_bridge_pipeline_report_v1(window_hours=2):
+    import os
+    import json
+    from pathlib import Path
+    from datetime import datetime, timezone, timedelta
+    from collections import Counter, deque
+
+    def parse_ts(x):
+        if not x:
+            return None
+        try:
+            txt = str(x).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def norm(x):
+        return str(x or "").strip().upper()
+
+    def clean(x):
+        txt = str(x or "-").strip()
+        return txt if txt else "-"
+
+    def top_fmt(counter, limit=5):
+        if not counter:
+            return "-"
+        return ", ".join([f"{k}:{v}" for k, v in counter.most_common(limit)])
+
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    fp = log_dir / "stat_tech_live_bridge_events_v1.jsonl"
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=float(window_hours or 2))
+
+    raw = deque(maxlen=30000)
+    if fp.exists():
+        try:
+            with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        raw.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    events = []
+    for r in raw:
+        if not isinstance(r, dict) or not r.get("symbol"):
+            continue
+        ts = parse_ts(r.get("created_at_utc"))
+        if ts and ts < since:
+            continue
+        events.append(r)
+
+    # Dedup latest per signal_key. Kalau signal_key kosong, fallback by symbol/dir/setup/entry/sl.
+    latest = {}
+    latest_ts = {}
+    for r in events:
+        key = str(
+            r.get("signal_key")
+            or "|".join([
+                str(r.get("symbol") or ""),
+                str(r.get("direction") or ""),
+                str(r.get("setup_type") or ""),
+                str(r.get("technical_score") or ""),
+            ])
+        )
+        ts = parse_ts(r.get("created_at_utc")) or datetime.min.replace(tzinfo=timezone.utc)
+        if key not in latest or ts >= latest_ts.get(key, datetime.min.replace(tzinfo=timezone.utc)):
+            latest[key] = r
+            latest_ts[key] = ts
+
+    uniq = list(latest.values())
+
+    total_rows = len(events)
+    unique_signals = len(uniq)
+
+    confluence_allow = sum(1 for r in uniq if norm(r.get("confluence_decision")) == "ALLOW")
+    confluence_block = sum(1 for r in uniq if norm(r.get("confluence_decision")) == "BLOCK")
+
+    rr12_allow = sum(1 for r in uniq if norm(r.get("rr12_decision")) == "ALLOW")
+    rr12_block = sum(1 for r in uniq if norm(r.get("rr12_decision")) == "BLOCK")
+    rr12_reached = sum(1 for r in uniq if r.get("rr12_decision") is not None or r.get("rr12_reason") is not None)
+
+    bridge_reached = sum(1 for r in uniq if r.get("bridge_decision") is not None or r.get("bridge_reason") is not None)
+    bridge_ok = sum(1 for r in uniq if r.get("bridge_ok") is True)
+    bridge_fail = sum(1 for r in uniq if r.get("bridge_ok") is False)
+
+    final_counter = Counter(clean(r.get("final_decision")) for r in uniq)
+    final_reason_counter = Counter(clean(r.get("final_reason")) for r in uniq)
+    conf_reason_counter = Counter(clean(r.get("confluence_reason")) for r in uniq)
+    bridge_reason_counter = Counter(clean(r.get("bridge_reason")) for r in uniq if r.get("bridge_reason"))
+
+    by_symbol = Counter(clean(r.get("symbol")) for r in uniq)
+    by_setup = Counter(clean(r.get("setup_type")) for r in uniq)
+
+    live_issue_keys = (
+        "LIVE_ENTRY_FAILED",
+        "live_preflight_failed",
+        "preflight",
+        "binance",
+        "qty_",
+        "min_notional",
+        "position",
+        "order",
+    )
+    live_issue_n = 0
+    for r in uniq:
+        txt = "|".join([
+            str(r.get("bridge_reason") or ""),
+            str(r.get("final_reason") or ""),
+            str(r.get("bridge_decision") or ""),
+            str(r.get("final_decision") or ""),
+        ]).lower()
+        if any(k.lower() in txt for k in live_issue_keys):
+            live_issue_n += 1
+
+    status_hint = "OK"
+    reason_hint = "bridge healthy or no actionable signal"
+
+    if unique_signals <= 0:
+        status_hint = "OK"
+        reason_hint = "bridge idle; no STAT_TECH candidates in window"
+    elif live_issue_n > 0 or bridge_fail > 0:
+        status_hint = "WARN"
+        reason_hint = f"bridge/execution issue detected: {top_fmt(bridge_reason_counter or final_reason_counter, 2)}"
+    elif confluence_allow > 0 and rr12_allow > 0 and bridge_reached <= 0:
+        status_hint = "WARN"
+        reason_hint = "confluence/RR12 passed but bridge not reached"
+    elif confluence_block == unique_signals:
+        status_hint = "OK"
+        reason_hint = "all candidates blocked by confluence; no execution issue"
+    elif bridge_reached > 0:
+        status_hint = "OK"
+        reason_hint = "bridge reached; no execution failure detected"
+
+    lines = []
+    lines.append(f"Bridge pipeline {window_hours}h:")
+    lines.append(f"- bridge event rows: {total_rows} | unique signals: {unique_signals}")
+    lines.append(f"- candidates by setup: {top_fmt(by_setup, 4)}")
+    lines.append(f"- candidates by pair: {top_fmt(by_symbol, 8)}")
+    lines.append(f"- confluence ALLOW/BLOCK: {confluence_allow}/{confluence_block}")
+    lines.append(f"- RR12 reached/ALLOW/BLOCK: {rr12_reached}/{rr12_allow}/{rr12_block}")
+    lines.append(f"- bridge reached/ok/fail: {bridge_reached}/{bridge_ok}/{bridge_fail}")
+    lines.append(f"- final decisions: {top_fmt(final_counter, 5)}")
+    lines.append(f"- top blockers: {top_fmt(final_reason_counter, 5)}")
+    lines.append(f"- confluence reasons: {top_fmt(conf_reason_counter, 4)}")
+    if bridge_reason_counter:
+        lines.append(f"- bridge reasons: {top_fmt(bridge_reason_counter, 4)}")
+
+    latest_list = sorted(
+        uniq,
+        key=lambda r: parse_ts(r.get("created_at_utc")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )[:6]
+
+    if latest_list:
+        lines.append("- latest:")
+        for r in latest_list:
+            sym = clean(r.get("symbol"))
+            d = clean(r.get("direction"))
+            setup = clean(r.get("setup_type"))
+            cscore = r.get("confluence_score")
+            cdec = clean(r.get("confluence_decision"))
+            rr = clean(r.get("rr12_decision"))
+            br = clean(r.get("bridge_decision"))
+            fr = clean(r.get("final_reason"))
+            lines.append(f"  {sym} {d} {setup} | conf={cdec} {cscore} | rr12={rr} | bridge={br} | {fr}")
+
+    return {
+        "status_hint": status_hint,
+        "reason_hint": reason_hint,
+        "unique_signals": unique_signals,
+        "bridge_reached": bridge_reached,
+        "bridge_fail": bridge_fail,
+        "live_issue_n": live_issue_n,
+        "lines": lines,
+    }
+
+
 def build_message(hours):
     symbols = pair_allowlist()
     tf_summary, bad_warn = freshness_report(symbols)
@@ -418,7 +607,36 @@ def build_message(hours):
     scheduler_active = service_status()
     bot = bot_status()
 
+    bridge = _stat_tech_bridge_pipeline_report_v1(hours)
     status, reason = status_from(tf_summary, sched, scheduler_active)
+
+    # Bridge-aware status:
+    # - no signal/candidate is OK if market data fresh + loop active
+    # - bridge/live execution failure must WARN
+    try:
+        bh = str((bridge or {}).get("status_hint") or "").upper()
+        br = str((bridge or {}).get("reason_hint") or "")
+
+        if status != "BAD" and bh == "WARN":
+            status = "WARN"
+            reason = br
+        elif status == "WARN":
+            low_reason = str(reason or "").lower()
+            only_waiting_signal = (
+                "fresh" in low_reason
+                and "stat-tech loop active" in low_reason
+                and (
+                    "waiting for next signal summary" in low_reason
+                    or "signals seen: 0" in low_reason
+                    or "no signal" in low_reason
+                )
+            )
+            if only_waiting_signal and bh in ("OK", "IDLE", ""):
+                status = "OK"
+                reason = br or "fresh; stat-tech loop active; no actionable signal in bridge window"
+    except Exception:
+        pass
+
     emoji = "✅" if status == "OK" else ("⚠️" if status == "WARN" else "🚨")
 
     out = []
@@ -455,7 +673,11 @@ def build_message(hours):
     out.append(f"- old TimeoutExpired: {sched['timeout']}")
     out.append(f"- full-repair: {sched['full_repair']}")
     out.append(f"- restart bot: {sched['restart_bot']}")
-    out.append(f"- signals seen: {sched['signals_seen']}")
+    out.append(f"- signals seen (scheduler legacy): {sched['signals_seen']}")
+    try:
+        out.append(f"- bridge unique signals: {(bridge or {}).get('unique_signals', 0)}")
+    except Exception:
+        out.append("- bridge unique signals: -")
 
     if bad_warn:
         out.append("")
@@ -481,6 +703,15 @@ def build_message(hours):
         out.append("Scheduler mode:")
         for line in sched["mode_lines"][-2:]:
             out.append("- " + short_line(line))
+
+    try:
+        bridge_lines = list((bridge or {}).get("lines") or [])
+        if bridge_lines:
+            out.append("")
+            out.extend(bridge_lines)
+    except Exception as e:
+        out.append("")
+        out.append(f"Bridge pipeline {int(hours)}h: ERROR {str(e)[:120]}")
 
     out.append("")
     if status == "OK":
