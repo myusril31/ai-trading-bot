@@ -1,11 +1,11 @@
 {
   "ok": true,
   "version": "ml_dataset_v4_outcome_join_v1",
-  "created_at_utc": "2026-06-28T08:29:28.207562+00:00",
+  "created_at_utc": "2026-06-28T17:30:06.926459+00:00",
   "out_jsonl": "logs/ml_dataset_v4_outcome_join_v1.jsonl",
-  "rows": 151,
-  "wins": 67,
-  "losses": 84,
+  "rows": 107,
+  "wins": 51,
+  "losses": 56,
   "symbols": [
     "ADAUSDT",
     "AVAXUSDT",
@@ -23,10 +23,9 @@
   ],
   "symbol_count": 13,
   "feature_source_counts": {
-    "v4_current14": 107,
-    "v3_feature_join": 44
+    "v4_current14": 107
   },
-  "unmatched_outcome_labels": 32,
+  "unmatched_outcome_labels": 76,
   "unmatched_sample": [
     {
       "signal_key": "HYPEUSDT|LONG|1780621200000",

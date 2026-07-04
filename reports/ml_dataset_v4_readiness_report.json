@@ -2,8 +2,8 @@
   "ok": false,
   "state": "V4_CANDIDATE_BLOCKED",
   "report_version": "ml_dataset_v4_readiness_report_20260620",
-  "dataset_path": "/app/logs/ml_dataset_v4_current14_candidate_join.jsonl",
-  "rows": 558,
+  "dataset_path": "/home/ubuntu/ai-trading-vps-bot/logs/ml_dataset_v4_current14_candidate_join.jsonl",
+  "rows": 564,
   "trainable_label_rows": 253,
   "wins": 167,
   "losses": 86,
@@ -41,12 +41,12 @@
     "ZECUSDT"
   ],
   "feature_source_counts": {
-    "SIGNAL_ROW_FALLBACK": 558
+    "SIGNAL_ROW_FALLBACK": 564
   },
   "target_counts": {
-    "TP1": 122,
     "SL": 86,
     "TP2": 4,
+    "TP1": 122,
     "TP3": 41
   },
   "feature_count": {
@@ -61,25 +61,25 @@
       "25": 8,
       "10": 39,
       "9": 5,
-      "4": 136,
+      "4": 142,
       "3": 2
     },
     "distribution_trainable": {
-      "27": 25,
-      "11": 113,
+      "27": 22,
       "10": 22,
+      "11": 111,
       "9": 1,
       "25": 2,
-      "4": 88,
+      "4": 93,
       "3": 2
     }
   },
   "by_symbol": {
     "ADAUSDT": {
       "rows": 42,
-      "trainable": 11,
+      "trainable": 10,
       "wins": 6,
-      "losses": 5
+      "losses": 4
     },
     "AVAXUSDT": {
       "rows": 30,
@@ -94,15 +94,15 @@
       "losses": 6
     },
     "BTCUSDT": {
-      "rows": 46,
-      "trainable": 14,
-      "wins": 11,
-      "losses": 3
+      "rows": 47,
+      "trainable": 16,
+      "wins": 12,
+      "losses": 4
     },
     "ETHUSDT": {
-      "rows": 42,
-      "trainable": 25,
-      "wins": 19,
+      "rows": 43,
+      "trainable": 26,
+      "wins": 20,
       "losses": 6
     },
     "HYPEUSDT": {
@@ -113,14 +113,14 @@
     },
     "LINKUSDT": {
       "rows": 44,
-      "trainable": 19,
-      "wins": 16,
+      "trainable": 18,
+      "wins": 15,
       "losses": 3
     },
     "LTCUSDT": {
-      "rows": 56,
-      "trainable": 25,
-      "wins": 18,
+      "rows": 57,
+      "trainable": 24,
+      "wins": 17,
       "losses": 7
     },
     "PAXGUSDT": {
@@ -130,10 +130,10 @@
       "losses": 8
     },
     "SOLUSDT": {
-      "rows": 41,
-      "trainable": 27,
+      "rows": 42,
+      "trainable": 26,
       "wins": 17,
-      "losses": 10
+      "losses": 9
     },
     "SUIUSDT": {
       "rows": 43,
@@ -148,10 +148,10 @@
       "losses": 14
     },
     "XRPUSDT": {
-      "rows": 23,
-      "trainable": 2,
+      "rows": 25,
+      "trainable": 3,
       "wins": 1,
-      "losses": 1
+      "losses": 2
     },
     "ZECUSDT": {
       "rows": 9,
@@ -165,7 +165,7 @@
     "join_future_feature_count": 0,
     "feature_future_candle_count": 1,
     "join_stale_feature_count": 0,
-    "recursive_plan_drift_count": 36
+    "recursive_plan_drift_count": 0
   },
   "checks": [
     {
@@ -173,7 +173,7 @@
       "name": "dataset_exists",
       "ok": true,
       "detail": {
-        "path": "/app/logs/ml_dataset_v4_current14_candidate_join.jsonl"
+        "path": "/home/ubuntu/ai-trading-vps-bot/logs/ml_dataset_v4_current14_candidate_join.jsonl"
       }
     },
     {
@@ -181,7 +181,7 @@
       "name": "rows_min_300",
       "ok": true,
       "detail": {
-        "rows": 558,
+        "rows": 564,
         "required": 300
       }
     },
@@ -294,9 +294,9 @@
     {
       "type": "warn",
       "name": "recursive_plan_drift_low",
-      "ok": false,
+      "ok": true,
       "detail": {
-        "recursive_plan_drift_count": 36
+        "recursive_plan_drift_count": 0
       }
     },
     {
@@ -310,9 +310,9 @@
     {
       "type": "warn",
       "name": "min_symbol_trainable_ge_3",
-      "ok": false,
+      "ok": true,
       "detail": {
-        "min_trainable_by_symbol": 2
+        "min_trainable_by_symbol": 3
       }
     },
     {
@@ -321,7 +321,7 @@
       "ok": true,
       "detail": {
         "feature_source_counts": {
-          "SIGNAL_ROW_FALLBACK": 558
+          "SIGNAL_ROW_FALLBACK": 564
         }
       }
     },

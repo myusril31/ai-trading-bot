@@ -1,6 +1,6 @@
 {
   "dataset_version": "v4_current14",
-  "created_at_utc": "2026-06-28T08:29:23.135380+00:00",
+  "created_at_utc": "2026-06-28T17:30:04.616120+00:00",
   "output": "logs/ml_dataset_v4_current14_execution_maturity_join.jsonl",
   "current14": [
     "ADAUSDT",
@@ -18,7 +18,7 @@
     "XRPUSDT",
     "ZECUSDT"
   ],
-  "rows": 933,
+  "rows": 683,
   "trainable_label_rows": 0,
   "wins": 0,
   "losses": 0,
@@ -26,21 +26,19 @@
   "position_confirmed_rows": 214,
   "protection_ok_rows": 203,
   "decision_counts": {
-    "REJECT": 416,
-    "NONE": 305,
+    "REJECT": 386,
     "ACCEPT": 210,
-    "REFRESH_RECOMPUTE_DONE": 2
+    "NONE": 87
   },
   "reason_counts": {
-    "NONE": 305,
     "LIVE_ORDER_PLACED": 192,
     "LIVE_ENTRY_FAILED": 160,
     "REJECT": 145,
-    "live_preflight_failed": 49,
+    "NONE": 87,
     "LIVE_LIMIT_IOC_NOT_FILLED_OR_POSITION_NOT_CONFIRMED": 40,
     "LIVE_ENTRY_PLACED_PROTECTION_PARTIAL_OR_FAILED": 26,
+    "live_preflight_failed": 19,
     "all_paper_gates_pass": 13,
-    "LIVE_RR_TOO_LOW_REFRESH_RECOMPUTE": 2,
     "duplicate_signal_key": 1
   },
   "missing_required_counts": {
