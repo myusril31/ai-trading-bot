@@ -102,6 +102,7 @@ run_in_bot scripts/stat_tech_ou_meanrev_store_v1.py
 run_in_bot scripts/ml_dataset_v4_linear_quant_join_v1.py
 run_in_bot scripts/ml_dataset_v4_stoch_barrier_join_v1.py
 run_in_bot scripts/ml_dataset_v4_ou_meanrev_join_v1.py
+run_in_bot scripts/ml_outcome_label_forwarder_v1.py
 
 log "PHASE 3: quant store loops"
 svc vps-stat-tech-linear-quant-loop.service
@@ -112,6 +113,7 @@ log "PHASE 4: dataset join loops"
 svc vps-ml-linear-dataset-join-loop.service
 svc vps-ml-stoch-barrier-dataset-join-loop.service
 svc vps-ml-ou-meanrev-dataset-join-loop.service
+svc vps-ml-outcome-label-forwarder-loop.service
 
 log "PHASE 5: live signal loop"
 svc vps-stat-tech-live-loop.service

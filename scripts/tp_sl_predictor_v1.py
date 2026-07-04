@@ -114,7 +114,8 @@ def beta_p(wins, total, alpha=2.0, beta=2.0):
 def load_empirical_priors():
     log_dir = Path(os.getenv("LOG_DIR", "logs"))
     paths = [
-        os.getenv("TP_SL_PREDICTOR_DATASET_PATH", str(log_dir / "ml_dataset_v4_ou_meanrev_join_v1.jsonl")),
+        os.getenv("TP_SL_PREDICTOR_DATASET_PATH", str(log_dir / "ml_dataset_v4_outcome_forwarded_v1.jsonl")),
+        str(log_dir / "ml_dataset_v4_ou_meanrev_join_v1.jsonl"),
         str(log_dir / "ml_dataset_v4_stoch_barrier_join_v1.jsonl"),
         str(log_dir / "ml_dataset_v4_linear_quant_join_v1.jsonl"),
         str(log_dir / "ml_dataset_v4_outcome_join_v1.jsonl"),

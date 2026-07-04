@@ -1,0 +1,34 @@
+{
+  "ok": true,
+  "marker": "ML_OUTCOME_LABEL_FORWARDER_V1_20260705",
+  "created_at_utc": "2026-07-04T19:58:29.305715Z",
+  "base_counts": {
+    "logs/ml_dataset_v4_ou_meanrev_join_v1.jsonl": 12550,
+    "logs/ml_dataset_v4_stoch_barrier_join_v1.jsonl": 12557,
+    "logs/ml_dataset_v4_linear_quant_join_v1.jsonl": 12548,
+    "logs/stat_tech_live_bridge_events_v1.jsonl": 25469,
+    "logs/ml_dataset_v4_current14_candidate_join.jsonl": 564,
+    "logs/ml_dataset_v4_candidate_join.jsonl": 624
+  },
+  "label_counts": {
+    "logs/ml_dataset_v4_outcome_join_v1.jsonl": 107,
+    "logs/ml_dataset_v4_outcome_forwarded_v1.jsonl": 12550,
+    "logs/tp_lifecycle_events.jsonl": 22285,
+    "logs/execution_events.jsonl": 3852,
+    "logs/decisions.jsonl": 2924
+  },
+  "output_path": "logs/ml_dataset_v4_outcome_forwarded_v1.jsonl",
+  "base_rows": 64312,
+  "label_source_rows": 41718,
+  "exact_label_keys": 382,
+  "broad_label_keys": 71,
+  "deduped_rows": 12557,
+  "labeled_rows": 371,
+  "forwarded_labeled_rows": 85,
+  "trainable_linear_label_rows": 1,
+  "trainable_barrier_label_rows": 1,
+  "trainable_ou_label_rows": 1,
+  "trainable_tp_sl_predictor_label_rows": 0,
+  "trainable_all_math_label_rows": 1,
+  "allow_broad_match": "false"
+}
