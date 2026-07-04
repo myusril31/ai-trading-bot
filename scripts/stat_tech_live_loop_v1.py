@@ -21,6 +21,167 @@ STATE_PATH = ROOT / "state" / "stat_tech_live_loop_state_v1.json"
 
 
 # === STAT_TECH_HISTORY_QUANT_PRIOR_V1_20260629 ===
+
+
+# === STAT_TECH_LINEAR_QUANT_INJECT_V1_20260703 ===
+_LINEAR_QUANT_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
+
+def _lq_to_float(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def _lq_norm_symbol(v):
+    return str(v or "").strip().upper().replace("BINANCE:", "").replace(".P", "").replace("/", "")
+
+def _lq_norm_dir(v):
+    d = str(v or "").strip().upper()
+    if d in ("BUY", "BULL", "LONG"):
+        return "LONG"
+    if d in ("SELL", "BEAR", "SHORT"):
+        return "SHORT"
+    return d
+
+def _lq_parse_ts(v):
+    try:
+        from datetime import datetime, timezone
+        txt = str(v or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _load_linear_quant_latest_v1():
+    import os
+    import json
+    import time
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    ttl = float(os.getenv("STAT_TECH_LINEAR_QUANT_CACHE_TTL_SEC", "60") or 60)
+    now = time.time()
+    if _LINEAR_QUANT_CACHE_V1.get("by_symbol") and now - float(_LINEAR_QUANT_CACHE_V1.get("loaded_at") or 0) <= ttl:
+        return _LINEAR_QUANT_CACHE_V1["by_symbol"]
+
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    fp = Path(os.getenv("STAT_TECH_LINEAR_QUANT_STORE_PATH", str(log_dir / "stat_tech_linear_quant_store_v1.jsonl")))
+
+    max_age_min = float(os.getenv("STAT_TECH_LINEAR_QUANT_MAX_AGE_MIN", "20") or 20)
+    max_age_sec = max_age_min * 60.0
+
+    by_symbol = {}
+    if fp.exists():
+        rows = []
+        try:
+            with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+            # read latest first
+            utc_now = datetime.now(timezone.utc)
+            for r in reversed(rows[-3000:]):
+                sym = _lq_norm_symbol(r.get("symbol"))
+                if not sym or sym in by_symbol:
+                    continue
+                ts = _lq_parse_ts(r.get("created_at_utc"))
+                if ts is not None:
+                    age = (utc_now - ts).total_seconds()
+                    if age > max_age_sec:
+                        continue
+                    r["_linear_quant_age_sec"] = age
+                by_symbol[sym] = r
+        except Exception:
+            pass
+
+    _LINEAR_QUANT_CACHE_V1["loaded_at"] = now
+    _LINEAR_QUANT_CACHE_V1["by_symbol"] = by_symbol
+    return by_symbol
+
+def _inject_stat_tech_linear_quant_v1(payload):
+    import os
+
+    if str(os.getenv("STAT_TECH_LINEAR_QUANT_ENABLED", "true")).strip().lower() not in ("1", "true", "yes", "on"):
+        return payload
+
+    try:
+        source_txt = str(payload.get("signal_source") or payload.get("source") or payload.get("engine") or "").upper()
+        if "STAT_TECH" not in source_txt:
+            return payload
+
+        sym = _lq_norm_symbol(payload.get("symbol") or payload.get("pair"))
+        direction = _lq_norm_dir(payload.get("direction") or payload.get("dir") or payload.get("side"))
+        if not sym or direction not in ("LONG", "SHORT"):
+            return payload
+
+        store = _load_linear_quant_latest_v1()
+        row = store.get(sym)
+        if not row:
+            payload["linear_quant"] = {"ok": False, "reason": "missing_linear_quant_store", "symbol": sym}
+            return payload
+
+        score_key = "la_score_long" if direction == "LONG" else "la_score_short"
+        la_score = _lq_to_float(row.get(score_key))
+        if la_score is None:
+            payload["linear_quant"] = {"ok": False, "reason": "missing_directional_score", "symbol": sym, "direction": direction}
+            return payload
+
+        features = row.get("linear_algebra_features") or {}
+        parts = row.get("la_parts_long" if direction == "LONG" else "la_parts_short") or {}
+
+        payload["linear_quant_score"] = round(float(la_score), 1)
+        payload["linear_quant_source"] = "STAT_TECH_LINEAR_ALGEBRA_V1"
+        payload["linear_quant_age_sec"] = row.get("_linear_quant_age_sec")
+        payload["linear_quant_features"] = features
+        payload["linear_quant_parts"] = parts
+        payload["linear_quant"] = {
+            "ok": True,
+            "source": "STAT_TECH_LINEAR_ALGEBRA_V1",
+            "symbol": sym,
+            "direction": direction,
+            "score": round(float(la_score), 1),
+            "age_sec": row.get("_linear_quant_age_sec"),
+            "features": features,
+            "parts": parts,
+        }
+
+        min_emit = float(os.getenv("STAT_TECH_LINEAR_QUANT_MIN_EMIT", "60") or 60)
+        if float(la_score) >= min_emit:
+            hist_q = _lq_to_float(payload.get("quant_score"))
+            blend_w = float(os.getenv("STAT_TECH_LINEAR_QUANT_BLEND_WEIGHT", "0.35") or 0.35)
+
+            if hist_q is None:
+                combined = float(la_score)
+                source = "STAT_TECH_LINEAR_ALGEBRA_V1"
+            else:
+                # Keep historical prior as base, but let linear algebra lift valid setup.
+                combined = max(hist_q, hist_q * (1.0 - blend_w) + float(la_score) * blend_w)
+                source = "STAT_TECH_HISTORY_PLUS_LINEAR_ALGEBRA_V1"
+
+            combined = round(max(0.0, min(100.0, combined)), 1)
+            payload["quant_score"] = combined
+            payload["core_quant_score"] = combined
+            payload["quant_source"] = source
+            payload["linear_quant_emit"] = True
+            payload["linear_quant_combined_score"] = combined
+        else:
+            payload["linear_quant_emit"] = False
+
+        return payload
+    except Exception as e:
+        payload["linear_quant"] = {"ok": False, "reason": f"exception:{type(e).__name__}:{e}"}
+        return payload
+
+
 def _stq_to_float(v, default=None):
     try:
         if v is None or v == "":
@@ -396,7 +557,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = _inject_stat_tech_quant_prior(dict(r))
+        payload = _inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r)))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"
@@ -417,6 +578,11 @@ def run_once():
             "setup_type": payload.get("setup_type"),
             "signal_key": key,
             "technical_score": payload.get("technical_score"),
+            "quant_score": payload.get("quant_score"),
+            "stat_quant_score_raw": payload.get("stat_quant_score_raw"),
+            "linear_quant_score": payload.get("linear_quant_score"),
+            "linear_quant_emit": payload.get("linear_quant_emit"),
+            "linear_quant_source": payload.get("linear_quant_source"),
             "confluence_decision": conf.get("decision"),
             "confluence_reason": conf.get("reason"),
             "confluence_score": conf.get("confluence_score"),
