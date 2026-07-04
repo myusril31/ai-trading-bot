@@ -239,15 +239,41 @@ def compute_barrier_from_plan(row, store_row):
 def flatten_barrier(row, store_row):
     out = dict(row)
 
-    # If live loop already put stoch_barrier in event row, use it first.
+    # If live loop already put full stoch_barrier object in event row, use it first.
     existing = out.get("stoch_barrier") if isinstance(out.get("stoch_barrier"), dict) else None
+    existing_score = to_float(out.get("barrier_score"))
+    existing_prob = to_float(out.get("barrier_prob_target"))
+    if existing_prob is None:
+        existing_prob = to_float(out.get("barrier_prob_tp1"))
+
     if existing and existing.get("ok"):
         b = existing
-        prob_target = b.get("barrier_prob_tp1")
+        prob_target = b.get("barrier_prob_tp1") or b.get("barrier_prob_target")
         score = b.get("barrier_score")
-        rr = b.get("rr1_log")
-        sigma = b.get("sigma_eff_logret_bar")
-        mu = b.get("mu_favorable_bar")
+        rr = b.get("rr1_log") or b.get("barrier_rr1_log")
+        sigma = b.get("sigma_eff_logret_bar") or b.get("barrier_sigma_eff")
+        mu = b.get("mu_favorable_bar") or b.get("barrier_mu_favorable")
+
+    # Preserve live-computed flat fields.
+    # This is valid because live loop already computed barrier_score from entry/sl/target at signal time.
+    # Single target RR12: barrier_prob_target = barrier_score / 100 when explicit prob is missing.
+    elif existing_score is not None:
+        score = existing_score
+        prob_target = existing_prob if existing_prob is not None else round(max(0.0, min(1.0, existing_score / 100.0)), 6)
+        rr = to_float(out.get("barrier_rr1_log"))
+        sigma = to_float(out.get("barrier_sigma_eff"))
+        mu = to_float(out.get("barrier_mu_favorable"))
+        b = {
+            "ok": True,
+            "source": "STAT_TECH_STOCH_BARRIER_V1_EXISTING_FIELDS",
+            "barrier_score": score,
+            "barrier_prob_target": prob_target,
+            "barrier_prob_tp1": prob_target,
+            "barrier_rr1_log": rr,
+            "barrier_sigma_eff": sigma,
+            "barrier_mu_favorable": mu,
+        }
+
     else:
         b = compute_barrier_from_plan(out, store_row)
         prob_target = b.get("barrier_prob_target")
@@ -276,9 +302,9 @@ def flatten_barrier(row, store_row):
     out["barrier_target_model"] = "SINGLE_TARGET_RR12"
     out["target_rr"] = to_float(out.get("target_rr"), 1.2)
 
-    out["barrier_entry"] = b.get("entry")
-    out["barrier_sl"] = b.get("sl")
-    out["barrier_target"] = b.get("target") or b.get("tp1")
+    out["barrier_entry"] = b.get("entry") or out.get("barrier_entry")
+    out["barrier_sl"] = b.get("sl") or out.get("barrier_sl")
+    out["barrier_target"] = b.get("target") or b.get("tp1") or out.get("barrier_target")
     out["barrier_sl_distance_log"] = b.get("sl_distance_log")
     out["barrier_target_distance_log"] = b.get("target_distance_log") or ((b.get("tp_distance_log") or {}).get("tp1") if isinstance(b.get("tp_distance_log"), dict) else None)
 
