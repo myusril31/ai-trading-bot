@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "marker": "ML_DATASET_V4_LINEAR_QUANT_JOIN_V1_20260704",
+  "created_at_utc": "2026-07-04T11:02:59.016915Z",
+  "base_source_counts": {
+    "logs/ml_dataset_v4_current14_candidate_join.jsonl": 564,
+    "logs/ml_dataset_v4_candidate_join.jsonl": 624,
+    "logs/ml_dataset_v4_outcome_join_v1.jsonl": 107,
+    "logs/stat_tech_live_bridge_events_v1.jsonl": 24640
+  },
+  "linear_store_path": "logs/stat_tech_linear_quant_store_v1.jsonl",
+  "output_path": "logs/ml_dataset_v4_linear_quant_join_v1.jsonl",
+  "raw_rows": 25935,
+  "deduped_rows": 12051,
+  "linear_rows_total": 70,
+  "joined_rows": 11,
+  "already_had_linear_rows": 10,
+  "linear_feature_rows": 568,
+  "label_rows_raw": 646,
+  "trainable_linear_label_rows": 303,
+  "missing_rows": 7631,
+  "future_blocked_rows": 17058,
+  "stale_rows": 0,
+  "latest_no_signal_ts_rows": 1235,
+  "reason_counts": {
+    "latest_no_signal_ts": 1235,
+    "missing_linear_symbol": 60,
+    "future_blocked": 17058,
+    "missing_symbol": 7571,
+    "joined": 11
+  },
+  "no_future_leak_ok": false,
+  "max_age_sec": 1800.0,
+  "future_tolerance_sec": 90.0
+}
