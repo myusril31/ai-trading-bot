@@ -1,0 +1,93 @@
+{
+  "ok": true,
+  "marker": "STAT_TECH_STOCH_BARRIER_STORE_V1_20260704",
+  "created_at_utc": "2026-07-04T11:36:51.056581Z",
+  "symbols_requested": 14,
+  "rows_written": 14,
+  "failures": {},
+  "output": "logs/stat_tech_stoch_barrier_store_v1.jsonl",
+  "highest_vol": [
+    {
+      "symbol": "ZECUSDT",
+      "sigma": 0.0020579032,
+      "atr_pct_4h": 0.00295103
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "sigma": 0.0018087359,
+      "atr_pct_4h": 0.00249042
+    },
+    {
+      "symbol": "ADAUSDT",
+      "sigma": 0.0017845578,
+      "atr_pct_4h": 0.00265256
+    },
+    {
+      "symbol": "SOLUSDT",
+      "sigma": 0.0017184503,
+      "atr_pct_4h": 0.00200181
+    },
+    {
+      "symbol": "UNIUSDT",
+      "sigma": 0.0016197462,
+      "atr_pct_4h": 0.00235041
+    },
+    {
+      "symbol": "XRPUSDT",
+      "sigma": 0.001571756,
+      "atr_pct_4h": 0.00229047
+    },
+    {
+      "symbol": "SUIUSDT",
+      "sigma": 0.0015130639,
+      "atr_pct_4h": 0.00197645
+    },
+    {
+      "symbol": "LTCUSDT",
+      "sigma": 0.0014157916,
+      "atr_pct_4h": 0.00194315
+    }
+  ],
+  "lowest_vol": [
+    {
+      "symbol": "PAXGUSDT",
+      "sigma": 0.00015,
+      "atr_pct_4h": 0.00010314
+    },
+    {
+      "symbol": "BTCUSDT",
+      "sigma": 0.0005820631,
+      "atr_pct_4h": 0.00073466
+    },
+    {
+      "symbol": "ETHUSDT",
+      "sigma": 0.000864975,
+      "atr_pct_4h": 0.00118793
+    },
+    {
+      "symbol": "LINKUSDT",
+      "sigma": 0.0010873001,
+      "atr_pct_4h": 0.00140386
+    },
+    {
+      "symbol": "AVAXUSDT",
+      "sigma": 0.0011916462,
+      "atr_pct_4h": 0.0016044
+    },
+    {
+      "symbol": "BCHUSDT",
+      "sigma": 0.0013192297,
+      "atr_pct_4h": 0.0017971
+    },
+    {
+      "symbol": "LTCUSDT",
+      "sigma": 0.0014157916,
+      "atr_pct_4h": 0.00194315
+    },
+    {
+      "symbol": "SUIUSDT",
+      "sigma": 0.0015130639,
+      "atr_pct_4h": 0.00197645
+    }
+  ]
+}

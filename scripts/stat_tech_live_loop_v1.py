@@ -26,6 +26,279 @@ STATE_PATH = ROOT / "state" / "stat_tech_live_loop_state_v1.json"
 # === STAT_TECH_LINEAR_QUANT_INJECT_V1_20260703 ===
 _LINEAR_QUANT_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 
+
+
+# === STAT_TECH_STOCH_BARRIER_INJECT_V1_20260704 ===
+_STOCH_BARRIER_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
+
+def _sb_to_float(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        x = float(v)
+        return x if x == x else default
+    except Exception:
+        return default
+
+def _sb_norm_symbol(v):
+    return str(v or "").strip().upper().replace("BINANCE:", "").replace(".P", "").replace("/", "")
+
+def _sb_norm_dir(v):
+    d = str(v or "").strip().upper()
+    if d in ("BUY", "BULL", "LONG"):
+        return "LONG"
+    if d in ("SELL", "BEAR", "SHORT"):
+        return "SHORT"
+    return d
+
+def _sb_parse_ts(v):
+    try:
+        from datetime import datetime, timezone
+        txt = str(v or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _load_stoch_barrier_latest_v1():
+    import os
+    import json
+    import time
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    ttl = float(os.getenv("STAT_TECH_STOCH_BARRIER_CACHE_TTL_SEC", "60") or 60)
+    now = time.time()
+    if _STOCH_BARRIER_CACHE_V1.get("by_symbol") and now - float(_STOCH_BARRIER_CACHE_V1.get("loaded_at") or 0) <= ttl:
+        return _STOCH_BARRIER_CACHE_V1["by_symbol"]
+
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    fp = Path(os.getenv("STAT_TECH_STOCH_BARRIER_STORE_PATH", str(log_dir / "stat_tech_stoch_barrier_store_v1.jsonl")))
+    max_age_min = float(os.getenv("STAT_TECH_STOCH_BARRIER_MAX_AGE_MIN", "20") or 20)
+    max_age_sec = max_age_min * 60.0
+
+    by_symbol = {}
+    if fp.exists():
+        rows = []
+        try:
+            with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+
+            utc_now = datetime.now(timezone.utc)
+            for r in reversed(rows[-3000:]):
+                sym = _sb_norm_symbol(r.get("symbol"))
+                if not sym or sym in by_symbol:
+                    continue
+                ts = _sb_parse_ts(r.get("created_at_utc"))
+                if ts is not None:
+                    age = (utc_now - ts).total_seconds()
+                    if age > max_age_sec:
+                        continue
+                    r["_stoch_barrier_age_sec"] = age
+                by_symbol[sym] = r
+        except Exception:
+            pass
+
+    _STOCH_BARRIER_CACHE_V1["loaded_at"] = now
+    _STOCH_BARRIER_CACHE_V1["by_symbol"] = by_symbol
+    return by_symbol
+
+def _sb_exp_safe(x):
+    import math
+    x = max(-60.0, min(60.0, float(x)))
+    return math.exp(x)
+
+def _sb_hit_prob_upper_before_lower(mu, sigma, upper_a, lower_b):
+    # X_t = mu*t + sigma*dW. Start 0. Upper boundary +a, lower boundary -b.
+    # Probability hit +a before -b.
+    import math
+
+    a = float(upper_a)
+    b = float(lower_b)
+    sig = max(float(sigma), 1e-9)
+    m = float(mu)
+
+    if a <= 0 or b <= 0:
+        return None
+
+    if abs(m) < 1e-12:
+        return b / (a + b)
+
+    den = 1.0 - _sb_exp_safe(-2.0 * m * (a + b) / (sig * sig))
+    num = 1.0 - _sb_exp_safe(-2.0 * m * b / (sig * sig))
+
+    if abs(den) < 1e-12:
+        return b / (a + b)
+
+    p = num / den
+    return max(0.0, min(1.0, p))
+
+def _sb_plan_price(payload, key):
+    v = _sb_to_float(payload.get(key))
+    if v is not None:
+        return v
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    return _sb_to_float(plan.get(key))
+
+def _sb_compute_payload_barrier(payload, store_row):
+    import math
+
+    direction = _sb_norm_dir(payload.get("direction") or payload.get("dir") or payload.get("side"))
+    entry = _sb_plan_price(payload, "entry")
+    sl = _sb_plan_price(payload, "sl")
+    tp1 = _sb_plan_price(payload, "tp1")
+    tp2 = _sb_plan_price(payload, "tp2")
+    tp3 = _sb_plan_price(payload, "tp3")
+
+    if direction not in ("LONG", "SHORT"):
+        return {"ok": False, "reason": "bad_direction"}
+    if not entry or not sl or entry <= 0 or sl <= 0:
+        return {"ok": False, "reason": "missing_entry_or_sl"}
+
+    sign = 1.0 if direction == "LONG" else -1.0
+
+    # Favorable coordinate: y = sign * log(price / entry)
+    sl_y = sign * math.log(sl / entry)
+    if sl_y >= 0:
+        return {"ok": False, "reason": "sl_not_adverse", "entry": entry, "sl": sl, "direction": direction}
+
+    lower_b = abs(sl_y)
+
+    mu_raw = _sb_to_float(store_row.get("mu_logret_bar"), 0.0) or 0.0
+    sigma = _sb_to_float(store_row.get("sigma_eff_logret_bar"), 0.0) or 0.0
+
+    # Drift in favorable coordinate.
+    mu = sign * mu_raw
+
+    probs = {}
+    distances = {}
+
+    for name, tp in (("tp1", tp1), ("tp2", tp2), ("tp3", tp3)):
+        if not tp or tp <= 0:
+            continue
+        tp_y = sign * math.log(tp / entry)
+        if tp_y <= 0:
+            probs[name] = None
+            distances[name] = tp_y
+            continue
+        p = _sb_hit_prob_upper_before_lower(mu, sigma, tp_y, lower_b)
+        probs[name] = None if p is None else round(float(p), 6)
+        distances[name] = round(float(tp_y), 8)
+
+    valid = {k: v for k, v in probs.items() if v is not None}
+    if not valid:
+        return {"ok": False, "reason": "no_valid_tp", "entry": entry, "sl": sl, "direction": direction}
+
+    # Weighted score: TP1 matters most, but TP2/TP3 add quality.
+    weights = {"tp1": 0.55, "tp2": 0.30, "tp3": 0.15}
+    wsum = sum(weights[k] for k in valid if k in weights)
+    score_prob = sum(valid[k] * weights.get(k, 0.0) for k in valid) / max(wsum, 1e-9)
+    barrier_score = round(max(0.0, min(100.0, score_prob * 100.0)), 1)
+
+    rr1 = None
+    if tp1:
+        tp_dist = abs(sign * math.log(tp1 / entry))
+        rr1 = tp_dist / lower_b if lower_b > 0 else None
+
+    return {
+        "ok": True,
+        "source": "STAT_TECH_STOCH_BARRIER_V1",
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "mu_favorable_bar": round(mu, 10),
+        "mu_raw_logret_bar": round(mu_raw, 10),
+        "sigma_eff_logret_bar": round(sigma, 10),
+        "sl_distance_log": round(lower_b, 8),
+        "tp_distance_log": distances,
+        "barrier_prob_tp1": probs.get("tp1"),
+        "barrier_prob_tp2": probs.get("tp2"),
+        "barrier_prob_tp3": probs.get("tp3"),
+        "barrier_score": barrier_score,
+        "rr1_log": None if rr1 is None else round(rr1, 4),
+        "store_created_at_utc": store_row.get("created_at_utc"),
+        "store_age_sec": store_row.get("_stoch_barrier_age_sec"),
+    }
+
+def _inject_stat_tech_stoch_barrier_v1(payload):
+    import os
+
+    if str(os.getenv("STAT_TECH_STOCH_BARRIER_ENABLED", "true")).strip().lower() not in ("1", "true", "yes", "on"):
+        return payload
+
+    try:
+        source_txt = str(payload.get("signal_source") or payload.get("source") or payload.get("engine") or "").upper()
+        if "STAT_TECH" not in source_txt:
+            return payload
+
+        sym = _sb_norm_symbol(payload.get("symbol") or payload.get("pair"))
+        if not sym:
+            return payload
+
+        store = _load_stoch_barrier_latest_v1()
+        row = store.get(sym)
+        if not row:
+            payload["stoch_barrier"] = {"ok": False, "reason": "missing_stoch_barrier_store", "symbol": sym}
+            return payload
+
+        b = _sb_compute_payload_barrier(payload, row)
+        payload["stoch_barrier"] = b
+
+        if not b.get("ok"):
+            return payload
+
+        score = _sb_to_float(b.get("barrier_score"))
+        if score is None:
+            return payload
+
+        payload["barrier_score"] = score
+        payload["barrier_source"] = "STAT_TECH_STOCH_BARRIER_V1"
+        payload["barrier_prob_tp1"] = b.get("barrier_prob_tp1")
+        payload["barrier_prob_tp2"] = b.get("barrier_prob_tp2")
+        payload["barrier_prob_tp3"] = b.get("barrier_prob_tp3")
+        payload["barrier_rr1_log"] = b.get("rr1_log")
+        payload["barrier_sigma_eff"] = b.get("sigma_eff_logret_bar")
+        payload["barrier_mu_favorable"] = b.get("mu_favorable_bar")
+
+        min_emit = float(os.getenv("STAT_TECH_STOCH_BARRIER_MIN_EMIT", "58") or 58)
+        min_tp1 = float(os.getenv("STAT_TECH_STOCH_BARRIER_MIN_TP1_PROB", "0.50") or 0.50)
+        p1 = _sb_to_float(b.get("barrier_prob_tp1"), 0.0) or 0.0
+
+        if score >= min_emit and p1 >= min_tp1:
+            old_q = _sb_to_float(payload.get("quant_score"))
+            blend_w = float(os.getenv("STAT_TECH_STOCH_BARRIER_BLEND_WEIGHT", "0.25") or 0.25)
+
+            if old_q is None:
+                combined = score
+                qsource = "STAT_TECH_STOCH_BARRIER_V1"
+            else:
+                combined = max(old_q, old_q * (1.0 - blend_w) + score * blend_w)
+                qsource = str(payload.get("quant_source") or "STAT_TECH_QUANT") + "+STOCH_BARRIER_V1"
+
+            combined = round(max(0.0, min(100.0, combined)), 1)
+            payload["quant_score"] = combined
+            payload["core_quant_score"] = combined
+            payload["quant_source"] = qsource
+            payload["barrier_emit"] = True
+            payload["barrier_combined_score"] = combined
+        else:
+            payload["barrier_emit"] = False
+
+        return payload
+    except Exception as e:
+        payload["stoch_barrier"] = {"ok": False, "reason": f"exception:{type(e).__name__}:{e}"}
+        return payload
+
+
 def _lq_to_float(v, default=None):
     try:
         if v is None or v == "":
@@ -557,7 +830,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = _inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r)))
+        payload = _inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r))))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"
@@ -583,6 +856,11 @@ def run_once():
             "linear_quant_score": payload.get("linear_quant_score"),
             "linear_quant_emit": payload.get("linear_quant_emit"),
             "linear_quant_source": payload.get("linear_quant_source"),
+            "barrier_score": payload.get("barrier_score"),
+            "barrier_emit": payload.get("barrier_emit"),
+            "barrier_prob_tp1": payload.get("barrier_prob_tp1"),
+            "barrier_prob_tp2": payload.get("barrier_prob_tp2"),
+            "barrier_prob_tp3": payload.get("barrier_prob_tp3"),
             "confluence_decision": conf.get("decision"),
             "confluence_reason": conf.get("reason"),
             "confluence_score": conf.get("confluence_score"),
