@@ -39,6 +39,130 @@ _OU_MEANREV_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 
 
 # === TP_SL_PREDICTOR_INJECT_V1_20260705 ===
+
+
+# === ENTRY_PLAN_BUILDER_V2_INJECT_20260705 ===
+def _inject_entry_plan_builder_v2(payload):
+    import os
+    import json
+    import subprocess
+    from pathlib import Path
+
+    if str(os.getenv("ENTRY_PLAN_BUILDER_ENABLED", "true")).strip().lower() not in ("1", "true", "yes", "on"):
+        return payload
+
+    try:
+        has_min_signal = bool(payload.get("symbol") or payload.get("pair")) and bool(payload.get("direction") or payload.get("dir") or payload.get("side"))
+        if not has_min_signal:
+            return payload
+
+        script = os.getenv("ENTRY_PLAN_BUILDER_SCRIPT", "scripts/stat_tech_entry_plan_builder_v2.py")
+        if not Path(script).exists():
+            payload["entry_plan_builder_v2"] = {"ok": False, "plan_reason": "script_missing", "script": script}
+            return payload
+
+        pp = dict(payload)
+        pp["signal_source"] = pp.get("signal_source") or "STAT_TECH_V1"
+
+        proc = subprocess.run(
+            ["python", script],
+            input=json.dumps(pp, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=float(os.getenv("ENTRY_PLAN_BUILDER_TIMEOUT_SEC", "10") or 10),
+        )
+
+        if proc.returncode != 0:
+            payload["entry_plan_builder_v2"] = {
+                "ok": False,
+                "plan_decision": "ERROR",
+                "plan_reason": "builder_nonzero_exit",
+                "returncode": proc.returncode,
+                "stderr": (proc.stderr or "")[-700:],
+            }
+            return payload
+
+        out = json.loads((proc.stdout or "{}").strip() or "{}")
+        payload["entry_plan_builder_v2"] = out
+
+        if not out.get("ok"):
+            payload["entry_plan_decision"] = out.get("plan_decision")
+            payload["entry_plan_reason"] = out.get("plan_reason")
+            return payload
+
+        payload["raw_entry"] = out.get("raw_entry")
+        payload["raw_sl"] = out.get("raw_sl")
+        payload["raw_tp"] = out.get("raw_tp")
+        payload["raw_rr"] = out.get("raw_rr")
+
+        payload["final_entry"] = out.get("final_entry")
+        payload["final_sl"] = out.get("final_sl")
+        payload["final_tp"] = out.get("final_tp")
+        payload["final_rr"] = out.get("final_rr")
+
+        # Make final plan the active plan before RR lock / bridge.
+        if out.get("final_entry") is not None:
+            payload["entry"] = out.get("final_entry")
+            payload["entry_price"] = out.get("final_entry")
+            payload["limit_entry"] = out.get("final_entry")
+
+        if out.get("final_sl") is not None:
+            payload["sl"] = out.get("final_sl")
+            payload["stop_loss"] = out.get("final_sl")
+
+        if out.get("final_tp") is not None:
+            payload["tp"] = out.get("final_tp")
+            payload["tp1"] = out.get("final_tp")
+            payload["tp2"] = out.get("final_tp")
+            payload["tp3"] = out.get("final_tp")
+            payload["target"] = out.get("final_tp")
+            payload["take_profit"] = out.get("final_tp")
+
+        if out.get("final_rr") is not None:
+            payload["rr"] = out.get("final_rr")
+            payload["target_rr"] = out.get("final_rr")
+            payload["rr_target"] = out.get("final_rr")
+
+        payload["target_model"] = out.get("target_model")
+        payload["target_adjusted"] = out.get("target_adjusted")
+        payload["target_adjustment_source"] = out.get("target_adjustment_source")
+        payload["target_adjustment_reason"] = out.get("target_adjustment_reason")
+
+        payload["entry_plan_decision"] = out.get("plan_decision")
+        payload["entry_plan_reason"] = out.get("plan_reason")
+        payload["entry_plan_mode"] = out.get("mode")
+
+        payload["tp_sl_p_tp"] = out.get("p_tp_before_sl")
+        payload["tp_sl_p_sl"] = out.get("p_sl_before_tp")
+        payload["tp_sl_expected_R"] = out.get("expected_R")
+        payload["tp_sl_fee_adjusted_expected_R"] = out.get("fee_adjusted_expected_R")
+        payload["tp_sl_predictive_edge"] = out.get("predictive_edge")
+        payload["tp_sl_predictor_decision"] = out.get("plan_decision")
+        payload["tp_sl_predictor_reason"] = out.get("plan_reason")
+
+        payload["fib_geometry_score"] = out.get("fib_geometry_score")
+        payload["fib_entry_retracement"] = out.get("fib_entry_retracement")
+        payload["fib_tp_extension"] = out.get("fib_tp_extension")
+        payload["fib_target_quality"] = out.get("fib_target_quality")
+        payload["fib_entry_zone"] = out.get("fib_entry_zone")
+        payload["fib_chasing_penalty"] = out.get("fib_chasing_penalty")
+        payload["fib_sl_quality"] = out.get("fib_sl_quality")
+        payload["fib_suggested_rr"] = out.get("fib_suggested_rr")
+
+        hard_gate = str(os.getenv("ENTRY_PLAN_BUILDER_HARD_GATE", "false")).strip().lower() in ("1", "true", "yes", "on")
+        if hard_gate and out.get("plan_decision") == "NO_TRADE":
+            payload["entry_plan_hard_block"] = True
+            payload["hard_block_reason"] = "entry_plan_builder_no_trade:" + str(out.get("plan_reason"))
+        else:
+            payload["entry_plan_hard_block"] = False
+
+        return payload
+
+    except Exception as e:
+        payload["entry_plan_builder_v2"] = {"ok": False, "plan_decision": "ERROR", "plan_reason": f"exception:{type(e).__name__}:{e}"}
+        return payload
+
+
 def _inject_tp_sl_predictor_v1(payload):
     import os
     import json
@@ -50,7 +174,8 @@ def _inject_tp_sl_predictor_v1(payload):
 
     try:
         source_txt = str(payload.get("signal_source") or payload.get("source") or payload.get("engine") or "").upper()
-        if "STAT_TECH" not in source_txt:
+        has_min_signal = bool(payload.get("symbol") or payload.get("pair")) and bool(payload.get("direction") or payload.get("dir") or payload.get("side"))
+        if "STAT_TECH" not in source_txt and not has_min_signal:
             return payload
 
         script = os.getenv("TP_SL_PREDICTOR_SCRIPT", "scripts/tp_sl_predictor_v1.py")
@@ -1067,7 +1192,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = _inject_tp_sl_predictor_v1(_inject_stat_tech_ou_meanrev_v1(_inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r))))))
+        payload = _inject_entry_plan_builder_v2(_inject_tp_sl_predictor_v1(_inject_stat_tech_ou_meanrev_v1(_inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r)))))))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"
