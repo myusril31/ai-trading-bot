@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Trading Ordered Startup Flow
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ubuntu/ai-trading-vps-bot
+ExecStart=/home/ubuntu/ai-trading-vps-bot/scripts/ai_trading_start_flow_v1.sh start
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
