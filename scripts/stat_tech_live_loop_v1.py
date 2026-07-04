@@ -31,6 +31,174 @@ _LINEAR_QUANT_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 # === STAT_TECH_STOCH_BARRIER_INJECT_V1_20260704 ===
 _STOCH_BARRIER_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 
+
+
+# === STAT_TECH_OU_MEANREV_INJECT_V1_20260704 ===
+_OU_MEANREV_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
+
+def _ou_to_float(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        x = float(v)
+        return x if x == x else default
+    except Exception:
+        return default
+
+def _ou_norm_symbol(v):
+    return str(v or "").strip().upper().replace("BINANCE:", "").replace(".P", "").replace("/", "")
+
+def _ou_norm_dir(v):
+    d = str(v or "").strip().upper()
+    if d in ("BUY", "BULL", "LONG"):
+        return "LONG"
+    if d in ("SELL", "BEAR", "SHORT"):
+        return "SHORT"
+    return d
+
+def _ou_parse_ts(v):
+    try:
+        from datetime import datetime, timezone
+        txt = str(v or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _load_ou_meanrev_latest_v1():
+    import os
+    import json
+    import time
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    ttl = float(os.getenv("STAT_TECH_OU_MEANREV_CACHE_TTL_SEC", "60") or 60)
+    now = time.time()
+    if _OU_MEANREV_CACHE_V1.get("by_symbol") and now - float(_OU_MEANREV_CACHE_V1.get("loaded_at") or 0) <= ttl:
+        return _OU_MEANREV_CACHE_V1["by_symbol"]
+
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    fp = Path(os.getenv("STAT_TECH_OU_MEANREV_STORE_PATH", str(log_dir / "stat_tech_ou_meanrev_store_v1.jsonl")))
+    max_age_min = float(os.getenv("STAT_TECH_OU_MEANREV_MAX_AGE_MIN", "20") or 20)
+    max_age_sec = max_age_min * 60.0
+
+    by_symbol = {}
+    if fp.exists():
+        rows = []
+        try:
+            with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+
+            utc_now = datetime.now(timezone.utc)
+            for r in reversed(rows[-3000:]):
+                sym = _ou_norm_symbol(r.get("symbol"))
+                if not sym or sym in by_symbol:
+                    continue
+                ts = _ou_parse_ts(r.get("created_at_utc"))
+                if ts is not None:
+                    age = (utc_now - ts).total_seconds()
+                    if age > max_age_sec:
+                        continue
+                    r["_ou_meanrev_age_sec"] = age
+                by_symbol[sym] = r
+        except Exception:
+            pass
+
+    _OU_MEANREV_CACHE_V1["loaded_at"] = now
+    _OU_MEANREV_CACHE_V1["by_symbol"] = by_symbol
+    return by_symbol
+
+def _inject_stat_tech_ou_meanrev_v1(payload):
+    import os
+
+    if str(os.getenv("STAT_TECH_OU_MEANREV_ENABLED", "true")).strip().lower() not in ("1", "true", "yes", "on"):
+        return payload
+
+    try:
+        source_txt = str(payload.get("signal_source") or payload.get("source") or payload.get("engine") or "").upper()
+        if "STAT_TECH" not in source_txt:
+            return payload
+
+        sym = _ou_norm_symbol(payload.get("symbol") or payload.get("pair"))
+        direction = _ou_norm_dir(payload.get("direction") or payload.get("dir") or payload.get("side"))
+        if not sym or direction not in ("LONG", "SHORT"):
+            return payload
+
+        store = _load_ou_meanrev_latest_v1()
+        row = store.get(sym)
+        if not row:
+            payload["ou_meanrev"] = {"ok": False, "reason": "missing_ou_meanrev_store", "symbol": sym}
+            return payload
+
+        score_key = "ou_score_long" if direction == "LONG" else "ou_score_short"
+        ou_score = _ou_to_float(row.get(score_key))
+        if ou_score is None:
+            payload["ou_meanrev"] = {"ok": False, "reason": "missing_directional_score", "symbol": sym, "direction": direction}
+            return payload
+
+        payload["ou_score"] = round(float(ou_score), 1)
+        payload["ou_score_long"] = row.get("ou_score_long")
+        payload["ou_score_short"] = row.get("ou_score_short")
+        payload["ou_source"] = "STAT_TECH_OU_MEANREV_V1"
+        payload["ou_zscore"] = row.get("ou_zscore")
+        payload["ou_phi"] = row.get("ou_phi")
+        payload["ou_theta"] = row.get("ou_theta")
+        payload["ou_half_life_bars"] = row.get("ou_half_life_bars")
+        payload["ou_mean_reversion_strength"] = row.get("ou_mean_reversion_strength")
+        payload["ou_expected_reversion_log_1bar"] = row.get("ou_expected_reversion_log_1bar")
+        payload["ou_age_sec"] = row.get("_ou_meanrev_age_sec")
+
+        payload["ou_meanrev"] = {
+            "ok": True,
+            "source": "STAT_TECH_OU_MEANREV_V1",
+            "symbol": sym,
+            "direction": direction,
+            "score": round(float(ou_score), 1),
+            "score_long": row.get("ou_score_long"),
+            "score_short": row.get("ou_score_short"),
+            "zscore": row.get("ou_zscore"),
+            "phi": row.get("ou_phi"),
+            "theta": row.get("ou_theta"),
+            "half_life_bars": row.get("ou_half_life_bars"),
+            "strength": row.get("ou_mean_reversion_strength"),
+            "expected_reversion_log_1bar": row.get("ou_expected_reversion_log_1bar"),
+            "store_created_at_utc": row.get("created_at_utc"),
+            "age_sec": row.get("_ou_meanrev_age_sec"),
+        }
+
+        min_emit = float(os.getenv("STAT_TECH_OU_MEANREV_MIN_EMIT", "60") or 60)
+        if float(ou_score) >= min_emit:
+            old_q = _ou_to_float(payload.get("quant_score"))
+            blend_w = float(os.getenv("STAT_TECH_OU_MEANREV_BLEND_WEIGHT", "0.20") or 0.20)
+
+            if old_q is None:
+                combined = float(ou_score)
+                qsource = "STAT_TECH_OU_MEANREV_V1"
+            else:
+                combined = max(old_q, old_q * (1.0 - blend_w) + float(ou_score) * blend_w)
+                qsource = str(payload.get("quant_source") or "STAT_TECH_QUANT") + "+OU_MEANREV_V1"
+
+            combined = round(max(0.0, min(100.0, combined)), 1)
+            payload["quant_score"] = combined
+            payload["core_quant_score"] = combined
+            payload["quant_source"] = qsource
+            payload["ou_emit"] = True
+            payload["ou_combined_score"] = combined
+        else:
+            payload["ou_emit"] = False
+
+        return payload
+    except Exception as e:
+        payload["ou_meanrev"] = {"ok": False, "reason": f"exception:{type(e).__name__}:{e}"}
+        return payload
+
+
 def _sb_to_float(v, default=None):
     try:
         if v is None or v == "":
@@ -830,7 +998,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = _inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r))))
+        payload = _inject_stat_tech_ou_meanrev_v1(_inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r)))))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"
@@ -861,6 +1029,11 @@ def run_once():
             "barrier_prob_tp1": payload.get("barrier_prob_tp1"),
             "barrier_prob_tp2": payload.get("barrier_prob_tp2"),
             "barrier_prob_tp3": payload.get("barrier_prob_tp3"),
+            "ou_score": payload.get("ou_score"),
+            "ou_emit": payload.get("ou_emit"),
+            "ou_zscore": payload.get("ou_zscore"),
+            "ou_half_life_bars": payload.get("ou_half_life_bars"),
+            "ou_theta": payload.get("ou_theta"),
             "confluence_decision": conf.get("decision"),
             "confluence_reason": conf.get("reason"),
             "confluence_score": conf.get("confluence_score"),

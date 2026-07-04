@@ -1,0 +1,109 @@
+{
+  "ok": true,
+  "marker": "STAT_TECH_OU_MEANREV_STORE_V1_20260704",
+  "created_at_utc": "2026-07-04T13:29:03.409971Z",
+  "symbols_requested": 14,
+  "rows_written": 14,
+  "failures": {},
+  "output": "logs/stat_tech_ou_meanrev_store_v1.jsonl",
+  "top_long": [
+    {
+      "symbol": "SOLUSDT",
+      "score": 59.8,
+      "z": -0.97988,
+      "half_life": 21.995
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "score": 46.2,
+      "z": 0.070948,
+      "half_life": 8.03
+    },
+    {
+      "symbol": "PAXGUSDT",
+      "score": 39.0,
+      "z": 0.654919,
+      "half_life": 15.844
+    },
+    {
+      "symbol": "BCHUSDT",
+      "score": 37.9,
+      "z": 0.694752,
+      "half_life": 8.957
+    },
+    {
+      "symbol": "AVAXUSDT",
+      "score": 27.5,
+      "z": 1.332065,
+      "half_life": 8.687
+    },
+    {
+      "symbol": "SUIUSDT",
+      "score": 25.9,
+      "z": 1.399951,
+      "half_life": 6.333
+    },
+    {
+      "symbol": "BTCUSDT",
+      "score": 23.1,
+      "z": 1.819581,
+      "half_life": 4.284
+    },
+    {
+      "symbol": "UNIUSDT",
+      "score": 22.9,
+      "z": 1.637945,
+      "half_life": 4.986
+    }
+  ],
+  "top_short": [
+    {
+      "symbol": "XRPUSDT",
+      "score": 78.3,
+      "z": 2.347313,
+      "half_life": 9.381
+    },
+    {
+      "symbol": "LTCUSDT",
+      "score": 77.8,
+      "z": 2.254596,
+      "half_life": 8.997
+    },
+    {
+      "symbol": "ETHUSDT",
+      "score": 77.6,
+      "z": 2.780937,
+      "half_life": 7.46
+    },
+    {
+      "symbol": "LINKUSDT",
+      "score": 77.4,
+      "z": 2.077668,
+      "half_life": 8.088
+    },
+    {
+      "symbol": "ADAUSDT",
+      "score": 77.3,
+      "z": 2.320064,
+      "half_life": 16.49
+    },
+    {
+      "symbol": "BTCUSDT",
+      "score": 74.2,
+      "z": 1.819581,
+      "half_life": 4.284
+    },
+    {
+      "symbol": "ZECUSDT",
+      "score": 72.3,
+      "z": 1.663493,
+      "half_life": 6.96
+    },
+    {
+      "symbol": "UNIUSDT",
+      "score": 71.9,
+      "z": 1.637945,
+      "half_life": 4.986
+    }
+  ]
+}
