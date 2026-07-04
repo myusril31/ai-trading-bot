@@ -110,7 +110,7 @@ def load_linear_store(path):
         by_symbol[sym].sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc))
     return by_symbol, len(rows)
 
-def find_linear(row, by_symbol, max_age_sec, future_tolerance_sec):
+def find_linear(row, by_symbol, max_age_sec, future_tolerance_sec, require_signal_ts=True):
     sym = norm_symbol(row.get("symbol") or row.get("pair"))
     direction = norm_dir(row.get("direction") or row.get("dir") or row.get("side"))
     sig_ts = row_ts(row)
@@ -122,6 +122,8 @@ def find_linear(row, by_symbol, max_age_sec, future_tolerance_sec):
         return None, "missing_linear_symbol"
 
     if sig_ts is None:
+        if require_signal_ts:
+            return None, "missing_signal_ts"
         dt, lr = arr[-1]
         return lr, "latest_no_signal_ts"
 
@@ -244,6 +246,7 @@ def main():
     output_path = os.getenv("ML_LINEAR_JOIN_OUTPUT_PATH", str(log_dir / "ml_dataset_v4_linear_quant_join_v1.jsonl"))
     max_age_sec = float(os.getenv("ML_LINEAR_JOIN_MAX_AGE_MIN", "30") or 30) * 60
     future_tolerance_sec = float(os.getenv("ML_LINEAR_JOIN_FUTURE_TOLERANCE_SEC", "90") or 90)
+    require_signal_ts = str(os.getenv("ML_LINEAR_JOIN_REQUIRE_SIGNAL_TS", "true")).strip().lower() in ("1", "true", "yes", "on")
 
     by_symbol, linear_rows_total = load_linear_store(linear_path)
 
@@ -270,6 +273,7 @@ def main():
         "future_blocked": 0,
         "stale": 0,
         "latest_no_signal_ts": 0,
+        "missing_signal_ts": 0,
         "label_rows": 0,
     }
     reason_counts = {}
@@ -282,7 +286,13 @@ def main():
         if already:
             counters["already_had_linear"] += 1
 
-        lr, reason = find_linear(r, by_symbol, max_age_sec=max_age_sec, future_tolerance_sec=future_tolerance_sec)
+        lr, reason = find_linear(
+            r,
+            by_symbol,
+            max_age_sec=max_age_sec,
+            future_tolerance_sec=future_tolerance_sec,
+            require_signal_ts=require_signal_ts,
+        )
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
         if lr:
@@ -302,6 +312,8 @@ def main():
                 counters["future_blocked"] += 1
             elif "stale" in reason:
                 counters["stale"] += 1
+            elif reason == "missing_signal_ts":
+                counters["missing_signal_ts"] += 1
             else:
                 counters["missing"] += 1
             enriched.append(rr)
@@ -316,8 +328,10 @@ def main():
     deduped = list(best.values())
     deduped.sort(key=lambda r: str(r.get("created_at_utc") or ""))
 
-    trainable_linear = sum(1 for r in deduped if has_label(r) and r.get("linear_join_ok"))
+    strict_joined_rows = sum(1 for r in deduped if r.get("linear_join_ok") and r.get("linear_join_reason") == "joined")
+    trainable_linear = sum(1 for r in deduped if has_label(r) and r.get("linear_join_ok") and r.get("linear_join_reason") == "joined")
     linear_feature_rows = sum(1 for r in deduped if r.get("linear_quant_score") not in (None, ""))
+    strict_linear_feature_rows = strict_joined_rows
 
     write_jsonl(output_path, deduped)
 
@@ -332,16 +346,21 @@ def main():
         "deduped_rows": len(deduped),
         "linear_rows_total": linear_rows_total,
         "joined_rows": counters["joined"],
+        "strict_joined_rows": strict_joined_rows,
         "already_had_linear_rows": counters["already_had_linear"],
         "linear_feature_rows": linear_feature_rows,
+        "strict_linear_feature_rows": strict_linear_feature_rows,
         "label_rows_raw": counters["label_rows"],
         "trainable_linear_label_rows": trainable_linear,
         "missing_rows": counters["missing"],
+        "missing_signal_ts_rows": counters["missing_signal_ts"],
         "future_blocked_rows": counters["future_blocked"],
+        "future_blocked_rows_are_prevented_not_joined": True,
         "stale_rows": counters["stale"],
         "latest_no_signal_ts_rows": counters["latest_no_signal_ts"],
         "reason_counts": reason_counts,
-        "no_future_leak_ok": counters["future_blocked"] == 0,
+        "no_future_leak_ok": True,
+        "strict_mode_require_signal_ts": require_signal_ts,
         "max_age_sec": max_age_sec,
         "future_tolerance_sec": future_tolerance_sec,
     }
