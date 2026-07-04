@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Trading TP SL Predictor Readiness Loop
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/ai-trading-vps-bot
+ExecStart=/bin/bash -lc 'while true; do docker exec ai-trading-bot bash -lc "cd /app && python scripts/tp_sl_predictor_readiness_v1.py"; sleep 900; done'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

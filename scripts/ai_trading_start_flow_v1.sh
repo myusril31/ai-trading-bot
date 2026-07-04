@@ -123,6 +123,7 @@ svc vps-position-manager-loop.service
 svc vps-post-entry-manager-loop.service
 
 log "PHASE 7: reports / health"
+svc vps-tp-sl-predictor-readiness-loop.service
 svc vps-market-data-report-loop.service
 svc vps-telegram-market-report-loop.service
 svc vps-health-report-loop.service

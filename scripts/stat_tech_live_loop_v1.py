@@ -36,6 +36,75 @@ _STOCH_BARRIER_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 # === STAT_TECH_OU_MEANREV_INJECT_V1_20260704 ===
 _OU_MEANREV_CACHE_V1 = {"loaded_at": 0.0, "by_symbol": {}}
 
+
+
+# === TP_SL_PREDICTOR_INJECT_V1_20260705 ===
+def _inject_tp_sl_predictor_v1(payload):
+    import os
+    import json
+    import subprocess
+    from pathlib import Path
+
+    if str(os.getenv("TP_SL_PREDICTOR_ENABLED", "true")).strip().lower() not in ("1", "true", "yes", "on"):
+        return payload
+
+    try:
+        source_txt = str(payload.get("signal_source") or payload.get("source") or payload.get("engine") or "").upper()
+        if "STAT_TECH" not in source_txt:
+            return payload
+
+        script = os.getenv("TP_SL_PREDICTOR_SCRIPT", "scripts/tp_sl_predictor_v1.py")
+        if not Path(script).exists():
+            payload["tp_sl_predictor"] = {"ok": False, "reason": "script_missing", "script": script}
+            return payload
+
+        timeout = float(os.getenv("TP_SL_PREDICTOR_TIMEOUT_SEC", "8") or 8)
+        proc = subprocess.run(
+            ["python", script],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+
+        if proc.returncode != 0:
+            payload["tp_sl_predictor"] = {
+                "ok": False,
+                "reason": "predictor_nonzero_exit",
+                "returncode": proc.returncode,
+                "stderr": (proc.stderr or "")[-500:],
+            }
+            return payload
+
+        out = json.loads((proc.stdout or "{}").strip() or "{}")
+        payload["tp_sl_predictor"] = out
+
+        if out.get("ok"):
+            payload["tp_sl_p_tp"] = out.get("p_tp_before_sl")
+            payload["tp_sl_p_sl"] = out.get("p_sl_before_tp")
+            payload["tp_sl_expected_R"] = out.get("expected_R")
+            payload["tp_sl_fee_adjusted_expected_R"] = out.get("fee_adjusted_expected_R")
+            payload["tp_sl_predictive_edge"] = out.get("predictive_edge")
+            payload["tp_sl_predictor_decision"] = out.get("decision")
+            payload["tp_sl_predictor_reason"] = out.get("reason")
+            payload["tp_sl_predictor_components"] = out.get("components")
+            payload["tp_sl_predictor_weights"] = out.get("weights")
+            payload["tp_sl_predictor_mode"] = out.get("mode")
+
+        # Default: advisory only. Engine tetap jalan.
+        hard_gate = str(os.getenv("TP_SL_PREDICTOR_HARD_GATE", "false")).strip().lower() in ("1", "true", "yes", "on")
+        if hard_gate and out.get("ok") and out.get("decision") == "NO_TRADE":
+            payload["tp_sl_predictor_hard_block"] = True
+            payload["hard_block_reason"] = "tp_sl_predictor_no_trade:" + str(out.get("reason"))
+        else:
+            payload["tp_sl_predictor_hard_block"] = False
+
+        return payload
+    except Exception as e:
+        payload["tp_sl_predictor"] = {"ok": False, "reason": f"exception:{type(e).__name__}:{e}"}
+        return payload
+
+
 def _ou_to_float(v, default=None):
     try:
         if v is None or v == "":
@@ -998,7 +1067,7 @@ def run_once():
             out["results"].append({"symbol": symbol, "skip": "pair_cooldown", "signal_key": key})
             continue
 
-        payload = _inject_stat_tech_ou_meanrev_v1(_inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r)))))
+        payload = _inject_tp_sl_predictor_v1(_inject_stat_tech_ou_meanrev_v1(_inject_stat_tech_stoch_barrier_v1(_inject_stat_tech_linear_quant_v1(_inject_stat_tech_quant_prior(dict(r))))))
         payload["signal_key"] = key
         payload["signal_id"] = key
         payload["source"] = "STAT_TECH_V1"
@@ -1034,6 +1103,12 @@ def run_once():
             "ou_zscore": payload.get("ou_zscore"),
             "ou_half_life_bars": payload.get("ou_half_life_bars"),
             "ou_theta": payload.get("ou_theta"),
+            "tp_sl_p_tp": payload.get("tp_sl_p_tp"),
+            "tp_sl_p_sl": payload.get("tp_sl_p_sl"),
+            "tp_sl_expected_R": payload.get("tp_sl_expected_R"),
+            "tp_sl_fee_adjusted_expected_R": payload.get("tp_sl_fee_adjusted_expected_R"),
+            "tp_sl_predictor_decision": payload.get("tp_sl_predictor_decision"),
+            "tp_sl_predictor_reason": payload.get("tp_sl_predictor_reason"),
             "confluence_decision": conf.get("decision"),
             "confluence_reason": conf.get("reason"),
             "confluence_score": conf.get("confluence_score"),
