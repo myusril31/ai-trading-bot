@@ -116,6 +116,7 @@ svc vps-stat-tech-live-loop.service
 
 log "PHASE 6: lifecycle / execution monitor"
 svc vps-tp-lifecycle-loop.service
+svc vps-protection-fail-autoclose-loop.service
 svc vps-position-manager-loop.service
 svc vps-post-entry-manager-loop.service
 
