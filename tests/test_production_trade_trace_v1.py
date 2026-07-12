@@ -34,6 +34,12 @@ def test_closed_event_is_exact_whitelist_not_reason_based():
     assert not module.is_closed_event({"event": "ORDER_CANCELLED", "reason": "stale"})
 
 
+def test_generic_position_closed_without_reason_has_no_close_reason():
+    event = close_event(event="POSITION_CLOSED", close_reason="")
+    trace = module.build_traces([base_plan()], [event], fills(), [], "cfg")[0]
+    assert trace["close_reason"] is None
+
+
 def test_partial_fills_use_quantity_weighted_vwap_and_role_arrays():
     traces = module.build_traces([base_plan()], [close_event()], fills(), [], "cfg-test")
     trace = traces[0]
