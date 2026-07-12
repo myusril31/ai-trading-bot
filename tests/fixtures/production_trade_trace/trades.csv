@@ -1,0 +1,4 @@
+symbol,orderId,clientOrderId,tradeId,side,positionSide,price,qty,commission,realizedPnl,time,reduceOnly
+BTCUSDT,1001,bot-entry-1,501,BUY,BOTH,99,1,0.10,0,2026-07-01T00:01:00Z,false
+BTCUSDT,1001,bot-entry-1,502,BUY,BOTH,101,1,0.10,0,2026-07-01T00:02:00Z,false
+BTCUSDT,1002,bot-tp-1,503,SELL,BOTH,110,2,0.20,20,2026-07-01T00:59:00Z,true
