@@ -1,27 +1,38 @@
 # Production trade trace v1
 
-`scripts/production_trade_trace_v1.py` is a read-only P0 audit. It joins closed
-internal execution events to a Binance CSV/JSONL export using `order_id` or
-`client_order_id`, emits one canonical trace per internal closed trade, and
-measures whether the dataset is trustworthy enough for signal tuning.
+This read-only P0 audit reconstructs **closed position lifecycles**, not order
+counts. It requires separate Binance account-trade/fill and income-history
+exports so realized PnL, commission, and funding cannot be mixed.
 
 ```bash
 python scripts/production_trade_trace_v1.py \
   --plans logs/execution_plans.jsonl \
   --events logs/execution_events.jsonl \
-  --binance private/binance_trades.csv \
+  --trades private/binance_account_trades.csv \
+  --income private/binance_income_history.csv \
   --strict
 ```
 
-Outputs default to:
+The canonical trace carries separate `entry_order_ids`, `tp_order_ids`,
+`sl_order_ids`, `exit_order_ids`, and `fill_ids`. Entry and exit prices are
+quantity-weighted fill VWAPs. Fills match by `(symbol, order_id)`, or by
+`(symbol, client_order_id, lifecycle time window)`; generic `id` is never used.
 
-- `logs/production_trade_traces_v1.jsonl`
-- `logs/production_trade_trace_audit_v1.json`
+Only explicit close events are eligible: `POSITION_CLOSED`, `TRADE_CLOSED`,
+`TP_FILLED`, `SL_FILLED`, `MANUAL_CLOSE_FILLED`, and `LIQUIDATED`. A failure or
+cancellation carrying a `reason` is not a closed trade.
 
-Acceptance checks are intentionally strict: 99% order/PnL/fee coverage, no
-duplicate internal trade identity, and equal internal/Binance closed counts.
-Failure is labelled `dataset_anomaly`; it is not interpreted as strategy
-performance. The script does not call Binance or mutate live execution state.
+Income processing is type-specific:
 
-Do not commit Binance exports. Keep them outside tracked paths and pass their
-location through `--binance`.
+- fill `realizedPnl`, with `REALIZED_PNL` income as fallback;
+- fill `commission`, with `COMMISSION` income as fallback;
+- `FUNDING_FEE` only when symbol, position side, and open interval match.
+
+Funding that cannot be safely allocated is reported as unallocated and excluded
+from trade `net_pnl`. The audit cannot become `production_truth_ready` unless
+plan, entry, exit, realized PnL, commission, funding allocation, close reason,
+and net PnL coverage are each at least 99%, lifecycle counts agree, and duplicate
+trade identity is zero.
+
+Sanitized fixtures live under `tests/fixtures/production_trade_trace`. Never
+commit real Binance exports or credentials.
