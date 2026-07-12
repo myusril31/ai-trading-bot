@@ -1,0 +1,31 @@
+name: production-trade-trace
+
+on:
+  pull_request:
+    paths:
+      - "scripts/production_trade_trace_v1.py"
+      - "tests/test_production_trade_trace_v1.py"
+      - "tests/fixtures/production_trade_trace/**"
+      - ".github/workflows/production-trade-trace.yml"
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m py_compile scripts/production_trade_trace_v1.py
+      - run: pytest -q tests/test_production_trade_trace_v1.py
+
+  full-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q
