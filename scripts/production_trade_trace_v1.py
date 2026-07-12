@@ -292,6 +292,11 @@ def build_traces(plans: Sequence[Mapping[str, Any]], events: Sequence[Mapping[st
         funding_allocated = bool(opened and closed) and (funding is not None or not any(income_type(row) == "FUNDING_FEE" and symbol(row) == (symbol(event) or symbol(plan)) for row in income))
         net = realized - commission + (funding or 0.0) if realized is not None and commission is not None and funding_allocated else None
         source = {**plan, **event}
+        explicit_close_reason = upper(first(event, "close_reason", "reason"))
+        event_type = upper(first(event, "event", "event_type"))
+        inferred_close_reason = event_type if event_type in {
+            "TP_FILLED", "SL_FILLED", "MANUAL_CLOSE_FILLED", "LIQUIDATED"
+        } else None
         trace = {
             "trace_schema_version": TRACE_SCHEMA_VERSION,
             "correlation_id": text(first(source, "correlation_id")) or stable_id(source),
@@ -323,7 +328,7 @@ def build_traces(plans: Sequence[Mapping[str, Any]], events: Sequence[Mapping[st
             "funding_unallocated": None if funding_allocated else funding,
             "funding_allocated": funding_allocated,
             "net_pnl": net,
-            "close_reason": upper(first(event, "close_reason", "reason")) or upper(first(event, "event", "event_type")),
+            "close_reason": explicit_close_reason or inferred_close_reason,
             "label_win": None if net is None else int(net > 0),
             "plan_linked": bool(plan) and not duplicate_plan,
             "duplicate_plan": duplicate_plan,
